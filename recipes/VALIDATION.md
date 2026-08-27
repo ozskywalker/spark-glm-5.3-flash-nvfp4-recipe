@@ -44,6 +44,23 @@ watching + the flush ritual (`scripts/prelaunch_flush.sh`).
   `probe_cache_continuation.py`, `probe_longctx.py --tokens 250000`.
   All dependency-free (urllib); sized via the server's `/tokenize` endpoint.
 
+## NVFP4 KV cache lane: not servable on sm121-v9 (confirmed 2026-08-27)
+
+`glm-5.3-flash-nvfp4-kvnvfp4-vllm.yaml` (`--kv-cache-dtype nvfp4`) fails fast
+at VllmConfig validation, before weight load:
+
+```
+nvfp4 KV cache is not supported with MLA (Multi-head Latent Attention)
+backends. Please use a different --kv-cache-dtype (e.g., 'fp8' or 'auto')
+for MLA models such as DeepSeek.
+```
+
+No MLA-sparse backend in the image supports nvfp4 (SM90: auto/bf16/fp8/fp8_e4m3;
+SM120: + fp8_ds_mla; TRTLLM-SM10: fp16/bf16/fp8; plain FlashInfer nvfp4 requires
+the SM100 non-MLA trtllm-gen kernel). The custom `nvfp4_ds_mla` kernel work
+required is specced in docs/NVFP4-KV-BUILD-SPEC.md but was never built. The
+recipe is kept as the target lane for that build.
+
 ## Reproduce
 
 ```bash

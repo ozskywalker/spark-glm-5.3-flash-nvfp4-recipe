@@ -1,0 +1,82 @@
+# Recipe: GLM-5.3-Flash NVFP4 weights + NVFP4 KV cache (TP=2 across 2x DGX Spark)
+#
+# Derivative of glm-5.3-flash-nvfp4-vllm.yaml that switches the KV cache from
+# fp8_e4m3 to NVFP4 (--kv-cache-dtype nvfp4), halving KV bytes/token.
+#
+# STATUS: NOT SERVABLE on radixark/vllm-glm53-flash:sm121-v9 — CONFIRMED
+# EMPIRICALLY (2026-08-27): the launch fails fast at VllmConfig validation with
+#   "nvfp4 KV cache is not supported with MLA (Multi-head Latent Attention)
+#    backends. Please use a different --kv-cache-dtype (e.g., 'fp8' or 'auto')
+#    for MLA models such as DeepSeek."
+# Static analysis agrees: FlashInferMLASparseSM90Backend (this lane's backend)
+# supports only auto/bfloat16/fp8/fp8_e4m3; FlashInferMLASparseSM120Backend adds
+# only fp8_ds_mla; the plain FlashInferBackend's nvfp4 path requires the SM100
+# non-MLA trtllm-gen kernel; FlashInfer's MLA module ships no nvfp4 code.
+# The custom kernel work needed is specced in docs/NVFP4-KV-BUILD-SPEC.md
+# (nvfp4_ds_mla, "v10" image) but was never built. Kept as the target lane for
+# that build; expect the launch to fail at config validation.
+
+recipe_version: "2"
+name: GLM-5.3-Flash-NVFP4-KVNVFP4
+description: vLLM serving LibertAIDAI/GLM-5.3-Flash-NVFP4 on 2x DGX Spark, TP=2, NVFP4 KV cache (requires unbuilt nvfp4_ds_mla kernel support)
+
+model: LibertAIDAI/GLM-5.3-Flash-NVFP4
+runtime: vllm
+container: radixark/vllm-glm53-flash:sm121-v9
+
+min_nodes: 2
+
+cluster_config:
+  resolved_model_path: /models
+
+executor_config:
+  entrypoint: ""
+  auto_remove: false
+
+env:
+  TORCH_CUDA_ARCH_LIST: 12.1a
+  FLASHINFER_CUDA_ARCH_LIST: 12.1a
+  FLASHINFER_DISABLE_VERSION_CHECK: "1"
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+  NCCL_DEBUG: WARN
+  TORCH_NCCL_ASYNC_ERROR_HANDLING: "1"
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  served_model_name: glm-5.3-flash
+  tensor_parallel: 2
+  model_path: /models/models--LibertAIDAI--GLM-5.3-Flash-NVFP4/snapshots/aa28e1f54130286c95fee10d0705c74ce8743734
+  chat_template: /models/glm53-flash-chat_template_mm.jinja
+  max_model_len: 262144
+  max_num_seqs: 6
+  gpu_memory_utilization: 0.85
+  # NVFP4 KV halves bytes/token vs fp8 (432 B/token/layer per the build spec),
+  # so the proven-safe 3 GiB slab would hold ~2x the fp8 token count (~740K)
+  # IF the kernel support existed. Same GB10 first-touch ceiling applies.
+  kv_cache_memory: 3221225472
+  block_size: 2304
+  moe_backend: marlin
+  kv_cache_dtype: nvfp4
+  speculative_config: '{"method":"mtp","num_speculative_tokens":4}'
+  default_chat_template_kwargs: '{"enable_thinking": false}'
+
+command: |
+  vllm serve {model_path} \
+      --served-model-name {served_model_name} \
+      --host {host} --port {port} \
+      --trust-remote-code --load-format instanttensor \
+      --tensor-parallel-size {tensor_parallel} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} --block-size {block_size} \
+      --moe-backend {moe_backend} \
+      --speculative-config '{speculative_config}' \
+      --kv-cache-dtype {kv_cache_dtype} --kv-cache-memory {kv_cache_memory} \
+      --enforce-eager \
+      --tool-call-parser glm47 --enable-auto-tool-choice \
+      --reasoning-parser glm45 \
+      --chat-template {chat_template} \
+      --default-chat-template-kwargs '{default_chat_template_kwargs}' \
+      --distributed-executor-backend mp
