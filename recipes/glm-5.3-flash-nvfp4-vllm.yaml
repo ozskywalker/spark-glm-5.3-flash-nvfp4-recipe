@@ -1,0 +1,113 @@
+# Recipe: GLM-5.3-Flash NVFP4 (TP=2 across 2x DGX Spark, vLLM native multi-node)
+#
+# sparkrun port of launch-glm53-vllm-tp2.sh (tonyd2wild/GLM-5.3-Flash-NVFP4-2x-DGX-Spark).
+# Serving LibertAIDAI/GLM-5.3-Flash-NVFP4 (320B total / 18B active MoE, glm5_next,
+# weight-only NVFP4) at TP=2 over two GB10 nodes with fp8 KV + MTP-4 + thinking-off.
+#
+# Deviations from the source script (all deliberate, see comments inline):
+#   1. Weights are served from the pre-placed HF-cache snapshot under /models on
+#      every node (cluster_config.resolved_model_path) instead of a bind-mounted
+#      /var/tmp copy — no download, no distribution, no NFS duty on any rank.
+#   2. --kv-cache-memory 3221225472 (3 GiB/rank ~= 370K fp8 KV tokens = 1.4x the
+#      262144 max_model_len) instead of the script's 4445787956. These nodes
+#      (spark-2dd4/spark-276f) have ~4-6 GiB less effective unified-memory
+#      headroom than the upstream record nodes: vLLM's own profiler computes
+#      "Available KV cache memory: -0.02 GiB" here at gmu 0.85, and pinned pools
+#      of 4.14-5.5 GiB died in the silent NVRM first-touch kill (exit code None,
+#      no dmesg trace — docs/KV-HUNT-672K-TP2-RECORD.md signature). 3 GiB boots
+#      clean and survived the full validation suite incl. a 250K-token prefill.
+#   3. --chat-template points at the repo's chat_template_mm.jinja (copied to
+#      /models on both nodes). The checkpoint's own chat_template.jinja ignores
+#      enable_thinking and always reasons at max effort; the mm template honors
+#      enable_thinking=false (commit 53912b4). The TP4 launcher already used it.
+#   4. Per-node NCCL/IB fabric env (NCCL_IB_HCA, RoCE addressing, socket ifnames,
+#      VLLM_HOST_IP) is NOT hardcoded: sparkrun's CX7/IB detection pins the comm
+#      env per host. Only image/GPU-arch env is set here.
+#
+# GB10 pre-launch ritual (docs/KV-HUNT-672K-TP2-RECORD.md hardening rule): EVERY
+# (re)launch gets `sync; echo 3 > /proc/sys/vm/drop_caches` on all ranks first,
+# and a cache-flusher loop runs during model load. Use scripts/prelaunch_flush.sh.
+#
+# Metrics: vLLM's Prometheus exposition is ENABLED by default at /metrics on the
+# serve port (http://<head>:8000/metrics). Do NOT add --disable-log-stats.
+
+recipe_version: "2"
+name: GLM-5.3-Flash-NVFP4
+description: vLLM serving LibertAIDAI/GLM-5.3-Flash-NVFP4 (glm5_next) on 2x DGX Spark, TP=2, fp8 KV + MTP-4
+
+model: LibertAIDAI/GLM-5.3-Flash-NVFP4
+runtime: vllm
+container: radixark/vllm-glm53-flash:sm121-v9
+
+min_nodes: 2
+
+# Pre-placed weights: /models is a shared HF-hub-style store present identically
+# on both nodes. resolved_model_path makes sparkrun skip model download +
+# distribution, identity-mount /models into the container, and preflight-verify
+# the path on every host. Requires a trusted recipe (local file = trusted).
+cluster_config:
+  resolved_model_path: /models
+
+# The image declares ENTRYPOINT ["vllm","serve"], which would consume sparkrun's
+# appended command; clear it so the full `vllm serve ...` command below runs.
+executor_config:
+  entrypoint: ""
+  auto_remove: false
+
+env:
+  # --- image / GPU arch (GB10 = SM121) ---
+  TORCH_CUDA_ARCH_LIST: 12.1a
+  FLASHINFER_CUDA_ARCH_LIST: 12.1a
+  FLASHINFER_DISABLE_VERSION_CHECK: "1"
+  # --- GB10 unified-memory hygiene ---
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  # --- long boot tolerance (instanttensor load + MTP warmup can take many minutes) ---
+  VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+  # --- NCCL diagnostics (fabric selection itself is sparkrun-detected) ---
+  NCCL_DEBUG: WARN
+  TORCH_NCCL_ASYNC_ERROR_HANDLING: "1"
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  served_model_name: glm-5.3-flash
+  tensor_parallel: 2
+  # Pre-placed snapshot (identical hash on both nodes; override via -o if it moves)
+  model_path: /models/models--LibertAIDAI--GLM-5.3-Flash-NVFP4/snapshots/aa28e1f54130286c95fee10d0705c74ce8743734
+  # Vision-capable template honoring enable_thinking (see header note 3)
+  chat_template: /models/glm53-flash-chat_template_mm.jinja
+  # --- capacity (262144 = script config; 3 GiB pool ~= 370K fp8 KV tokens = 1.4x) ---
+  max_model_len: 262144
+  max_num_seqs: 6
+  gpu_memory_utilization: 0.85
+  # 3 GiB/rank ~= 370K fp8 KV tokens (1.4x max_model_len) — the largest pool
+  # that survives warmup on these nodes; see header note 2. Revisit upward only
+  # with live memory watching and the flush ritual running.
+  kv_cache_memory: 3221225472
+  # --- kernels / cache (block 2304 = kpool*64 x MLA-128 alignment; marlin MoE) ---
+  block_size: 2304
+  moe_backend: marlin
+  kv_cache_dtype: fp8_e4m3
+  # --- MTP day-1 config (image has Glm5NextMTPModel) ---
+  speculative_config: '{"method":"mtp","num_speculative_tokens":4}'
+  # --- parsers / chat ---
+  default_chat_template_kwargs: '{"enable_thinking": false}'
+
+command: |
+  vllm serve {model_path} \
+      --served-model-name {served_model_name} \
+      --host {host} --port {port} \
+      --trust-remote-code --load-format instanttensor \
+      --tensor-parallel-size {tensor_parallel} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} --block-size {block_size} \
+      --moe-backend {moe_backend} \
+      --speculative-config '{speculative_config}' \
+      --kv-cache-dtype {kv_cache_dtype} --kv-cache-memory {kv_cache_memory} \
+      --enforce-eager \
+      --tool-call-parser glm47 --enable-auto-tool-choice \
+      --reasoning-parser glm45 \
+      --chat-template {chat_template} \
+      --default-chat-template-kwargs '{default_chat_template_kwargs}' \
+      --distributed-executor-backend mp

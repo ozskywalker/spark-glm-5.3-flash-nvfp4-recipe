@@ -1,0 +1,87 @@
+# Recipe: GLM-5.3-Flash NVFP4 (TP=4 across 4x DGX Spark, vLLM native multi-node)
+#
+# sparkrun port of launch-glm53-vllm-tp4.sh (tonyd2wild/GLM-5.3-Flash-NVFP4-2x-DGX-Spark).
+# Flagship lane: 1M-token model-native context, 24 GiB/rank fp8 KV pool
+# (25,769,803,776 bytes ~= 3.77M tokens), MTP-4, vision-capable chat template.
+#
+# NOT VALIDATED on the current 2-node cluster — requires four DGX Spark hosts.
+# Created for completeness alongside glm-5.3-flash-nvfp4-vllm.yaml (TP=2, the
+# validated lane). Same deviations as the TP2 recipe: pre-placed /models weights,
+# sparkrun-detected NCCL fabric env, entrypoint cleared for the image's
+# ENTRYPOINT ["vllm","serve"], cache-flush ritual before every launch.
+#
+# GB10 pre-launch ritual: run scripts/prelaunch_flush.sh (drop_caches on all
+# ranks + cache-flusher loop during load) — see docs/SM121-CRASH-FORENSICS and
+# docs/GB10-KV-MEMORY-LADDER.md for why the KV slab is pinned and gated.
+#
+# Metrics: vLLM's Prometheus exposition is ENABLED by default at /metrics on the
+# serve port (http://<head>:8000/metrics). Do NOT add --disable-log-stats.
+
+recipe_version: "2"
+name: GLM-5.3-Flash-NVFP4-TP4
+description: vLLM serving LibertAIDAI/GLM-5.3-Flash-NVFP4 (glm5_next) on 4x DGX Spark, TP=4, 1M context, fp8 KV + MTP-4
+
+model: LibertAIDAI/GLM-5.3-Flash-NVFP4
+runtime: vllm
+container: radixark/vllm-glm53-flash:sm121-v8
+
+min_nodes: 4
+
+cluster_config:
+  resolved_model_path: /models
+
+executor_config:
+  entrypoint: ""
+  auto_remove: false
+  # TP4 script pins container RAM (--memory 112g --memory-swap 112g). sparkrun's
+  # executor_config exposes memory_limit only; the no-swap pin (memory-swap) is
+  # NOT reproduced — a documented deviation. Docker's default allows swap up to
+  # 2x the limit, which is the safer direction on GB10 (swap thrash beats OOM).
+  memory_limit: 112g
+
+env:
+  TORCH_CUDA_ARCH_LIST: 12.1a
+  FLASHINFER_CUDA_ARCH_LIST: 12.1a
+  FLASHINFER_DISABLE_VERSION_CHECK: "1"
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+  NCCL_DEBUG: WARN
+  TORCH_NCCL_ASYNC_ERROR_HANDLING: "1"
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  served_model_name: glm-5.3-flash
+  tensor_parallel: 4
+  model_path: /models/models--LibertAIDAI--GLM-5.3-Flash-NVFP4/snapshots/aa28e1f54130286c95fee10d0705c74ce8743734
+  chat_template: /models/glm53-flash-chat_template_mm.jinja
+  # Model-native 1M context; the 3.77M-token KV pool holds 3.6 full-length requests
+  max_model_len: 1048576
+  max_num_seqs: 6
+  gpu_memory_utilization: 0.85
+  # 24 GiB/rank fp8 KV (TP4 script shipped value; 32G died under concurrent traffic)
+  kv_cache_memory: 25769803776
+  block_size: 2304
+  moe_backend: marlin
+  kv_cache_dtype: fp8_e4m3
+  speculative_config: '{"method":"mtp","num_speculative_tokens":4}'
+  default_chat_template_kwargs: '{"enable_thinking": false}'
+
+command: |
+  vllm serve {model_path} \
+      --served-model-name {served_model_name} \
+      --host {host} --port {port} \
+      --trust-remote-code \
+      --tensor-parallel-size {tensor_parallel} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} --block-size {block_size} \
+      --moe-backend {moe_backend} \
+      --speculative-config '{speculative_config}' \
+      --kv-cache-dtype {kv_cache_dtype} --kv-cache-memory {kv_cache_memory} \
+      --enforce-eager \
+      --tool-call-parser glm47 --enable-auto-tool-choice \
+      --reasoning-parser glm45 \
+      --chat-template {chat_template} \
+      --default-chat-template-kwargs '{default_chat_template_kwargs}' \
+      --distributed-executor-backend mp
