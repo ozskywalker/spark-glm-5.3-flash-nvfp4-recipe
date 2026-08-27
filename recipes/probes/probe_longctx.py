@@ -12,7 +12,8 @@ retrieve them. Verifies:
   - streaming stays alive for the whole multi-minute prefill.
 
 Default target: 250,000 prompt tokens (max_model_len is 262,144 on the TP2
-recipe; KV pool is ~672K tokens so a single request fits with room to spare).
+recipe; the shipped 3 GiB KV pool is ~370K tokens so a single request fits
+with room to spare).
 A full-depth prefill takes many minutes — run with a patient timeout.
 
 Usage:

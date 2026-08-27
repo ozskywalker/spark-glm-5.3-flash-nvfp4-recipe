@@ -11,8 +11,9 @@
 # ENTRYPOINT ["vllm","serve"], cache-flush ritual before every launch.
 #
 # GB10 pre-launch ritual: run scripts/prelaunch_flush.sh (drop_caches on all
-# ranks + cache-flusher loop during load) — see docs/SM121-CRASH-FORENSICS and
-# docs/GB10-KV-MEMORY-LADDER.md for why the KV slab is pinned and gated.
+# ranks + cache-flusher loop during load) — see
+# docs/SM121-CRASH-FORENSICS-2026-08-27.md and docs/GB10-KV-MEMORY-LADDER.md
+# for why the KV slab is pinned and gated.
 #
 # Metrics: vLLM's Prometheus exposition is ENABLED by default at /metrics on the
 # serve port (http://<head>:8000/metrics). Do NOT add --disable-log-stats.
