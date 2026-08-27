@@ -1,4 +1,4 @@
-FROM radixark/vllm-glm53-flash:glm53-sm121-v6
+FROM radixark/vllm-glm53-flash:sm121-v6
 
 # Indexer hardening (second NaN class): top-k destination was torch.empty and
 # the top-k kernels only guarantee the first min(k, valid) entries; rows with
