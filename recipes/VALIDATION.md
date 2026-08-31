@@ -227,16 +227,64 @@ in `/metrics` after boot, sanity, or a full soak pass — no error either, so
 it may just need a trigger condition (a specific dispatch-mode transition?)
 not yet exercised. Flag stays on; revisit if it matters later.
 
-For a detailed per-op/per-kernel timeline (not aggregate counters), use
-vLLM's built-in torch profiler instead of `--enable-layerwise-nvtx-tracing`
-(incompatible with CUDA graphs): `VLLM_TORCH_PROFILER_DIR` env +
-`POST /start_profile` / `POST /stop_profile`. `nsys` is present on both
-cluster nodes' hosts but NOT inside the `sm121-v9` container image and isn't
-cleanly `pip`/`apt`-installable there without real Dockerfile work — the
-built-in torch profiler covers the same "where does time go" question with
-zero extra installs, at the cost of one temporary `--enforce-eager` launch
-(graph-captured decode collapses into fewer distinguishable Python-level ops
-in a profiler trace).
+## Built-in torch profiler: reproducibly crashes the worker on this stack (2026-08-31)
+
+Attempted a detailed per-op/kernel timeline via vLLM's built-in torch
+profiler (a temporary `--enforce-eager` + `--profiler-config.*` launch,
+`recipes/glm-5.3-flash-nvfp4-vllm-profiling.yaml`, deleted after this
+investigation — not archived, not shipped). Correction along the way: the
+env var `VLLM_TORCH_PROFILER_DIR` does NOT exist in this build ("Unknown
+vLLM environment variable" warning) — this is a newer vLLM with a
+`--profiler-config.*` CLI group instead (`profiler=torch`,
+`torch_profiler_dir=...`, plus `record_shapes`/`with_flops`/schedule
+knobs — see `vllm/config/profiler.py` in the image).
+
+**Three attempts, three different crashes, all at the same call site**
+(`POST /stop_profile`, worker process, right after `profiler_stop`):
+
+1. `record_shapes=true, with_flops=true`, unbounded (~200 decode
+   iterations recorded): worker died with the familiar silent NVRM
+   signature (`exit code: None`, no traceback) during trace export/gzip.
+2. Dropped record_shapes/with_flops, bounded the capture via the
+   profiler's own schedule (`warmup_iterations=2, active_iterations=15`):
+   different failure — a genuine **segfault** in torch's `PythonTracer`
+   destructor (`~PythonTracer()` -> `stop()` -> GIL acquisition on an
+   already-torn-down thread) when the schedule auto-completes under
+   vLLM's multi-process (`mp`) executor. Not a resource issue.
+3. Back to plain manual start/stop, no schedule, no record_shapes/
+   with_flops, trivial 40-token request (smallest possible capture):
+   **same silent NVRM-style worker death as attempt 1**, despite the
+   tiny trace size — ruling out "trace too big" as the root cause.
+
+Each attempt: only a lightweight `*.async_llm.*.pt.trace.json.gz` survived
+(the API-server/front-end Python-call-stack trace — `cat: python_function`
+only, zero CUDA/kernel events, ~95K events of mostly idle thread-wait
+noise; the one real signal in it is the request-handling call chain itself
+costing ~85ms, negligible next to GPU time). The actual **worker-side GPU
+kernel trace never wrote once, in any of the three attempts** — the crash
+happens before or during that export every time. Verified after each crash
+via `torch.cuda.mem_get_info()` on both nodes: no trapped/eroded memory
+(121-126 GB free of 130.66 GB each time), so this isn't compounding damage
+from repeated failed launches either — it's a real, reproducible bug in
+this build's torch-profiler-plus-mp-executor path, independent of capture
+size or settings.
+
+**Conclusion: vLLM's built-in torch profiler is not currently usable on
+this stack for kernel-level instrumentation.** Options not yet tried:
+`--profiler-config.profiler=cuda` (the plain CUDA profiler mode, a
+different code path from `torch`) as a lower-risk alternative; or a real
+Dockerfile addition of `nsys` into the image (present on the host, not in
+`sm121-v9`) to profile from outside the crashy in-process mechanism
+entirely. `--enable-layerwise-nvtx-tracing` (incompatible with CUDA
+graphs, would need the same `--enforce-eager` temporary launch) hasn't
+been tried and is independent of this profiler subsystem — worth a shot
+on its own before writing off per-layer visibility entirely.
+
+The cheap, always-on metrics shipped separately above
+(`--enable-mfu-metrics`, `--kv-cache-metrics`, `--cudagraph-metrics`,
+`--enable-logging-iteration-details`) are unaffected by any of this —
+those come from vLLM's ordinary Prometheus/logging path, not the profiler
+subsystem, and remain the working instrumentation baseline.
 
 Not yet re-validated: the persistent_topk SM-count gate (a5c4b19) was proven
 out before `--enforce-eager` was dropped (2026-08-31, above). CUDA graph
