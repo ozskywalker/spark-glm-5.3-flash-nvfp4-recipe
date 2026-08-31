@@ -494,6 +494,42 @@ nodes at `/models/models--RedHatAI--GLM-5.3-Flash-NVFP4/snapshots/
 36c184c6cda000a481711306df5adde42f63321a` — the old LibertAIDAI weights
 are left in place (not deleted) in case of rollback.
 
+## RedHatAI checkpoint performance baseline (2026-08-31)
+
+The correctness validation above only ran the 3-sample short bench built
+into `probe_sanity.py` — not enough for a real performance comparison
+before chasing DFlash2. Ran a proper capture on the shipped recipe
+(RedHatAI checkpoint, CUDA graphs, 3 GiB pin, current metrics flags) to
+serve as the baseline DFlash2 gets compared against:
+
+- **Short bench** (`probe_sanity.py`, same methodology as every prior
+  CUDA-graph/metrics measurement in this doc): 21.13 / 24.61 / 21.56 tok/s
+  (median 21.56), TTFT 0.25-0.32s. Matches the existing CUDA-graph baseline
+  (21.8-26.3 tok/s across prior measurements) — **no regression from the
+  checkpoint swap**, within normal run-to-run noise.
+- **Longer-form decode** (400 max_tokens, prose explanation prompt, 8 runs,
+  `stream_options.include_usage` for real token counts — not previously
+  measured at this length on either checkpoint): median **19.40 tok/s**
+  (range 17.88-20.60), median TTFT 0.393s (range 0.28-0.40s). Lower than
+  the short-bench number, consistent with MTP's known content-dependent
+  acceptance (prose drafts worse than structured/code content per this
+  project's own README and the community DFlash2 writeups) — not a
+  checkpoint regression, a different (and more realistic multi-turn-length)
+  workload. **This is the number to compare DFlash2 against**, since
+  DFlash2's own published benchmarks are likewise measured on
+  code/structured prompts at comparable length, not a 10-token sanity
+  check.
+- **Long-context** (`probe_longctx.py`, 250K tokens, same exact test as the
+  original validation): TTFT **198.2s**, 4/4 planted codes retrieved — vs.
+  195.3s on the old checkpoint. Within 1.5%, no meaningful prefill
+  regression.
+- **Soak** (2 rounds x 2 waves): all PASSED, timing comparable to prior
+  runs (sequential median 2.1-2.2s, concurrent x3 median 3.96-12.4s).
+- `vllm:estimated_flops_per_gpu_total` (the new `--enable-mfu-metrics`
+  counter): 2.68e15 by end of this session's traffic — a real number now
+  exists to compute MFU against once there's a clean way to pair it with
+  wall-clock GPU-active time; not yet turned into an actual MFU percentage.
+
 Not yet re-validated: the persistent_topk SM-count gate (a5c4b19) was proven
 out before `--enforce-eager` was dropped (2026-08-31, above). CUDA graph
 capture uses static shapes and could in principle route decode differently;
