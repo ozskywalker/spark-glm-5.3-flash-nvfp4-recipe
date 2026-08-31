@@ -1,0 +1,25 @@
+FROM radixark/vllm-glm53-flash:sm121-v9
+
+# nsys (Nsight Systems) for GPU kernel-level profiling. Motivation: vLLM's
+# built-in torch profiler (--profiler-config.*) reproducibly crashes the
+# worker process on this stack (3/3 attempts, 2026-08-31 — silent NVRM-style
+# deaths and a genuine PythonTracer segfault under the mp executor, all at
+# POST /stop_profile, independent of trace size) — see recipes/VALIDATION.md.
+# nsys profiling from outside vLLM's in-process profiler subsystem sidesteps
+# that crashy code path entirely.
+#
+# The base image already carries an apt source for
+# developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/sbsa (used to
+# install the CUDA toolkit itself) — installing the cuda-keyring package on
+# top of it conflicts ("Conflicting values set for option Signed-By"), so
+# this reuses the already-trusted source as-is rather than adding a second
+# one for the same URL.
+#
+# nsight-systems-2026.1.3 (not the older nsight-systems-cli-2024.2.3, which
+# predates GB10/Blackwell CUDA-13-era support) pulls in ~19 small X11/Qt
+# client libs for its bundled GUI viewer — never invoked in this headless
+# container context, negligible size next to the rest of this image.
+RUN apt-get update -qq \
+    && apt-get install -y --no-install-recommends nsight-systems-2026.1.3 \
+    && rm -rf /var/lib/apt/lists/* \
+    && nsys --version && echo V10-OK

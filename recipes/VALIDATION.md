@@ -286,6 +286,74 @@ The cheap, always-on metrics shipped separately above
 those come from vLLM's ordinary Prometheus/logging path, not the profiler
 subsystem, and remain the working instrumentation baseline.
 
+## nsys in-image: also crashes, conclusively ruling out per-op GPU profiling on this cluster (2026-08-31)
+
+Built `nsys` (Nsight Systems 2026.1.3.425, arm64) into a new image layer —
+`docker/Dockerfile.glm53-sm121-v10`, `FROM sm121-v9`, installed via the CUDA
+apt repo already trusted by the base image (adding `cuda-keyring` on top
+conflicts with it — reused the existing source as-is). Built, verified
+(`nsys --version`), distributed to both nodes (`docker save | ssh ... docker
+load`). This sidesteps vLLM's in-process profiler entirely — nsys traces
+from outside, no dependency on the crashy code paths above.
+
+**Two attempts, two more crashes — same silent NVRM-style signature, zero
+traceback, at two completely different points:**
+
+1. `nsys profile --capture-range=cudaProfilerApi` paired with vLLM's
+   `--profiler-config.profiler=cuda` (bare `cudaProfilerStart`/`Stop`
+   markers — no Python tracer object, structurally can't hit the segfault
+   class above). Booted clean, served fine, but calling `POST
+   /start_profile` (which triggers `cudaProfilerStart()` in the worker)
+   killed the worker instantly — `Worker_TP0`'s last log line is ~44s
+   before the death, zero traceback in between.
+
+   First attempt at this also surfaced a real, separate, easily-fixed
+   issue worth keeping: `nsys`'s own CUPTI instrumentation costs ~19 GiB of
+   GPU memory before vLLM even starts (102.76/121.69 GiB free vs. the
+   103.44 GiB the coarse `gpu_memory_utilization=0.85` admission check
+   wants) — lowering gmu to 0.78 for nsys-wrapped launches clears it.
+
+2. Plain `nsys profile` with **no** capture-range and **no**
+   `--profiler-config.*` at all (unconditional capture from process
+   start, meant to be stopped externally via `SIGINT` after sending a
+   request — zero interaction with any vLLM profiler-activation code).
+   Never even reached ready: died mid-boot, inside
+   `determine_available_memory()` (vLLM's own peak-activation memory
+   profiler, which runs a dummy forward pass during warmup) — 13s after
+   the last TileLang compile log line, zero traceback.
+
+**Five consecutive crashes now, across two fundamentally different
+profiling mechanisms** (vLLM's built-in torch profiler x3, nsys x2),
+**triggered at different call sites** (`stop_profile` export,
+`cudaProfilerStart()`, a plain memory-profiling step with no profiler API
+involved at all) — the common thread is not a specific API bug, it's GPU/
+CUDA instrumentation overhead itself (CUPTI buffers, driver-level trace
+hooks) landing on top of GB10's already-thin memory margin on this
+cluster (see docs/GB10-KV-MEMORY-LADDER.md, docs/SM121-CRASH-FORENSICS-
+2026-08-27.md) and tipping it over. Verified after every crash via
+`torch.cuda.mem_get_info()` on both nodes: consistently clean, no trapped/
+eroded memory (123-126 GB free of 130.66 GB each time) — so this isn't
+compounding damage across attempts, it's the same wall, hit five different
+ways.
+
+**Conclusion: live, in-cluster GPU kernel-level profiling (vLLM's built-in
+profiler or nsys, in-process or wrapping) is not currently viable on this
+2-node cluster.** Not a config problem to keep iterating on. If per-kernel
+visibility is needed later, more promising directions: an isolated
+single-kernel microbenchmark harness (bypassing the full serving pipeline
+and its memory footprint entirely — closer to `probes/bench_glm53.py`'s
+shape than to live profiling) or dropping `kv_cache_memory` much lower / a
+much smaller `max_model_len` specifically for a profiling boot to buy nsys
+more headroom (untried — the two attempts here both used the shipped 3 GiB
+pin and 262144 max_model_len; a purpose-built minimal-footprint profiling
+config, rather than the production recipe plus nsys bolted on, might have
+enough margin left).
+
+The nsys image layer (`sm121-v10`) and its Dockerfile are kept — the build
+process itself worked cleanly and may be useful again with a
+lower-footprint launch config. The disposable profiling recipe used for
+this investigation is deleted, same as the torch-profiler one above.
+
 Not yet re-validated: the persistent_topk SM-count gate (a5c4b19) was proven
 out before `--enforce-eager` was dropped (2026-08-31, above). CUDA graph
 capture uses static shapes and could in principle route decode differently;
