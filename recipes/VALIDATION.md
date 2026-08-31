@@ -354,6 +354,71 @@ process itself worked cleanly and may be useful again with a
 lower-footprint launch config. The disposable profiling recipe used for
 this investigation is deleted, same as the torch-profiler one above.
 
+## MoE backend investigation: why Marlin, and what else was tried (2026-08-31)
+
+Prompted by `gb10-kernel-bench`'s finding (https://github.com/ozskywalker/
+gb10-kernel-bench) that the Marlin NVFP4 MoE GEMM costs 30-50x more than
+attention or MHC at the same batch size — the likely dominant cost in real
+decode. Investigated whether a faster backend is available.
+
+**Why Marlin wins (source-read, `vllm/model_executor/layers/fused_moe/
+oracle/nvfp4.py`, no launch needed):** the oracle tries backends in a fixed
+priority order and picks the first whose `is_supported_config()` passes.
+`FLASHINFER_TRTLLM` and `FLASHINFER_CUTEDSL` hard-require
+`is_device_capability_family(100)` — genuine SM100-class Blackwell
+(B100/B200 datacenter), not GB10's SM121. `FLASHINFER_CUTLASS`'s NVFP4
+path requires **both** weight and activation to be NVFP4-quantized
+(`(kNvfp4Static, kNvfp4Dynamic)`, i.e. w4a4) — our checkpoint
+(LibertAIDAI/GLM-5.3-Flash-NVFP4) is weight-only NVFP4 (w4a16, activations
+stay bf16), so this backend is never reached regardless of hardware.
+Marlin is the first backend in the list whose scheme check actually
+matches w4a16 NVFP4. **This is a checkpoint-quantization-scheme
+constraint, not a fixable/overly-conservative capability gate** — unlike
+several past findings in this project (persistent_topk's SM-count gate,
+the PDL capability≥9 gate), there's no obvious wrong check to relax here.
+
+**Two backends do support our exact scheme and pass their device checks
+on this hardware** (confirmed via direct `_supports_current_device()`
+calls, no launch needed): `HUMMING` (`(kNvfp4Static, None)`,
+`has_device_capability((7,5))`) and `flashinfer_b12x`
+(`(kNvfp4Static, None)`, `is_device_capability_family(120)`) — both never
+get reached in auto-selection because Marlin sits earlier in the priority
+list and already succeeds. `flashinfer_b12x` is additionally excluded
+from auto-selection entirely by an explicit code comment: "intentionally
+excluded... until the upstream CUTLASS SM121 MMA op guard is resolved."
+Notably, `flashinfer_b12x` (the `ghcr.io/spark-arena/dgx-vllm-eugr-
+nightly-b12x` image) is already used in production on this same fleet for
+the DeepSeek-V4-Flash recipes archived in `~/ai/recipes`.
+
+**Tested `-o moe_backend=humming` directly on the real recipe (real
+weights, not synthetic) — crashed twice, same signature both times:**
+
+1. Default gmu (0.85): booted, loaded main weights fine (27.65s), then
+   during the second (MoE-conversion) weight pass hit `RuntimeWarning:
+   Shrink io_depth from 256 to 186 due to memory limit`, slowed ~20x
+   (349 MB/s vs. the usual 6-9 GB/s), then the worker died silently
+   (`exit code: None`) at ~1% into that pass.
+2. Lowered `gpu_memory_utilization` to 0.78 (the fix that worked for
+   nsys's overhead earlier) — same `io_depth` warning (shrunk to 203 this
+   time, slightly better), same slow pass, same silent death at ~1%.
+
+Both crashes verified clean afterward via `torch.cuda.mem_get_info()` on
+both nodes (125+ GB free of 130.66 GB) — not trapped/compounding memory,
+a real per-attempt memory-pressure failure in HUMMING's weight-conversion
+path specifically. **Conclusion: HUMMING is not viable on this cluster
+without a deeper fix to its loading-time memory footprint** — this isn't
+a quick gmu tweak away, unlike the earlier CUDA-graph/nsys cases.
+
+**`flashinfer_b12x` was not tested live this session** (time/cluster-time
+budget) — it remains the most promising untried lead: proven in
+production on this exact fleet for a different model, purpose-built for
+w4a16 NVFP4 (in-kernel BF16->FP4 activation quant per its own code
+comment), and passes its device-capability check on GB10. The documented
+caveat is a real, named upstream correctness concern (the SM121 CUTLASS
+MMA op guard), not a resource/memory issue like HUMMING's — worth testing
+with the same care (sanity + soak, not just "does it boot") if pursued.
+Test via `-o moe_backend=flashinfer_b12x` on the shipped recipe.
+
 Not yet re-validated: the persistent_topk SM-count gate (a5c4b19) was proven
 out before `--enforce-eager` was dropped (2026-08-31, above). CUDA graph
 capture uses static shapes and could in principle route decode differently;
