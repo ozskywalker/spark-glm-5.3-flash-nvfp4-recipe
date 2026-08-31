@@ -441,6 +441,59 @@ combo would need either a genuinely different checkpoint (full w4a4
 NVFP4, unlocking FLASHINFER_CUTLASS) or a kernel-level fix to one of the
 rejected backends — not a recipe-level config change.
 
+## Checkpoint swap: LibertAIDAI -> RedHatAI (correctness fix, 2026-08-31)
+
+Prompted by tonyd2wild/GLM-5.3-Flash-NVFP4-DFlash2-2x-DGX-Spark's README, which
+documents a reproducible token-corruption bug in ModelOpt-quantized NVFP4
+builds of this model (vLLM #54150): intermittent corrupted token IDs,
+invisible in English, surfacing as U+FFFD inside CJK/emoji output. Measured
+by tonyliu312/GLM-5.3-Flash-DFlash2-TP4-1M-Context against real gateway
+traffic: 16/1997 requests (0.80%) corrupted, and reproduced directly
+against `LibertAIDAI/...NVFP4` (our previous checkpoint) 4/4 runs on
+Korean text, 0/4 on `RedHatAI/GLM-5.3-Flash-NVFP4` (a compressed-tensors
+conversion of the same base model).
+
+Checked the actual published `quantization_config` before assuming
+anything from the README: **RedHatAI's checkpoint is weight-only NVFP4
+too** (`input_activations: None` in both quant groups) — contrary to the
+README's claim that it's W4A4, this does NOT unlock `FLASHINFER_CUTLASS`
+for MoE (see the MoE backend investigation section above). One wrinkle:
+layer 45's experts are 8-bit weight-only (`float-quantized`) rather than
+4-bit — every other layer is uniform NVFP4. Confirmed at boot: a *second*,
+separate `Using MARLIN Fp8 MoE backend` selection fires for that one
+layer, alongside the usual NVFP4 Marlin selection for the other 41.
+
+Downloaded via `hf download RedHatAI/GLM-5.3-Flash-NVFP4` (~185 GiB, 21
+files) to the head node, synced to the worker over the internal fabric
+(`rsync`, faster than a second independent download). Tested via a
+disposable `-o`-free copy of the shipped recipe with only `model_path`
+changed — everything else identical (Marlin, fp8 KV, MTP-4, CUDA graphs,
+3 GiB pin, the new metrics flags).
+
+**Result: booted clean, full suite passed, zero corruption reproduced:**
+
+- Boot: weights loaded in 30.66s (first pass) + 26.84s (second/MTP pass,
+  now routes through a distinct Fp8 Marlin path for layer 45) — comparable
+  to the previous checkpoint, no regression.
+- MoE backend: still `MARLIN` for the bulk of layers, as expected (scheme
+  unchanged) — `Using 'MARLIN' NvFp4 MoE backend out of potential
+  backends: [...]` logged identically to before.
+- KV pool: 365,621 tokens — matches the previous checkpoint's figure
+  exactly (same architecture, same config).
+- `probe_sanity.py`, `probe_soak.py` (2 rounds x 2 waves),
+  `probe_cache_continuation.py`: all PASSED.
+- **Corruption check** (reproducing tonyliu312's methodology): 4
+  generations at `temperature=0` — Korean prose, Traditional Chinese with
+  emoji, an emoji-definition list, a Japanese haiku — **zero U+FFFD**
+  across all four, vs. the documented reproduction on the old checkpoint.
+
+**Promoted to the shipped recipe.** `model_path` now points at
+`RedHatAI/GLM-5.3-Flash-NVFP4`'s snapshot; header comment updated with the
+full rationale. The disposable test recipe is deleted. Weights are on both
+nodes at `/models/models--RedHatAI--GLM-5.3-Flash-NVFP4/snapshots/
+36c184c6cda000a481711306df5adde42f63321a` — the old LibertAIDAI weights
+are left in place (not deleted) in case of rollback.
+
 Not yet re-validated: the persistent_topk SM-count gate (a5c4b19) was proven
 out before `--enforce-eager` was dropped (2026-08-31, above). CUDA graph
 capture uses static shapes and could in principle route decode differently;

@@ -1,8 +1,22 @@
 # Recipe: GLM-5.3-Flash NVFP4 (TP=2 across 2x DGX Spark, vLLM native multi-node)
 #
 # sparkrun port of launch-glm53-vllm-tp2.sh (tonyd2wild/GLM-5.3-Flash-NVFP4-2x-DGX-Spark).
-# Serving LibertAIDAI/GLM-5.3-Flash-NVFP4 (320B total / 18B active MoE, glm5_next,
-# weight-only NVFP4) at TP=2 over two GB10 nodes with fp8 KV + MTP-4 + thinking-off.
+# Serving RedHatAI/GLM-5.3-Flash-NVFP4 (320B total / 18B active MoE, glm5_next,
+# weight-only NVFP4, compressed-tensors format) at TP=2 over two GB10 nodes with
+# fp8 KV + MTP-4 + thinking-off.
+#
+# Checkpoint swapped from LibertAIDAI/GLM-5.3-Flash-NVFP4 (2026-08-31): the
+# ModelOpt-quantized checkpoint has a documented, reproducible token-corruption
+# bug (vLLM #54150) - intermittent corrupted token IDs, invisible in English,
+# surfacing as U+FFFD inside CJK/emoji output (real gateway traffic measured
+# by tonyliu312/GLM-5.3-Flash-DFlash2-TP4-1M-Context: 16/1997 requests, 0.80%).
+# RedHatAI's compressed-tensors conversion of the same base model does not
+# reproduce it. Re-verified directly on this cluster: 4/4 CJK+emoji
+# generations at temperature 0 came back with zero U+FFFD, full validation
+# suite (sanity, soak, cache-continuation) passed. Same weight-only NVFP4
+# scheme as before (checked the published quantization_config directly:
+# input_activations is None in both quant groups) - MoE backend still
+# resolves to Marlin, no change there. See VALIDATION.md 2026-08-31 entry.
 #
 # Deviations from the source script (all deliberate, see comments inline):
 #   1. Weights are served from the pre-placed HF-cache snapshot under /models on
@@ -89,8 +103,10 @@ defaults:
   host: 0.0.0.0
   served_model_name: glm-5.3-flash
   tensor_parallel: 2
-  # Pre-placed snapshot (identical hash on both nodes; override via -o if it moves)
-  model_path: /models/models--LibertAIDAI--GLM-5.3-Flash-NVFP4/snapshots/aa28e1f54130286c95fee10d0705c74ce8743734
+  # Pre-placed snapshot (identical hash on both nodes; override via -o if it moves).
+  # RedHatAI/GLM-5.3-Flash-NVFP4 (see header note on the 2026-08-31 checkpoint
+  # swap) — ships its own MTP head too.
+  model_path: /models/models--RedHatAI--GLM-5.3-Flash-NVFP4/snapshots/36c184c6cda000a481711306df5adde42f63321a
   # Vision-capable template honoring enable_thinking (see header note 3)
   chat_template: /models/glm53-flash-chat_template_mm.jinja
   # --- capacity (262144 = script config; 3 GiB pool ~= 370K fp8 KV tokens = 1.4x) ---

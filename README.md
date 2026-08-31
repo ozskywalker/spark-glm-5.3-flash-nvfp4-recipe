@@ -1,6 +1,8 @@
 # GLM-5.3-Flash on 2x NVIDIA DGX Spark
 
-Serving [zai-org/GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) (320B total / 18B active MoE, released 2026-08-26) across two DGX Spark (GB10, SM121) nodes at tensor-parallel 2, using the [LibertAIDAI/GLM-5.3-Flash-NVFP4](https://huggingface.co/LibertAIDAI/GLM-5.3-Flash-NVFP4) weight-only NVFP4 quant. **262,144-token context on TP2 — and the model-native 1,048,576 (1M) on TP4, whose 3.77M-token KV pool holds 3.6 full 1M-token requests. Working, benchmarked, same-day as the model drop.**
+Serving [zai-org/GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) (320B total / 18B active MoE, released 2026-08-26) across two DGX Spark (GB10, SM121) nodes at tensor-parallel 2, using the [RedHatAI/GLM-5.3-Flash-NVFP4](https://huggingface.co/RedHatAI/GLM-5.3-Flash-NVFP4) weight-only NVFP4 quant (compressed-tensors format — see the checkpoint-swap note below). **262,144-token context on TP2 — and the model-native 1,048,576 (1M) on TP4, whose 3.77M-token KV pool holds 3.6 full 1M-token requests. Working, benchmarked, same-day as the model drop.**
+
+**Checkpoint swap (2026-08-31):** switched from `LibertAIDAI/GLM-5.3-Flash-NVFP4` to `RedHatAI/GLM-5.3-Flash-NVFP4` to fix a documented, reproducible token-corruption bug in ModelOpt-quantized NVFP4 builds of this model ([vLLM #54150](https://github.com/vllm-project/vllm/issues/54150) — intermittent corrupted token IDs, invisible in English, surfacing as U+FFFD inside CJK/emoji output; found via [tonyd2wild/GLM-5.3-Flash-NVFP4-DFlash2-2x-DGX-Spark](https://github.com/tonyd2wild/GLM-5.3-Flash-NVFP4-DFlash2-2x-DGX-Spark)). Reproduced the corruption on the old checkpoint and its absence on the new one directly on this cluster (4/4 vs 0/4 CJK+emoji generations at temp 0). Same weight-only NVFP4 scheme, same flags, no MoE backend change — see `recipes/VALIDATION.md`.
 
 As far as we can tell this was the first working GLM-5.3-Flash deployment on DGX Spark hardware. Getting there took fixing **seven distinct day-0 bugs** across vLLM, FlashInfer, and their dependency chain — every one is documented in [docs/DEPLOY-REPORT.md](docs/DEPLOY-REPORT.md) with root causes, receipts, and the probe scripts that found them.
 
@@ -112,7 +114,7 @@ experiment lane before production).
 
 ## Credits
 
-- Model: [zai-org/GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) · Quant: [LibertAIDAI/GLM-5.3-Flash-NVFP4](https://huggingface.co/LibertAIDAI/GLM-5.3-Flash-NVFP4) (their sm_121 notes were used directly)
+- Model: [zai-org/GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) · Quant: [RedHatAI/GLM-5.3-Flash-NVFP4](https://huggingface.co/RedHatAI/GLM-5.3-Flash-NVFP4) (swapped 2026-08-31 from LibertAIDAI's ModelOpt build to fix a token-corruption bug — see above; LibertAIDAI's sm_121 notes were used directly during original bring-up)
 - **barrydeen** — the gmu 0.85 reference config and quantization-coverage table from their independently published DGX Spark recipe
 - vLLM [PR #53906](https://github.com/vllm-project/vllm/pull/53906) authors for the day-0 image; FlashInfer for the 0.6.18 SM90-NoPE MLA path
 - Deployed and debugged by Knox (Claude) for [@tonyd2wild](https://github.com/tonyd2wild)
