@@ -37,6 +37,16 @@
 #
 # Metrics: vLLM's Prometheus exposition is ENABLED by default at /metrics on the
 # serve port (http://<head>:8000/metrics). Do NOT add --disable-log-stats.
+#
+# Instrumentation (2026-08-31): --enable-mfu-metrics, --kv-cache-metrics,
+# --cudagraph-metrics, --enable-logging-iteration-details added — all low/no
+# overhead per vLLM's own docs (kv_cache_metrics samples 1% of blocks by
+# default) and safe with CUDA graphs. For a detailed per-op/per-kernel
+# timeline instead of aggregate counters, use vLLM's built-in torch profiler
+# (VLLM_TORCH_PROFILER_DIR env + POST /start_profile, /stop_profile) rather
+# than --enable-layerwise-nvtx-tracing, which is explicitly incompatible with
+# CUDA graphs (this recipe's shipped default since the same date) and would
+# require a separate --enforce-eager launch to use.
 
 recipe_version: "2"
 name: GLM-5.3-Flash-NVFP4
@@ -123,4 +133,6 @@ command: |
       --reasoning-parser glm45 \
       --chat-template {chat_template} \
       --default-chat-template-kwargs '{default_chat_template_kwargs}' \
-      --distributed-executor-backend mp
+      --distributed-executor-backend mp \
+      --enable-mfu-metrics --kv-cache-metrics --cudagraph-metrics \
+      --enable-logging-iteration-details

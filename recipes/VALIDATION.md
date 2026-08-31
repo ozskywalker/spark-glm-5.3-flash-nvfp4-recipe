@@ -205,6 +205,39 @@ No config change made or needed; `index_topk` stays at the model's default
 since we run `FLASHINFER_MLA_SPARSE_SM90` on GB10, but worth knowing if this
 ever comes up again for a different backend/hardware combo.
 
+## Instrumentation: cheap observability flags shipped (2026-08-31)
+
+Added `--enable-mfu-metrics`, `--kv-cache-metrics`, `--cudagraph-metrics`,
+`--enable-logging-iteration-details` to the shipped TP2 recipe — all
+documented as low/no-overhead in vLLM's own config and safe alongside the
+CUDA-graph default (unlike `--enable-layerwise-nvtx-tracing`, which explicitly
+isn't). Boots clean, sanity + soak pass with no observable perf change.
+
+Confirmed live via `/metrics` and container logs:
+- `vllm:estimated_flops_per_gpu_total` / `_created` (MFU building blocks) —
+  present.
+- `vllm:cache_config_info` and related KV series — present (pre-existing +
+  `--kv-cache-metrics` sampling).
+- Per-iteration log lines (`Iteration(N): ... context requests ... generation
+  tokens, iteration elapsed time: Xms, GPU KV cache usage: Y%`) — present,
+  one per engine step.
+
+Not yet confirmed: a distinct `cudagraph`-named metric series never appeared
+in `/metrics` after boot, sanity, or a full soak pass — no error either, so
+it may just need a trigger condition (a specific dispatch-mode transition?)
+not yet exercised. Flag stays on; revisit if it matters later.
+
+For a detailed per-op/per-kernel timeline (not aggregate counters), use
+vLLM's built-in torch profiler instead of `--enable-layerwise-nvtx-tracing`
+(incompatible with CUDA graphs): `VLLM_TORCH_PROFILER_DIR` env +
+`POST /start_profile` / `POST /stop_profile`. `nsys` is present on both
+cluster nodes' hosts but NOT inside the `sm121-v9` container image and isn't
+cleanly `pip`/`apt`-installable there without real Dockerfile work — the
+built-in torch profiler covers the same "where does time go" question with
+zero extra installs, at the cost of one temporary `--enforce-eager` launch
+(graph-captured decode collapses into fewer distinguishable Python-level ops
+in a profiler trace).
+
 Not yet re-validated: the persistent_topk SM-count gate (a5c4b19) was proven
 out before `--enforce-eager` was dropped (2026-08-31, above). CUDA graph
 capture uses static shapes and could in principle route decode differently;
