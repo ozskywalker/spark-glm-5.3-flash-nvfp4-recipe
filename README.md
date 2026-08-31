@@ -8,8 +8,8 @@ As far as we can tell this was the first working GLM-5.3-Flash deployment on DGX
 
 | Metric | bf16 TP2 (v7) | fp8+MTP-4 TP2 (v8) | **fp8+MTP-4 TP4 (v8, flagship)** |
 |---|---|---|---|
-| TTFT (median, 3 runs) | 0.239 s | 0.289 s | **0.204 s** |
-| Decode | 14.3 tok/s | 21.8 tok/s | **35.7 tok/s (peak 36.8)** |
+| TTFT (median, 3 runs) | 0.239 s | 0.31 s | **0.204 s** |
+| Decode | 14.3 tok/s | 25-26 tok/s (CUDA graphs, 2026-08-31) | **35.7 tok/s (peak 36.8)** |
 | Context | 262,144 | 262,144 | **up to 1,048,576 (model-native 1M)** |
 | KV pool | 603,144 tokens | 672,606 tokens (local weights) | **2,516,582 tokens (2.4x full 1M context, forensics-gated)** |
 | Nodes | 2 | 2 | 4 (`launch-glm53-vllm-tp4.sh`) |
@@ -20,6 +20,8 @@ TP4 also dissolves the GB10 KV-allocation ceiling documented in the memory-ladde
 **5M KV / 1M context on TP4 (2026-08-27, stress-gated):** the shipped TP4 config is now **16 GiB KV per rank = 2,516,582 fp8 tokens** (see docs/SM121-CRASH-FORENSICS-2026-08-27.md for why bigger pools fail), found by the residual-headroom rule: grow the KV slab until ~8-10 GB stays available per node. 38 GiB (5.97M tokens) allocates and even answers short prompts, then the first 20K-token prefill's activation transient NVRM-OOMs the engine — "serving" is not the bar, surviving a long prefill is. Gate every KV bump behind CONCURRENT prefills: 32 GiB passed a single-prefill gate, then died under three overlapping requests from real traffic (the head rank also carries the API server + NFS duty). 24 GiB survives 3x simultaneous 20K prefills with ~18 GB residual on the head.
 
 **1M context on TP4:** GLM-5.3-Flash ships `max_position_embeddings = 1,048,576`, and the TP4 KV pool (3,774,873 tokens) holds 3.6 full-length requests, so `--max-model-len 1048576` is within both the model's and the pool's limits — no rope scaling, no overrides. The launcher now defaults to 1M. Practical notes: a full 1M-token prefill takes many minutes of wall clock before the first output token, and concurrency at full depth is ~1.2 requests; cap `--max-model-len` lower (e.g. 300000) when you want a snappier multi-user endpoint.
+
+**TP2 CUDA graphs (2026-08-31):** `--enforce-eager` dropped from the sparkrun TP2 recipe — an isolated test (same 3 GiB/rank KV pin, same gmu 0.85, only `--enforce-eager` removed) passed the full validation suite including the 250K-token prefill and lifted decode from 21.8 to 25-26 tok/s (~15-20%). The earlier belief that this cluster needed eager mode was conflated with a separate, unpinned-KV config that OOM'd — see `recipes/VALIDATION.md`.
 
 **TP2 KV update (2026-08-27):** with LOCAL weights on both ranks (no NFS duty) plus an aggressive cache-flush ritual, TP2 holds **672,606 fp8 KV tokens** (`--kv-cache-memory 5905580032`), stress-verified — a +33% jump over the 507,041-token NFS-bound ceiling (which still applies when one rank doubles as the NFS server). The Results table above now reflects this local-weights number. 6 GiB+/rank reservations "succeed" then die on first touch in warmup (phantom backing). The 8-attempt hunt, the first-touch failure signature, and every lever that did NOT work are in [docs/KV-HUNT-672K-TP2-RECORD.md](docs/KV-HUNT-672K-TP2-RECORD.md).
 

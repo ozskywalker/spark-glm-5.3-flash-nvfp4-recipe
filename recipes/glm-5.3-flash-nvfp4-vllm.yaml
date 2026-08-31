@@ -16,6 +16,13 @@
 #      of 4.14-5.5 GiB died in the silent NVRM first-touch kill (exit code None,
 #      no dmesg trace — docs/KV-HUNT-672K-TP2-RECORD.md signature). 3 GiB boots
 #      clean and survived the full validation suite incl. a 250K-token prefill.
+#   5. --enforce-eager DROPPED (2026-08-31): CUDA graph capture is safe on top
+#      of the 3 GiB pin (isolated test — pin held constant, only enforce-eager
+#      removed) and lifts decode from 21.8 to ~25-26 tok/s. The earlier failure
+#      that motivated eager mode was actually an unpinned-KV + gmu-0.87 config
+#      leaving only 1.27 GiB available (needed 2.13 GiB) — not CUDA graphs
+#      themselves. Re-validated full suite incl. 250K-token prefill; see
+#      VALIDATION.md 2026-08-31 entries.
 #   3. --chat-template points at the repo's chat_template_mm.jinja (copied to
 #      /models on both nodes). The checkpoint's own chat_template.jinja ignores
 #      enable_thinking and always reasons at max effort; the mm template honors
@@ -88,6 +95,12 @@ defaults:
   block_size: 2304
   moe_backend: marlin
   kv_cache_dtype: fp8_e4m3
+  # Made explicit (2026-08-31) rather than left at vLLM's implicit default —
+  # was previously unset (silently defaulting to 2048). No cap-fighting
+  # long_prefill_token_threshold exists in this build (it defaults to 0 =
+  # disabled; verified against our own image source), so this value directly
+  # governs the per-iteration prefill chunk budget. Override via -o to tune.
+  max_num_batched_tokens: 2048
   # --- MTP day-1 config (image has Glm5NextMTPModel) ---
   speculative_config: '{"method":"mtp","num_speculative_tokens":4}'
   # --- parsers / chat ---
@@ -105,7 +118,7 @@ command: |
       --moe-backend {moe_backend} \
       --speculative-config '{speculative_config}' \
       --kv-cache-dtype {kv_cache_dtype} --kv-cache-memory {kv_cache_memory} \
-      --enforce-eager \
+      --max-num-batched-tokens {max_num_batched_tokens} \
       --tool-call-parser glm47 --enable-auto-tool-choice \
       --reasoning-parser glm45 \
       --chat-template {chat_template} \

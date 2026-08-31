@@ -61,6 +61,157 @@ the SM100 non-MLA trtllm-gen kernel). The custom `nvfp4_ds_mla` kernel work
 required is specced in docs/NVFP4-KV-BUILD-SPEC.md but was never built. The
 recipe is kept as the target lane for that build.
 
+## TP2 unpinned-KV + CUDA-graph experiment: confirmed failure (2026-08-31)
+
+`glm-5.3-flash-nvfp4-vllm-testing.yaml` (uncommitted at the time) dropped three
+things from the validated recipe simultaneously: the `--kv-cache-memory
+3221225472` pin, `--enforce-eager`, and bumped `gpu_memory_utilization`
+0.85 -> 0.87 — betting that auto-sized KV would now be safe given everything
+learned since (persistent_topk fix, driver-wall forensics).
+
+**Result: fails cleanly at engine init, before weight-adjacent memory is
+touched further.** Weights load fine (InstantTensor, 27.45 s). KV-cache
+sizing then raises a plain `ValueError`: "available KV cache memory (1.27
+GiB)" vs "2.13 GiB KV cache is needed" for max_model_len=262144 — i.e. gmu
+0.87 without a pin leaves **less** than half the headroom the working 3 GiB
+pin uses. sparkrun's own dry-run VRAM estimator predicted 14.6 GB available
+at gmu 0.87 (681K-token capacity) — off by >10x from the real number; treat
+that estimator as directional only on this cluster, not load-bearing.
+
+This is a *different* failure signature from the documented silent NVRM
+first-touch kill (worker `exit code: None`, no dmesg trace): here the engine
+raises a real exception and exits with a message, before any KV slab is
+pinned. The APIServer process then hangs post-exception with the container
+still reporting `Up` in `docker ps`/`sparkrun status` — another confirmation
+of the "don't trust liveness, probe `/health`" rule (see fleet_watchdog.sh).
+
+Suspected primary cause: removing `--enforce-eager` re-enables CUDA graph
+capture, which reserves activation memory *before* the KV-cache sizing step
+— shrinking the pool available to the KV check independent of the gmu bump.
+This matches an independent community finding (MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks
+issue #47, EXL3/vLLM on the same hardware): full-depth CUDA graph capture at
+1M context OOM'd even under an explicit KV-memory-bytes pin, and
+`ENFORCE_EAGER=1` + explicit pin was their workaround. Follow-up test below
+isolates this variable.
+
+Not yet re-tested: whether `index_topk` on this image needs the same
+`2044` cap that Reederey87/glm53-flash-exl3-2x-dgx-spark found necessary on
+the same NoPE/sparse-attention kernel family (their fix for a 2048-wide
+buffer overflow) — worth checking against our persistent_topk crash
+(a5c4b19) as a separate experiment; not exercised by this test.
+
+## TP2 CUDA-graph isolation test: PASSED, promoted to the shipped recipe (2026-08-31)
+
+Follow-up to the failure above: held the validated 3 GiB pin + gmu 0.85
+constant, changed only one variable — dropped `--enforce-eager`. This
+isolates whether CUDA graph capture itself (as opposed to the missing pin)
+was responsible for the earlier OOM.
+
+**Result: full suite PASSED**, incl. the 250K-token prefill — the same
+memory-pressure test the original enforce-eager config was validated against.
+
+| Check | Result |
+|---|---|
+| Model load (InstantTensor) | clean, `Application startup complete` |
+| Sanity (`probe_sanity.py`) | PASS — TTFT 0.31-0.33s, decode **25.1-26.3 tok/s** (vs 21.8 tok/s baseline with `--enforce-eager`, +~15-20%) |
+| Soak (`probe_soak.py`, 2 rounds x 2 waves) | PASS — 10/10 + 10/10 sequential, 3/3 + 3/3 concurrent, endpoint alive after |
+| Cache continuation | PASS — cold/partial/warm all retrieved planted code, no degenerate output |
+| Long context 249,951 tokens | PASS — TTFT 195.3s, 4/4 planted codes retrieved |
+
+Conclusion: the OOM in the experiment above was caused by dropping the
+`--kv-cache-memory` pin (and/or the gmu 0.85->0.87 bump), not by CUDA graph
+capture. With the pin held constant, CUDA graphs are safe and strictly
+improve decode throughput. **`--enforce-eager` removed from the shipped TP2
+recipe** (`glm-5.3-flash-nvfp4-vllm.yaml`); `glm-5.3-flash-nvfp4-vllm-testing.yaml`
+retired now that its finding is folded into the main recipe.
+
+## max_num_batched_tokens tuning: 2048 baseline OK, 3584 hits the memory wall (2026-08-31)
+
+Prompted by an unverified third-party (Twitter) claim that vLLM's
+`long_prefill_token_threshold` silently caps prefill chunks at 1792 tokens
+regardless of `--max-num-batched-tokens`. **Checked directly against our
+image's vLLM source (`0.1.dev20051+g487ecf187`) before touching config:**
+`long_prefill_token_threshold` defaults to `0` (`vllm/config/scheduler.py:70`)
+and the scheduler only applies it when `0 < threshold < num_new_tokens`
+(`scheduler.py:526`,`907`) — at 0 it's a no-op. No `1792` literal exists
+anywhere relevant in our image (the only hits are unrelated: H100 MoE
+autotune JSON configs, an image-processor pixel constant, an LFM2 model
+default). **The claimed bug does not apply to this build/recipe** — we had
+also never explicitly set `--max-num-batched-tokens` (silently defaulting to
+vLLM's own default of 2048), so this was a legitimate blind spot worth
+testing on its own merits, independent of the debunked claim.
+
+Made `max_num_batched_tokens` an explicit recipe default (2048, i.e. no
+behavior change) and tested raising it:
+
+| Value | 64K-token cold-prefill TTFT | Result |
+|---|---|---|
+| 2048 (baseline, now explicit) | 53.3 s (~1198 tok/s effective) | PASS |
+| 3584 | — | **FAIL: silent worker death** |
+
+At 3584, `Worker_TP0` produced its last log line at boot (kernel warmup,
+graph capture finished, "Breakable CUDA graph enabled") and then **vanished
+with zero traceback** ~75 s later, mid-request, during the 64K-token
+prefill: `Worker proc VllmWorker-0 died unexpectedly (exit code: None)` —
+the exact silent NVRM first-touch-kill signature from
+docs/KV-HUNT-672K-TP2-RECORD.md and the 2026-08-31 unpinned-KV failure
+above, this time triggered by a larger per-iteration prefill activation
+footprint (`--max-num-batched-tokens`) rather than KV pool size or CUDA
+graph capture itself. **`max_num_batched_tokens` stays at 2048 in the
+shipped recipe** — this cluster's memory ceiling is sensitive to prefill
+batch size too, not just `kv_cache_memory`/`gpu_memory_utilization`.
+
+Caution for follow-up experiments: MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks
+issue #47 reports that on 610.43.02-class drivers, memory freed by a killed
+CUDA process can stay "trapped" until a full reboot (not released by
+`nvidia-persistenced` restart), eroding the usable floor by ~0.5-1 GiB per
+failed launch. Checked directly after this failure via `torch.cuda.mem_get_info()`
+in a throwaway container on both nodes: 121-125 GB free of 130.66 GB total —
+no sign of erosion, well clear of MiaAI's ~101-102 GB reported ceiling. (Our
+driver/kernel combo, `580.173.02` / `6.17.0-1031-nvidia`, matches the
+Canonical-packaged pairing MiaAI flagged as showing the OS/CUDA memory-
+accounting gap, for reference if this resurfaces.)
+
+## index_topk buffer-overflow check: not applicable, already fixed differently (2026-08-31)
+
+Follow-up to Reederey87/glm53-flash-exl3-2x-dgx-spark's finding that
+`index_topk=2048` "overflows the kernel's 2048-wide buffer arithmetic" with
+their kpool-tail KV layout, fixed there via `--hf-overrides
+'{"index_topk":2044}'`. Our model config matches their setup closely enough
+to be worth checking directly: `index_topk=2048`, `index_kpool=4`,
+`index_kpool_always_select_tail=True` (from the checkpoint's `config.json`).
+
+**Checked against our own image source — the bug class doesn't apply to us,
+for two independent reasons:**
+
+1. **The persistent_topk crash we already fixed (a5c4b19) never reaches this
+   path on GB10.** `docker/sparse_attn_indexer_kpool_sm121.py` gates
+   `persistent_topk` on `multi_processor_count >= 78`; GB10 has 48 SMs, so
+   every decode routes to `top_k_per_row_decode` instead, unconditionally.
+2. **Our build's `topk_indices_buffer` is already sized with the tail
+   margin Repo 1 was missing.** `vllm/models/glm5next/nvidia/model.py`
+   allocates `buffer_width = topk_tokens + (index_kpool - 1)` (2048 + 3 =
+   2051, rounded up to the next multiple of BLOCK_N=128 -> 2176 — this is
+   the "2176-wide kpool index buffer" already referenced in this repo's
+   README), not a bare 2048-wide buffer. `expand_pools_and_append_tail`
+   writes `topk + pool_size - 1` columns and the buffer already has room for
+   exactly that. Repo 1 was evidently on an older/different vLLM commit
+   without this fix; ours already carries it.
+
+No config change made or needed; `index_topk` stays at the model's default
+(2048). Also note: forcing `index_topk=2044` would be actively wrong on the
+`FLASHINFER_MLA_SPARSE_SM120` backend, which hard-asserts
+`index_topk == 2048` (`flashinfer_mla_sparse.py:227`) — irrelevant to us
+since we run `FLASHINFER_MLA_SPARSE_SM90` on GB10, but worth knowing if this
+ever comes up again for a different backend/hardware combo.
+
+Not yet re-validated: the persistent_topk SM-count gate (a5c4b19) was proven
+out before `--enforce-eager` was dropped (2026-08-31, above). CUDA graph
+capture uses static shapes and could in principle route decode differently;
+worth a dedicated >24K-context decode soak under the current CUDA-graph
+config to confirm the gate still holds, since that's a different question
+than the one this section answers.
+
 ## Reproduce
 
 ```bash
