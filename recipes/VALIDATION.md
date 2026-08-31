@@ -409,15 +409,37 @@ path specifically. **Conclusion: HUMMING is not viable on this cluster
 without a deeper fix to its loading-time memory footprint** — this isn't
 a quick gmu tweak away, unlike the earlier CUDA-graph/nsys cases.
 
-**`flashinfer_b12x` was not tested live this session** (time/cluster-time
-budget) — it remains the most promising untried lead: proven in
-production on this exact fleet for a different model, purpose-built for
-w4a16 NVFP4 (in-kernel BF16->FP4 activation quant per its own code
-comment), and passes its device-capability check on GB10. The documented
-caveat is a real, named upstream correctness concern (the SM121 CUTLASS
-MMA op guard), not a resource/memory issue like HUMMING's — worth testing
-with the same care (sanity + soak, not just "does it boot") if pursued.
-Test via `-o moe_backend=flashinfer_b12x` on the shipped recipe.
+**Tested `-o moe_backend=flashinfer_b12x` directly — cleanly rejected,
+not a crash:**
+
+```
+ValueError: Model sets swiglu_limit=10.0, but the explicitly requested
+moe_backend='flashinfer_b12x' does not apply the SwiGLU clamp. Use
+'flashinfer_trtllm', 'flashinfer_cutlass', 'flashinfer_cutedsl', 'cutlass',
+'marlin', or 'humming' instead.
+```
+
+GLM-5.3-Flash's config sets `swiglu_limit=10.0` (a SwiGLU activation clamp
+for numerical stability); `flashinfer_b12x`'s kernel doesn't implement
+that clamp, and vLLM's own oracle (`NVFP4_BACKENDS_WITH_CLAMP` in
+`oracle/nvfp4.py`) correctly refuses the combination rather than risk
+silently-wrong output. This is a **second, independent reason** B12X is
+unusable here, on top of the "upstream CUTLASS SM121 MMA op guard"
+exclusion noted earlier — not something fixable by a flag; it would need
+a real kernel change (implementing the clamp) to ever work for this
+specific model, even though B12X works fine for DeepSeek-V4-Flash (no
+swiglu_limit) on this same fleet.
+
+**Conclusion: both untried alternatives are genuine dead ends for THIS
+model**, for two different, well-understood reasons — HUMMING crashes
+from memory pressure in its weight-loading path, B12X is correctly
+blocked by a real architecture-compatibility check. Marlin is the only
+NVFP4 w4a16 MoE backend that actually works for GLM-5.3-Flash on this
+image. Verified clean afterward via `torch.cuda.mem_get_info()` (no
+trapped memory). Further MoE speedup on this exact model/hardware/quant
+combo would need either a genuinely different checkpoint (full w4a4
+NVFP4, unlocking FLASHINFER_CUTLASS) or a kernel-level fix to one of the
+rejected backends — not a recipe-level config change.
 
 Not yet re-validated: the persistent_topk SM-count gate (a5c4b19) was proven
 out before `--enforce-eager` was dropped (2026-08-31, above). CUDA graph
