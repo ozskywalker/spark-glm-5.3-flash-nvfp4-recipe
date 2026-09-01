@@ -1,0 +1,230 @@
+# Recipe: GLM-5.3-Flash EXL3 (TP=2 across 2x DGX Spark, vLLM native multi-node)
+#
+# *** VALIDATED 2026-09-01 — full results in VALIDATION.md ***
+# Booted clean on the FIRST attempt (base config), then again with CUDA
+# graphs, then again with DFlash2 k=7 — all three succeeded where every
+# NVFP4+DFlash2 attempt this session failed (5/5 crashes). Shipped default
+# below is CUDA graphs + DFlash2 k=7 (community's own headline config).
+# Summary: EXL3 + MTP k=2 = 26.75 tok/s prose (beats the NVFP4 baseline's
+# 21.56 outright); EXL3 + DFlash2 k=7 = 24.30 tok/s prose / 56.35 tok/s
+# structured (massive win on code/structured content, small ~9% regression
+# vs MTP on prose). Model-load footprint 80.45-82.38 GiB vs NVFP4's
+# 90.67-91.23 GiB — ~10 GiB smaller, the measured confirmation of the
+# memory-headroom theory that motivated this lane. See VALIDATION.md's
+# "Full session comparison: NVFP4 vs EXL3, with and without DFlash2" for
+# the complete table and every intermediate result (eager-mode baseline,
+# CUDA-graph isolation, MTP test, DFlash2 test, acceptance-rate detail).
+#
+# Serves the SAME model family (GLM-5.3-Flash, glm5_next) as the shipped
+# glm-5.3-flash-nvfp4-vllm.yaml recipe, but via EXL3 quantization
+# (fused trellis+MCG MoE kernel, routed experts only — dense/shared/attn/
+# embed/lm_head stay native BF16) instead of NVFP4/Marlin. Motivation: see
+# VALIDATION.md "EXL3: the 'bigger swing' this session's findings point
+# toward" — every tuning lever tried on the NVFP4 lane (MoE backend survey,
+# max_num_seqs bisection, CUDA-graph isolation) converged on one structural
+# wall: this cluster's memory margin under NVFP4/Marlin is too tight to
+# batch deeper or run DFlash2. EXL3 bypasses Marlin entirely (do NOT pass
+# --moe-backend marlin — that flag is the NVFP4 FLASHINFER_CUTLASS
+# workaround and is wrong for this quantization) and ships a ~20 GiB
+# smaller checkpoint, which two independent community repos on the same
+# 2x GB10 hardware class report as enough headroom to run DFlash2 and
+# batch up to max_num_seqs=32 successfully — both of which killed every
+# attempt on the NVFP4 lane this session.
+#
+# Source: ported from MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks (start.sh
+# + .env.example + Dockerfile read directly from the repo, not just the
+# README prose). Their orchestration is a raw SSH/rsync/docker shell script
+# with explicit --nnodes/--node-rank/--master-addr/--master-port; this
+# recipe instead follows this project's own working NVFP4 recipe's pattern
+# (--tensor-parallel-size + --distributed-executor-backend mp only, letting
+# sparkrun's own cluster orchestration handle node wiring) since that
+# pattern is proven on this exact cluster and their raw script's node
+# orchestration doesn't apply to sparkrun's job model.
+#
+# Image is prebuilt and pullable (ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-
+# sparks:exl3, confirmed via `docker manifest inspect` 2026-09-01) — NOT
+# rebuilding from their Dockerfile. It already bakes in everything needed:
+#   - exl3 quantization method registered in vLLM (overlay/exl3.py)
+#   - FLASHINFER_MLA_SPARSE_SM120 patched for this model's NoPE-MLA geometry
+#     (zero-pad 512-dim latent into the 576-wide GLM_NSA record; see the
+#     Dockerfile's own extensive comment block for the four independent
+#     kernel-compatibility issues this fixes)
+#   - FlashInfer's sparse-MLA + fused_moe autotune DISABLED at the Python
+#     level for SM121 ("FlashInfer's sparse-MLA autotune and fused_moe
+#     gemm1/gemm2 autotune kill rank 0 on SM121, ... skip both"). NOTE for
+#     the NVFP4 lane's own postmortem: this is structurally the same
+#     failure class (rank 0 dying right around FlashInfer autotuning) that
+#     killed every DFlash2 attempt in this project's VALIDATION.md — an
+#     independent team hit and fixed the same root cause on the same
+#     hardware family. Worth retrying NVFP4/DFlash2 with FlashInfer
+#     autotune disabled if this EXL3 lane doesn't pan out.
+#   - chat_template.jinja baked at /opt/glm53/chat_template.jinja (do NOT
+#     bind-mount our own — this image's template is EXL3-checkpoint-specific)
+#   - correctness patches: kpool_tail_slotmap clamp, hybrid_prefix_hit
+#     (EAGLE-group-aware prefix cache), xgrammar_termination backport,
+#     scheduler_decode_floor, suppress_stops_in_reasoning,
+#     glm_video_placeholders
+#
+# Checkpoint: Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw (public byte-identical
+# mirror of brandonmusic/GLM-5.3-Flash-tr3-4bpw, uniform-K4 EXL3/TR3,
+# ~164 GiB, 120 shards) — already present on this cluster's /models share,
+# verified complete 2026-09-01 (120/120 shards in the `main`-ref snapshot,
+# no incomplete/lock files).
+#
+# *** FIRST-PASS CONFIG IS DELIBERATELY CONSERVATIVE, NOT MiaAI-Lab's OWN
+# PRODUCTION DEFAULTS *** — following this project's own established
+# bring-up discipline (isolate one variable at a time; see every entry in
+# VALIDATION.md) rather than their tuned config, since this cluster has
+# repeatedly shown a tighter memory margin than reference/community nodes:
+#   - No speculative decode yet (their default is SPEC_METHOD=dflash,
+#     k=7 — deliberately deferred until the plain base config is proven to
+#     boot and serve correctly; DFlash2 gets layered in as its own isolated
+#     experiment, exactly like the NVFP4 lane's own methodology).
+#   - --enforce-eager ON for this first boot (their own production default
+#     is CUDA graphs on, ENFORCE_EAGER=0 — but graph capture is the exact
+#     mechanism that killed every NVFP4+DFlash2 attempt on this cluster;
+#     prove the base config boots in eager mode first, then isolate CUDA
+#     graphs as a separate test with everything else held constant, same
+#     as how graphs were validated safe on the NVFP4 lane).
+#   - max_model_len 262144 (matching the shipped NVFP4 recipe for an
+#     apples-to-apples comparison), not their 1,000,000 — 1M context is a
+#     much larger KV/memory commitment to test after the base config is
+#     proven, not on the very first boot.
+#   - gpu_memory_utilization 0.85 (this project's own established safe
+#     value across every recipe), not their 0.87.
+#   - max_num_seqs 4 (their own conservative default; still below every
+#     value this project proved safe/unsafe on the NVFP4 lane, since EXL3's
+#     actual concurrent-capacity ceiling on THIS cluster is unknown and
+#     needs its own bisection, not an assumption that NVFP4's ceiling
+#     transfers).
+#   - Vision kept ON (LANGUAGE_MODEL_ONLY=0, their own default) to match
+#     the shipped NVFP4 recipe's capability for a fair comparison;
+#     --skip-mm-profiling kept per their own docs (a max-size image+video
+#     dummy profile OOMs this UMA hardware).
+#
+# If this boots clean: run the full probe suite (probe_sanity.py,
+# probe_soak.py, probe_cache_continuation.py), capture the same short-bench
+# + longer-form decode numbers as the NVFP4 baseline for a true comparison,
+# THEN chase performance incrementally (CUDA graphs isolated, then MTP,
+# then DFlash2, then higher max_num_seqs/max_num_batched_tokens/context) —
+# one variable at a time, documenting every step in VALIDATION.md, exactly
+# like the NVFP4 lane. If it doesn't boot: full crash forensics in
+# VALIDATION.md before touching config, same as every crash this session.
+
+recipe_version: "2"
+name: GLM-5.3-Flash-EXL3
+description: vLLM serving GLM-5.3-Flash via EXL3 quantization (fused trellis+MCG MoE) on 2x DGX Spark, TP=2, fp8 MLA KV, CUDA graphs + DFlash2 k=7
+
+model: Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw
+runtime: vllm
+container: ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3
+
+min_nodes: 2
+
+# Pre-placed weights: /models is a shared HF-hub-style store present identically
+# on both nodes. resolved_model_path makes sparkrun skip model download +
+# distribution, identity-mount /models into the container, and preflight-verify
+# the path on every host. Requires a trusted recipe (local file = trusted).
+cluster_config:
+  resolved_model_path: /models
+
+# The image's own ENTRYPOINT would consume sparkrun's appended command;
+# clear it so the full `vllm serve ...` command below runs (same pattern as
+# the shipped NVFP4 recipe).
+executor_config:
+  entrypoint: ""
+  auto_remove: false
+
+env:
+  # --- image / GPU arch (GB10 = SM121) ---
+  TORCH_CUDA_ARCH_LIST: 12.1a
+  FLASHINFER_CUDA_ARCH_LIST: 12.1a
+  FLASHINFER_DISABLE_VERSION_CHECK: "1"
+  # --- GB10 unified-memory hygiene ---
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  # --- long boot tolerance ---
+  VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+  # --- NCCL diagnostics (fabric selection itself is sparkrun-detected) ---
+  NCCL_DEBUG: WARN
+  TORCH_NCCL_ASYNC_ERROR_HANDLING: "1"
+  # --- EXL3-specific (from MiaAI-Lab's .env.example) ---
+  # 1 = fused exllamav3_ext.exl3_moe per layer; 0 = unique-expert LinearEXL3
+  # loop (much slower, fallback only). Read directly by overlay/exl3.py, not
+  # a CLI flag.
+  EXL3_FUSED_MOE: "1"
+  # Suppresses client stop strings until </think> closes (thinking-on
+  # default) — matches upstream's own default (1).
+  GLM53_SUPPRESS_STOPS_IN_REASONING: "1"
+  # Do not mix a peer prefill into a running decode step (upstream issue #6
+  # workaround, baked into their default; keep parity).
+  GLM53_MIXED_PREFILL_CHUNK: skip
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  served_model_name: glm-5.3-flash-exl3
+  tensor_parallel: 2
+  # main-ref snapshot, verified complete 2026-09-01 (120/120 shards).
+  model_path: /models/models--Mia-AiLab--GLM-5.3-Flash-EXL3-TR3-4bpw/snapshots/024db9f7e9871e8efdf21538ba55af7442be3cd5
+  quantization: exl3
+  # --- capacity: deliberately conservative first pass, see header note ---
+  max_model_len: 262144
+  max_num_seqs: 4
+  # Raised from 0.85 to 0.87 (2026-09-01, matching MiaAI-Lab's own tested
+  # production default) after two reproducible boot failures at 0.85 with
+  # DFlash2 k=7 at 262144 context: "12.62 GiB KV cache is needed... available
+  # KV cache memory (12.33-12.42 GiB)" — a ~0.2-0.3 GiB shortfall, present
+  # even after the mandatory prelaunch_flush.sh ritual (ruling out page
+  # cache as the sole cause). 0.87 adds ~2.4 GiB of total budget, comfortable
+  # margin over the observed shortfall.
+  gpu_memory_utilization: 0.87
+  # --- kernels / KV ---
+  # "fp8" (not fp8_e4m3 like the NVFP4 lane) — the image's FLASHINFER_MLA_
+  # SPARSE_SM120 overlay resolves this to the packed fp8_ds_mla record
+  # internally; do not pass fp8_e4m3 or fp8_ds_mla directly (MiaAI-Lab's
+  # own launcher passes the bare "fp8" string).
+  kv_cache_dtype: fp8
+  # vLLM's own default, made explicit (matches the NVFP4 lane's convention).
+  max_num_batched_tokens: 2048
+  # --- multimodal (kept on for capability parity with the NVFP4 lane) ---
+  limit_mm: '{"image":4,"video":1}'
+  # --- parsers / chat (chat template is baked into the image at
+  # /opt/glm53/chat_template.jinja — do not override) ---
+  default_chat_template_kwargs: '{"enable_thinking": false}'
+  # --- MTP k=2 speculative decode (2026-09-01, DOWNGRADED FROM DFlash2) ---
+  # DFlash2 k=7 showed TWO distinct crash classes today: a KV-sizing
+  # ValueError at gmu=0.85 (fixed by raising to 0.87 above), and a separate,
+  # still-unexplained "Worker died unexpectedly (exit code: None)" ->
+  # "Executor failed" silent kill during live request handling — the same
+  # signature hit once during this session's own DFlash2 bring-up testing
+  # (that time after ~2h41m idle; this time on the very first request).
+  # MTP k=2 never crashed once across every test this session and already
+  # beats DFlash2 on prose (26.75 vs 24.30 tok/s) — reverted to it for a
+  # reliable daily-driver deployment. DFlash2 gets 56 tok/s on structured/
+  # code content when it works, so it's worth root-causing and revisiting
+  # later, but isn't the safe default until that crash is understood. See
+  # VALIDATION.md for the full crash trail.
+  speculative_config: '{"method":"mtp","num_speculative_tokens":2}'
+
+command: |
+  vllm serve {model_path} \
+      --served-model-name {served_model_name} \
+      --host {host} --port {port} \
+      --trust-remote-code \
+      --tensor-parallel-size {tensor_parallel} \
+      --quantization {quantization} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} \
+      --kv-cache-dtype {kv_cache_dtype} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --speculative-config '{speculative_config}' \
+      --tool-call-parser glm47 --enable-auto-tool-choice \
+      --reasoning-parser glm45 \
+      --enable-prefix-caching \
+      --no-enable-flashinfer-autotune \
+      --skip-mm-profiling \
+      --limit-mm-per-prompt '{limit_mm}' \
+      --chat-template /opt/glm53/chat_template.jinja \
+      --default-chat-template-kwargs '{default_chat_template_kwargs}' \
+      --distributed-executor-backend mp
