@@ -1236,3 +1236,194 @@ baseline), higher `max_num_seqs`/`max_num_batched_tokens` bisection
 caching effectiveness (`--enable-prefix-caching` is on but unmeasured),
 and MTP's own structured-content number (only DFlash2 was tested on the
 structured prompt) for a fully symmetric comparison.
+
+# EXL3 v2: validating four new upstream PRs (2026-09-01)
+
+MiaAI-Lab merged four PRs today (all `main`@`c190db1`) after v1 was
+already validated and in production use: PR77 (fat-expert prefill CUDA
+kernels), PR86 (indexer workspace rightsizing), PR63 (prefix-cache
+thinking-toggle fix), PR96 (spinwait tuning) — see each PR's own title,
+body, and diff (read directly via `gh api`, not the social-media summary
+that prompted this investigation) for full technical detail. A fifth
+claim ("fairer scheduling") maps to `GLM53_MIXED_PREFILL_CHUNK=skip`,
+already set in v1 — not a new change.
+
+**None of the four had reached the published `ghcr.io/miaai-lab/...:exl3`
+image tag** — confirmed empirically by pulling it fresh and grepping the
+baked-in `chat_template.jinja` for PR63's fix (absent). Built our own
+image from a fresh clone at `main`@`c190db1`
+(`docker build -t glm53-exl3-v2:c190db1 .`) rather than waiting on a
+republish. New recipe: `glm-5.3-flash-exl3-v2-vllm.yaml`.
+
+## Incident: the build itself caused a production outage
+
+Ran the ~7-minute CUDA-extension compile directly on `spark-276f`
+(10.7.0.142) — one of the two nodes actively serving the user's live v1
+deployment. The build's CPU/memory load coincided almost exactly with
+`shm_broadcast.py`'s "No available shared memory broadcast block found in
+60 seconds" warnings appearing on the live server, and generation requests
+began timing out (confirmed via direct `curl`, 15-20s with no response,
+`/health` still returning 200 the whole time — a genuine engine hang, not
+a crash, and not detectable via health checks alone). Load average had
+already dropped back to normal (0.29) by the time this was diagnosed,
+confirming it wasn't ongoing contention resolving on its own — the engine
+needed an actual restart. Stopped, flushed, relaunched v1; verified
+recovery with a real generation request (not just `/health`) before
+declaring it fixed.
+
+**Lesson for any future build/compile work on this cluster**: never run
+a heavy build on a node that's also carrying live production traffic,
+even when the build itself doesn't touch the GPU — CPU/memory contention
+alone can hang a co-located vLLM worker. Coordinate build windows with
+whoever is depending on the live service.
+
+## Boot: four attempts before a clean serve
+
+1. **gmu=0.87** (matching v1): failed at the startup free-memory check —
+   `Free memory on device cuda:0 (104.93/121.69 GiB) ... less than desired
+   ... (0.87, 105.87 GiB)`. Real, not page-cache (persisted through a fresh
+   `prelaunch_flush.sh`).
+2. **gmu=0.87, retry after fresh flush**: failed again, `105.31/121.69
+   GiB` — closer but still short. Confirms this is genuine, current
+   headroom on this node, not a caching artifact. (Both this and the
+   previous v1 baseline run below hit the identical failure class at 0.87
+   — see the "second incident" note.)
+3. **gmu=0.86** (MiaAI-Lab's own documented fallback for tighter-margin
+   nodes — not this project's usual 0.85, since v1's earlier 0.85 failures
+   were a *different* problem, post-weight-load KV sizing, not this
+   startup check): passed the memory check, booted through weight load and
+   graph capture, then died with `KeyboardInterrupt` inside vLLM's own
+   init-timeout watchdog, specifically during the API server's
+   video-processor warmup (`glm5next.py` video-patch reshape) — unrelated
+   to any of the four PRs (none touch multimodal code).
+4. **gmu=0.86, `--language-model-only`** (vision/video tower off — not
+   needed for this validation, and the crashing code path): **booted
+   clean**. Verified with a real chat completion (not just `/health`),
+   `probe_sanity.py` and `probe_soak.py` both fully passed.
+
+## Second incident: v1 hit the identical 0.87 startup failure too
+
+While re-launching v1 for a same-day prefill baseline, it hit the exact
+same `Free memory ... 105.75/121.69 GiB ... less than 105.87 GiB` failure
+at its own established gmu=0.87 — a config that had booted cleanly
+multiple times earlier the same day. The free-memory figure crept upward
+across each of these three consecutive near-misses (104.93 -> 105.31 ->
+105.75) but never quite cleared 105.87. This is consistent with
+MiaAI-Lab's and Reederey87's own documented GB10/driver finding: memory
+freed by a killed CUDA process can stay "trapped" until a full reboot,
+eroding the usable ceiling by a fraction of a GiB per failed launch — very
+plausibly compounding from today's repeated crashed/killed launches
+(the v2 boot attempts, the hang-recovery cycle). Worked around by
+overriding to gmu=0.86 for this run (`-o gpu_memory_utilization=0.86`,
+not a permanent recipe change). **If boots keep landing short of 0.87
+after this session, a full node reboot — not just cache flushing — may be
+the real fix**, per that documented driver behavior.
+
+## Results: three of four claims independently confirmed, one inconclusive
+
+**PR86 (indexer workspace rightsizing) — confirmed, exact formula match.**
+Boot log: stock = 10,485,760 entries (= `262144*40`, matches the documented
+formula exactly); rightsized = 262,148 entries (=
+`min(4,2048) * cdiv(262144+2, 4)`, matches exactly); **~1287 MiB reclaimed**
+at our 262,144 context. Their own headline (~4.5-4.8 GiB) was measured at
+1,000,000 context — the workspace scales with `max_model_len`, so this
+was never going to transfer 1:1; scaling their figure by our context
+ratio (262144/1000000 = 26.2%) predicts ~1320 MiB, matching the observed
+1287 MiB closely. The mechanism is real and behaves exactly as documented.
+
+**PR63 (prefix-cache thinking-toggle fix) — confirmed clean.** ~16.2K-token
+system+tools+filler prompt (matching PR63's own test shape): cold 14.67s,
+warm same-effort repeat 4.79s (real ~3x cache benefit), **toggle
+thinking=False 4.78s** — indistinguishable from the warm repeat, not
+falling back to a cold-like re-prefill. Toggling thinking no longer costs
+a full re-prefill on this deployment.
+
+**PR77 (fat-expert prefill kernel) — confirmed, real gain, smaller than
+their own measurement.** Same-day A/B, `probe_longctx.py`, both under
+identical config otherwise (context, speculator, gmu overridden to 0.86 on
+both arms for a fair comparison):
+
+| Context | v1 (stock fat-expert path) | v2 (E2 kernel) | Gain |
+|---|---:|---:|---:|
+| ~100K tokens | 816.6 tok/s (122.4s TTFT) | 933.3 tok/s (107.1s TTFT) | **+14.3%** |
+| ~250K tokens | 920.5 tok/s (271.5s TTFT) | 1048.4 tok/s (238.4s TTFT) | **+13.9%** |
+
+Both correctness-passed (4/4 planted retrieval codes at both lengths, both
+versions). Consistent ~14% gain at two context lengths — a real, robust
+effect, not noise — below their own reported +20-21%, expected given the
+PR author's own caveat that the effect is "geometry-sensitive" and had
+already failed to reproduce on one other deployment. This deployment
+reproduces a smaller but still substantial version of the claimed effect.
+
+**PR96 (spinwait tuning) — inconclusive at this measurement's resolution,
+no regression.** `docker stats` CPU sampling during matched 400-token
+decode bursts: v1 (stock) ~107-122% (avg ~111%), v2 (`GLM53_SPINWAIT_MS=16`)
+~107-110% (avg ~108%) — a small, directionally-consistent reduction, not
+the claimed 85.3%. This doesn't falsify their claim: `docker stats`
+measures whole-container CPU (GPU worker's real compute dominates during
+active decode), while their claim specifically targets EngineCore's idle
+spin-wait threads, which matter most during IPC gaps between requests, not
+a continuously-active single-stream decode burst. Properly validating the
+85.3% figure would need process-level profiling (py-spy/psutil targeting
+the EngineCore PID specifically) under bursty/gappy traffic — out of scope
+given this project's own established finding that live profiling tooling
+is unreliable on this cluster. Decode throughput itself showed no
+regression (24.07-26.26 tok/s short-bench, comparable to v1's 26.75).
+
+## Decision: v2 promoted as the new default
+
+Real, meaningful, independently-confirmed gains (prefill +14%, prefix-cache
+fix eliminates a real re-prefill cost, KV capacity mechanism confirmed
+correct) with zero observed regressions (decode throughput comparable,
+full sanity+soak suites passed, no new crash classes). **v2 replaces v1 as
+the deployed default.** Operational note: `glm53-exl3-v2:c190db1` is a
+custom-built image, not in any registry — only exists on this cluster's
+two nodes (built on spark-276f, synced to the head via sparkrun's own
+resource-distribution step, confirmed working for a locally-built,
+non-registry image). If this cluster is ever rebuilt from scratch, the
+image needs rebuilding from the same commit
+(`git clone https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks
+&& git checkout c190db1 && docker build ...`), not just re-pulled.
+`gpu_memory_utilization` shipped at 0.86 (not 0.87) per the memory-ceiling
+findings above — revisit upward only with fresh headroom confirmed (a
+node reboot may be warranted first, given the "trapped memory" pattern
+observed today).
+
+## Vision retest: the multimodal-warmup crash didn't reproduce
+
+Initially shipped v2 with `--language-model-only` (vision/video tower off)
+after one boot attempt died with a `KeyboardInterrupt` during the API
+server's multi-modal renderer warmup. Traced the actual mechanism: the
+exception comes from `api_server.py`'s own `_interrupt_init` —
+`signal.signal(signal.SIGTERM, _interrupt_init)`, installed specifically
+to convert an *external* SIGTERM arriving before uvicorn's own handlers
+are installed into a clean `KeyboardInterrupt`. Not an internal vLLM
+timeout. Checked for an external sender: no Docker `HEALTHCHECK` defined
+on the image, no custom `StopSignal`/`StopTimeout`, and no `sparkrun
+stop`/kill command was issued during that boot window. Source never
+conclusively identified.
+
+Given no reproducible mechanism was found, retested the identical config
+(gmu=0.86, MTP k=2, vision **on**) cleanly: weights loaded (82.38 GiB),
+graph capture (5s, 0.33 GiB), engine init (44.93s), then **`Multi-modal
+warmup completed in 13.978s`** and **`Readonly multi-modal warmup
+completed in 3.478s`** — both phases that crashed before now complete
+without incident. Full `probe_sanity.py` (TTFT 0.227-0.33s, decode
+23.55-25.09 tok/s median 24.12) and `probe_soak.py` (10/10 + 10/10
+sequential, 3/3 + 3/3 concurrent) passed.
+
+**Conclusion: one-off, not a reproducible defect.** Restored vision/video
+(`--skip-mm-profiling --limit-mm-per-prompt '{"image":4,"video":1}'`,
+matching v1's capability) as v2's shipped config — no capability tradeoff
+after all. If this KeyboardInterrupt recurs on a future boot, capture the
+exact SIGTERM sender (host process list / `strace -f` on the container's
+PID 1) before reaching for `--language-model-only` again as a workaround.
+
+## Final decision: v2 (vision on) promoted as the default
+
+Copied to `~/ai/recipes/glm-5.3-flash-exl3-tp2.yaml`, replacing v1's
+config in place (same filename — anyone already launching this recipe
+gets the improvements automatically). No capability regression, no
+performance regression, three of four PR claims independently confirmed
+with real measured gains, the fourth neither confirmed nor disproven.
+Live deployment left running on this exact validated config.
