@@ -1,0 +1,285 @@
+# Recipe: GLM-5.3-Flash EXL3 v2, FP8 -- attempt #4: widen scope beyond the LM head
+#
+# *** EXPERIMENT -- same validated mechanism as attempt #2/#3, wider scope ***
+#
+# BACKGROUND
+#
+# Attempts #2 and #3 (glm-5.3-flash-exl3-v2-fp8-lmhead-v2.yaml) proved out
+# `ScaleAwareFp8LinearMethod` end-to-end on the LM head alone: correct
+# per-tensor dynamic FP8 quantization from the genuinely-bf16 checkpoint,
+# full probe suite clean, throughput matching the shipped baseline. That was
+# deliberately the smallest, most legible layer to validate the mechanism
+# on -- per this project's own "one variable at a time" discipline, and
+# because isolated per-layer argmax checks are known to be non-diagnostic
+# (see fp8-lmhead.yaml's header), so the mechanism had to be trusted via
+# real end-to-end generation before widening scope, not before.
+#
+# It's proven now. This recipe applies the SAME class, unchanged, to every
+# bf16 Linear-ish layer this checkpoint has -- not just the LM head. Per
+# the kernel-trace breakdown from the Blackwell-kernel investigation
+# (VALIDATION.md), this is where the bigger win actually lives:
+# attention+MLP's combined ~30.8% share of decode kernel time vs. the LM
+# head's ~9.5%, and the synthetic-shape benchmarks showed BETTER FP8
+# speedups on attention/MLP shapes (1.4x-2.74x, genuine SM121 TMA kernels)
+# than the LM head got (1.54x, SM89 fallback).
+#
+# WHAT'S IN SCOPE, AND WHY
+#
+# `Exl3Config` quantizes only `RoutedExperts` (`"scope":
+# "glm53_routed_experts_only"` in this checkpoint's own config). Everything
+# else currently runs bf16. Checkpoint tensor names (dumped this session via
+# model.safetensors.index.json) show TWO attention families: 12/45 layers
+# (3, 7, 11, ...) use MLA (`q_a_proj`/`q_b_proj`/`kv_a_proj_with_mqa`/
+# `kv_b_proj`/`o_proj`), the other 33 use gated-linear-attention/mamba
+# (`q_proj`/`k_proj`/`v_proj`/`o_proj`/`b_proj`/`f_a_proj`/`f_b_proj`/
+# `g_a_proj`/`g_b_proj`, plus `A_log`/`dt_bias`/`*_conv1d` which are NOT
+# Linear-backed and never reach this patch regardless). Dense MLP
+# (`mlp.gate_proj`/`up_proj`/`down_proj`) exists only on the first
+# `first_k_dense_replace=3` layers (0-2); every other layer's FFN is
+# `mlp.experts.*` (already EXL3-quantized, untouched) plus a small router
+# (`mlp.gate.weight` -- note: NOT the same thing as `gate_proj`).
+#
+# Routing rule: fp8-quantize any `LinearBase`/`ParallelLMHead` layer UNLESS
+# its prefix contains "experts" (leave EXL3 alone) or its final path
+# segment is exactly "gate" (leave the MoE router alone -- a discrete
+# routing decision is a qualitatively different risk than a continuous
+# projection output, and it was never covered by the real-weight
+# correctness check from the Blackwell-pivot investigation, unlike the MLA
+# attention tensors). This picks up: the LM head (already validated
+# standalone), every attention family's Q/K/V/O and gating projections
+# across all 45 layers, and the 3 dense-layer MLPs. It deliberately does
+# NOT touch: RoutedExperts, the router, or anything not Linear-backed
+# (conv1d, A_log, dt_bias, norms).
+#
+# MECHANISM: identical to attempt #2/#3, not reimplemented
+#
+# `ScaleAwareFp8LinearMethod` (same class, same two-bug fix: allocate
+# weight storage in the checkpoint's real dtype so loading is lossless,
+# then compute a REAL per-tensor scale from the actual loaded weights
+# before quantizing, instead of vLLM's stock unscaled-cast-plus-sentinel-
+# scale path). `GLM53_FP8_LMHEAD_SCALE_MODE` still selects tensor/channel
+# (default tensor -- #3 found no measurable win from channel on the LM
+# head; not re-tested per-layer here, same default carried forward).
+#
+# ELEVATED VALIDATION BAR
+#
+# This is the largest blast-radius change in this investigation -- dozens
+# of layers across two attention architectures, never individually
+# correctness-checked the way the LM head and MLA-layer-3 tensors were.
+# Per-layer isolated checks aren't diagnostic (established in fp8-lmhead.yaml),
+# so this recipe leans entirely on the full probe suite plus real multi-turn
+# generation quality, run before any conclusion is drawn -- same bar as
+# attempt #2, applied more carefully given the wider surface.
+
+recipe_version: "2"
+name: GLM-5.3-Flash-EXL3-v2-FP8-Wide
+description: EXL3 v2 with LM head + all attention (MLA and gated-linear-attention) + dense-layer MLP dynamically quantized to FP8 via ScaleAwareFp8LinearMethod -- same mechanism validated standalone on the LM head in attempt #2/#3, now widened to every non-expert, non-router bf16 Linear layer
+
+model: Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw
+runtime: vllm
+container: glm53-exl3-v2:c190db1
+
+min_nodes: 2
+
+cluster_config:
+  resolved_model_path: /models
+
+executor_config:
+  entrypoint: ""
+  auto_remove: false
+
+env:
+  TORCH_CUDA_ARCH_LIST: 12.1a
+  FLASHINFER_CUDA_ARCH_LIST: 12.1a
+  FLASHINFER_DISABLE_VERSION_CHECK: "1"
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+  NCCL_DEBUG: WARN
+  TORCH_NCCL_ASYNC_ERROR_HANDLING: "1"
+  EXL3_FUSED_MOE: "1"
+  GLM53_SUPPRESS_STOPS_IN_REASONING: "1"
+  GLM53_MIXED_PREFILL_CHUNK: skip
+  EXL3_FAT_KERNEL: "1"
+  EXL3_MOE_ROW_TILE: "0"
+  GLM53_INDEXER_WORKSPACE: rightsize
+  GLM53_FP8_LMHEAD_SCALE_MODE: tensor
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  served_model_name: glm-5.3-flash-exl3-v2
+  tensor_parallel: 2
+  model_path: /models/models--Mia-AiLab--GLM-5.3-Flash-EXL3-TR3-4bpw/snapshots/024db9f7e9871e8efdf21538ba55af7442be3cd5
+  quantization: exl3
+  max_model_len: 262144
+  max_num_seqs: 4
+  gpu_memory_utilization: 0.86
+  kv_cache_dtype: fp8
+  max_num_batched_tokens: 7168
+  limit_mm: '{"image":4,"video":1}'
+  default_chat_template_kwargs: '{"enable_thinking": false}'
+  speculative_config: '{"method":"mtp","num_speculative_tokens":2}'
+
+command: |
+  cat > /tmp/glm53_fp8_wide_shim.py <<'PYSHIM'
+  # See recipe header for scope rationale. Mechanism (ScaleAwareFp8LinearMethod)
+  # is IDENTICAL to attempt #2/#3 -- only the routing predicate in
+  # _patched_get_quant_method changed (scoped to lm_head only there, to
+  # every non-expert/non-router LinearBase/ParallelLMHead layer here).
+  # Multiprocessing-boundary handling unchanged: patch at IMPORT TIME
+  # (unconditional), only `main()` behind `if __name__ == "__main__"`.
+  import os
+  import sys
+
+  import torch
+
+  from vllm.model_executor.layers.linear import LinearBase
+  from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+  from vllm.model_executor.layers.quantization.exl3 import Exl3Config
+  from vllm.model_executor.layers.quantization.fp8 import (
+      Fp8Config,
+      Fp8LinearMethod,
+      MarlinFP8ScaledMMLinearKernel,
+      init_fp8_linear_kernel,
+  )
+  from vllm.model_executor.parameter import ModelWeightParameter
+  from vllm.model_executor.utils import replace_parameter
+
+  _SCALE_MODE = os.environ.get("GLM53_FP8_LMHEAD_SCALE_MODE", "tensor")
+  assert _SCALE_MODE in ("tensor", "channel"), _SCALE_MODE
+
+  _fp8_config = Fp8Config(
+      is_checkpoint_fp8_serialized=False,
+      activation_scheme="dynamic",
+      weight_block_size=None,
+  )
+
+  _ROUTED_COUNT = 0
+
+
+  class ScaleAwareFp8LinearMethod(Fp8LinearMethod):
+      """Fp8LinearMethod for on-the-fly quantization from a genuinely bf16
+      checkpoint. Identical to the class validated standalone on the LM
+      head in glm-5.3-flash-exl3-v2-fp8-lmhead-v2.yaml -- see that recipe's
+      header and VALIDATION.md for the two-bug root cause this fixes
+      (unscaled cast + uninitialized -3.4e38 weight_scale sentinel).
+      """
+
+      def create_weights(
+          self,
+          layer,
+          input_size_per_partition,
+          output_partition_sizes,
+          input_size,
+          output_size,
+          params_dtype,
+          **extra_weight_attrs,
+      ):
+          assert not self.block_quant, "scale-aware path is per-tensor/channel dynamic only"
+          output_size_per_partition = sum(output_partition_sizes)
+          weight_loader = extra_weight_attrs.get("weight_loader")
+          layer.logical_widths = output_partition_sizes
+          layer.input_size_per_partition = input_size_per_partition
+          layer.output_size_per_partition = output_size_per_partition
+          layer.orig_dtype = params_dtype
+          layer.weight_block_size = None
+
+          weight = ModelWeightParameter(
+              data=torch.empty(
+                  output_size_per_partition, input_size_per_partition,
+                  dtype=params_dtype,
+              ),
+              input_dim=1,
+              output_dim=0,
+              weight_loader=weight_loader,
+          )
+          layer.register_parameter("weight", weight)
+
+          self.fp8_linear = init_fp8_linear_kernel(
+              activation_quant_key=self.activation_quant_key,
+              weight_quant_key=self.weight_quant_key,
+              weight_shape=(output_size_per_partition, input_size_per_partition),
+              input_dtype=self.input_dtype,
+              out_dtype=self.out_dtype,
+              module_name=self.__class__.__name__,
+          )
+          self.use_marlin = isinstance(self.fp8_linear, MarlinFP8ScaledMMLinearKernel)
+
+      def process_weights_after_loading(self, layer) -> None:
+          assert not self.use_marlin, "scale-aware path assumes real SM121 FP8 tensor cores"
+          w = layer.weight.data
+          w32 = w.to(torch.float32)
+
+          if _SCALE_MODE == "channel":
+              scale_div = (w32.abs().amax(dim=1, keepdim=True) / 448.0).clamp(min=1e-12)
+          else:
+              scale_div = (w32.abs().amax() / 448.0).clamp(min=1e-12).reshape(1)
+
+          wq = (w32 / scale_div).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+
+          # weight_scale convention is [N, 1] for channel mode, confirmed
+          # against vLLM's own kernel-level padding code -- see fp8-lmhead-v2.yaml.
+          scale_store = scale_div
+
+          replace_parameter(layer, "weight", wq.t())
+          layer.weight_scale = torch.nn.Parameter(scale_store.to(torch.float32), requires_grad=False)
+          layer.input_scale = None
+
+          self.fp8_linear.process_weights_after_loading(layer)
+
+
+  _original_get_quant_method = Exl3Config.get_quant_method
+
+
+  def _in_scope(layer, prefix: str) -> bool:
+      if not isinstance(layer, (LinearBase, ParallelLMHead)):
+          return False
+      if "experts" in prefix:
+          return False  # RoutedExperts -- already EXL3-quantized, leave alone
+      if prefix.rsplit(".", 1)[-1] == "gate":
+          return False  # MoE router (mlp.gate) -- NOT mlp.gate_proj (dense MLP, in scope)
+      return True
+
+
+  def _patched_get_quant_method(self, layer, prefix):
+      global _ROUTED_COUNT
+      if _in_scope(layer, prefix):
+          _ROUTED_COUNT += 1
+          print(f"[glm53-fp8-wide] routing '{prefix}' ({type(layer).__name__}) "
+                f"through ScaleAwareFp8LinearMethod (dynamic, scale_mode={_SCALE_MODE}) "
+                f"[#{_ROUTED_COUNT}]",
+                file=sys.stderr, flush=True)
+          return ScaleAwareFp8LinearMethod(_fp8_config)
+      return _original_get_quant_method(self, layer, prefix)
+
+
+  Exl3Config.get_quant_method = _patched_get_quant_method
+  print(f"[glm53-fp8-wide] Exl3Config.get_quant_method patched (pid={os.getpid()}, "
+        f"__name__={__name__!r}, scale_mode={_SCALE_MODE!r})", file=sys.stderr, flush=True)
+
+  if __name__ == "__main__":
+      sys.argv[0] = "vllm"
+      from vllm.entrypoints.cli.main import main
+      sys.exit(main())
+  PYSHIM
+  python3 /tmp/glm53_fp8_wide_shim.py serve {model_path} \
+      --served-model-name {served_model_name} \
+      --host {host} --port {port} \
+      --trust-remote-code \
+      --tensor-parallel-size {tensor_parallel} \
+      --quantization {quantization} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} \
+      --kv-cache-dtype {kv_cache_dtype} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --speculative-config '{speculative_config}' \
+      --tool-call-parser glm47 --enable-auto-tool-choice \
+      --reasoning-parser glm45 \
+      --enable-prefix-caching \
+      --no-enable-flashinfer-autotune \
+      --skip-mm-profiling \
+      --limit-mm-per-prompt '{limit_mm}' \
+      --chat-template /opt/glm53/chat_template.jinja \
+      --default-chat-template-kwargs '{default_chat_template_kwargs}' \
+      --distributed-executor-backend mp

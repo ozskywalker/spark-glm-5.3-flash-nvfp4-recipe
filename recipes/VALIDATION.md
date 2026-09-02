@@ -2723,3 +2723,91 @@ remains the simpler, equally-correct choice. Skipped a full soak/longctx
 re-run here — the underlying mechanism is identical to the already
 fully-validated #2, and the only variable (scale granularity) shows no
 signal worth chasing further with more probe time.
+
+## FP8 LM head, attempt #4: widen scope — real finding is a correction, not a benchmark
+
+`glm-5.3-flash-exl3-v2-fp8-wide.yaml` widened the same `ScaleAwareFp8LinearMethod`
+routing to every `LinearBase`/`ParallelLMHead` layer except `RoutedExperts`
+(prefix contains "experts") and the MoE router (`mlp.gate` — exact last
+path segment "gate", deliberately NOT matching `mlp.gate_proj`, which is
+the dense-MLP layer we do want in scope). The intent, per the plan agreed
+this session, was to reach attention (both the MLA and gated-linear-
+attention/mamba families) plus dense MLP — attention/MLP's combined ~30.8%
+decode-kernel-time share is the bigger prize next to the LM head's ~9.5%.
+
+**It booted clean, passed the full probe suite, and the real finding is
+that it didn't reach attention at all — for a reason worth understanding,
+not a bug to route around.** Only **8 layers** got routed: the 3
+dense-layer MLPs (`layers.{0,1,2}.mlp.gate_up_proj` + `down_proj`, dense
+because `first_k_dense_replace=3`) and both LM heads (main +
+MTP draft). Zero attention layers matched — not because the exclusion
+predicate was wrong, but because attention never reaches
+`Exl3Config.get_quant_method` at all. Read directly from this container's
+`vllm/models/glm5next/nvidia/model.py`:
+
+```
+self.self_attn = Glm5NextMLAAttention(
+    ...
+    quant_config=None,  # MLA projections are BF16 in checkpoint
+    ...
+```
+
+— an explicit, hardcoded `None` at the call site, not a config value. Since
+`LinearBase.__init__` only calls `quant_config.get_quant_method(...)` when
+`quant_config is not None` (falling back straight to `UnquantizedLinearMethod`
+otherwise), no monkeypatch of `Exl3Config` — however the routing predicate
+inside it is written — can ever see these layers. The same pattern repeats
+lower in the file for the mamba/gated-linear-attention layers ("pattern
+(quant_config=None for BF16 submodules)"). This is a deliberate choice made
+in vLLM's own model code for this architecture, not a gap in this
+checkpoint's `Exl3Config` scope declaration.
+
+**This changes the addressable-surface picture from the Blackwell-pivot
+investigation.** That investigation's ~30.8% "attention+MLP" kernel-time
+share and the 1.4x-2.74x real-weight speedup measurements were both
+produced by extracting checkpoint tensors directly via `safetensors` and
+benchmarking them in isolation — a path that never goes through vLLM's
+model construction or `get_quant_method` at all, so it correctly measured
+what the *hardware* can do on those shapes, but couldn't reveal that the
+*model code* hardcodes attention to bf16 regardless of quant config.
+Reaching attention for real would mean patching `Glm5NextMLAAttention.__init__`
+(and its mamba counterpart) directly to override the hardcoded `None` —
+a qualitatively different, more invasive intervention than a
+`get_quant_method` monkeypatch, and one that overrides a choice the model
+authors made on purpose (plausibly: MLA's compressed latent KV cache
+compounding precision loss over long-context attention is a different risk
+profile than a single LM head or an FFN's independent-per-token output —
+worth treating as a real signal, not just an obstacle, until investigated
+further). Not attempted this session.
+
+**What actually validated, on its own merits**: LM head + the 3 dense-MLP
+layers, fp8'd together. Quality check: coherent on the same code+reasoning
+prompt used throughout this thread. `probe_sanity.py`: **ALL PASSED**,
+decode 25.35-29.11 tok/s (median 28.35) — no regression, consistent with
+the earlier LM-head-only numbers (expected: 3 dense-MLP layers out of 45
+is a small slice of total FFN compute next to 42 layers of untouched,
+already-EXL3-quantized routed experts). `probe_soak.py`: **PASSED**, 7/7.
+`probe_longctx.py` (100K tokens): **ALL PASSED**, TTFT 82.9s (matching
+baseline), 4/4 planted codes retrieved.
+
+**Verdict: a real, validated, small-but-genuine widening (LM head + 3
+dense-MLP layers), not the attention win originally targeted.** Production
+restored and re-verified with a real generation request after this run.
+
+## Summary for review: where this leaves the four options
+
+- **#2 (scale-aware dynamic loader on the LM head)**: fully validated,
+  clean win, matches baseline throughput. Ready to promote if desired.
+- **#3 (per-channel scaling)**: tested, no measurable difference from #2's
+  per-tensor default. Not worth the extra complexity for this checkpoint.
+- **#4 (widen scope)**: the mechanism cleanly extends to any *bf16 Linear
+  layer that vLLM's model code actually routes through a quant config* —
+  which turned out to be only the LM head and the 3 dense-MLP layers for
+  this architecture, not attention. That's still validated and real, just
+  smaller than planned.
+- **Attention fp8 (the bigger prize — ~30.8% of decode kernel time)**
+  remains unreached: it requires patching the model's attention module
+  construction directly (overriding a hardcoded `quant_config=None`), a
+  materially different and more invasive change than anything tried this
+  session, and one that overrides what looks like a deliberate precision
+  choice by the model's authors rather than an oversight.
