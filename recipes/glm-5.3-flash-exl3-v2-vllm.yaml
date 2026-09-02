@@ -174,11 +174,13 @@ defaults:
   # — their doc says "E2 keep 2026-09-01", chosen specifically alongside
   # the fat-expert prefill kernel). Measured on this cluster: +28.4%
   # prefill at 100K tokens (933->1199 tok/s), +19.5% at 250K (1048->1253
-  # tok/s), zero decode regression, full sanity+soak (incl. concurrent
-  # waves) passed. A substantial, real, independently-confirmed gain — see
-  # VALIDATION.md. Contrast with the NVFP4 lane, which crashed raising
-  # this same knob to just 3584 — direct, measured confirmation that
-  # EXL3's smaller memory footprint is real headroom, not just theory.
+  # tok/s), zero decode regression on prose OR structured content (25.68
+  # tok/s prose, 31.65 tok/s median / 96.57% MTP-2 accept on a counting-
+  # task structured probe — see VALIDATION.md), full sanity+soak (incl.
+  # concurrent waves) passed. A substantial, real, independently-confirmed
+  # gain. Contrast with the NVFP4 lane, which crashed raising this same
+  # knob to just 3584 — direct, measured confirmation that EXL3's smaller
+  # memory footprint is real headroom, not just theory.
   max_num_batched_tokens: 7168
   limit_mm: '{"image":4,"video":1}'
   default_chat_template_kwargs: '{"enable_thinking": false}'

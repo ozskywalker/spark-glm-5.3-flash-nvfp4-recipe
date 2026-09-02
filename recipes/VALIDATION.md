@@ -1604,6 +1604,33 @@ conflict — their README already documented "E2 keep 2026-09-01" for this
 exact figure, chosen alongside the fat-expert kernel; this project just
 hadn't picked it up yet before this test).
 
+### Gap closed: structured-content decode, not just prose (2026-09-02, later)
+
+The promotion above validated `probe_sanity.py` (prose decode), `probe_soak.py`
+(concurrent load), and `probe_longctx.py` (prefill/TTFT) — but not a
+structured-content decode number, which is the workload DFlash2's own
+validation flagged as sensitive to scheduler/batching changes. Since
+`max_num_batched_tokens` is nominally a prefill/scheduling knob, no decode-phase
+effect was expected, but that was an assumption, not something measured for
+this specific recipe. Closed the gap against the live `max_num_batched_tokens=7168`
+service (MTP-2, matching the shipped default): same counting-task methodology
+used for the DFlash2 lanes above (1→100, one number per line, 300 max tokens,
+temp 0, 3 runs), acceptance rate read from `vllm:spec_decode_num_*_tokens_total`
+deltas across the 3 runs.
+
+| Run | Decode tok/s | Completion tokens | Finish reason |
+|---|---:|---:|---|
+| 1 | 32.21 | 200 | stop (counted 1→100 correctly) |
+| 2 | 31.17 | 200 | stop |
+| 3 | 31.65 | 200 | stop |
+
+**Median 31.65 tok/s, MTP-2 acceptance 96.57% (394/408 draft tokens
+accepted)** on structured content — actually *higher* than this same
+recipe's prose number (25.68 tok/s from the promotion run above), consistent
+with MTP's draft head predicting highly-regular sequences well. Confirms the
+assumption: `max_num_batched_tokens` shows no decode-phase regression on
+structured content either. No change needed to the shipped recipe.
+
 ### Incidental finding: the multimodal-warmup crash is real and intermittent, not a one-off
 
 During the restoration boot that preceded this test (before the
