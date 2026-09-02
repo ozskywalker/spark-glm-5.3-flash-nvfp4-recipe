@@ -1,0 +1,303 @@
+# Recipe: GLM-5.3-Flash EXL3 v2, LM head FP8 -- scale-aware attempt #2
+#
+# *** EXPERIMENT -- fixes the root cause found by
+# glm-5.3-flash-exl3-v2-fp8-lmhead.yaml (v1), does not change the goal ***
+#
+# BACKGROUND: why v1 produced garbage
+#
+# v1 patched `Exl3Config.get_quant_method()` to hand `lm_head` off to vLLM's
+# stock `Fp8LinearMethod`, configured for dynamic per-tensor quantization
+# (`is_checkpoint_fp8_serialized=False`). That looked right -- and the
+# hardware/kernel case for FP8 on this checkpoint IS real (see
+# VALIDATION.md: 1.4x-2.74x on attention/MLP shapes with genuine SM121 TMA
+# kernels; a real-weight correctness check on lm_head's own tensor came back
+# clean at 100% argmax agreement) -- but the *implementation* wasn't, and
+# reading vLLM's actual source (not just its docstrings) this session found
+# TWO compounding bugs in how `Fp8LinearMethod` handles a checkpoint that
+# is genuinely bf16 on disk, not just under-documented behavior:
+#
+#   1. `create_fp8_weight_parameter()` unconditionally allocates the weight
+#      Parameter as `torch.float8_e4m3fn`, REGARDLESS of
+#      `is_checkpoint_fp8_serialized`. The standard weight loader then does
+#      a raw dtype-cast copy from the checkpoint's real bf16 tensor straight
+#      into fp8 storage -- an UNSCALED cast. This checkpoint's actual
+#      `lm_head.weight` sits deep in e4m3's subnormal range (max ~= 0.22,
+#      mean ~= 0.015-0.02), so an unscaled cast destroys nearly all of it.
+#   2. Worse: `create_fp8_scale_parameter()` initializes `weight_scale` to
+#      `torch.finfo(torch.float32).min` (~ -3.4e38) as a sentinel, expecting
+#      a REAL checkpoint to carry a `*.weight_scale` tensor that the loader
+#      matches by name and overwrites it with. A plain bf16 checkpoint has
+#      no such key -- nothing ever overwrites the sentinel, and
+#      `process_weights_after_loading`'s non-block-quant path uses
+#      `layer.weight_scale` completely as-is (see
+#      `process_fp8_weight_tensor_strategy`), so the real SM121 GEMM kernel
+#      runs against a garbage weight AND a -3.4e38 scale. That second bug
+#      alone is enough to explain "every generation is
+#      `���...`, never predicts a stop token" -- worse than
+#      the precision loss from bug 1 alone would be.
+#
+# Both are load-time weight-preparation bugs, not activation-quant or
+# kernel-dispatch bugs -- `Fp8LinearMethod.apply()`'s actual runtime GEMM
+# path (`self.fp8_linear.apply_weights`, real SM121/SM89 tensor-core kernel,
+# dynamic per-call activation quantization) was never broken and is left
+# completely untouched here.
+#
+# THE FIX: ScaleAwareFp8LinearMethod
+#
+# A small subclass of vLLM's own `Fp8LinearMethod` that overrides exactly
+# the two methods responsible for the two bugs above:
+#
+#   - `create_weights`: allocates the weight Parameter in `params_dtype`
+#     (bf16) instead of fp8, and does NOT create a `weight_scale` parameter
+#     at all -- there's nothing in the checkpoint for the stock loader to
+#     match it against, so it would just sit at its sentinel forever.
+#     Everything else (kernel selection via `init_fp8_linear_kernel`,
+#     `logical_widths`, `use_marlin` detection) is copied verbatim from
+#     upstream so the real fast-path kernel is chosen exactly as before.
+#   - `process_weights_after_loading`: runs AFTER the standard loader has
+#     copied the checkpoint's real bf16 weights into `layer.weight`
+#     (lossless -- same dtype in, same dtype out). Computes a REAL
+#     per-tensor scale from those actual weights
+#     (`w.abs().amax() / 448.0`, exactly the math already validated
+#     end-to-end in `real_weight_fp8_check.py`), quantizes into fp8 with
+#     that scale, and only THEN calls the upstream kernel's own
+#     `process_weights_after_loading` (16-alignment padding etc.) so
+#     everything downstream of weight prep is stock vLLM code.
+#
+# Everything else -- routing logic, the two multiprocessing-boundary fixes
+# from v1 (patch at import time / unconditional; only `main()` behind
+# `if __name__ == "__main__"`), scope (LM head only) -- is unchanged from
+# v1. Root-caused-and-fixed, not a new approach.
+#
+# SCALE MODE
+#
+# `GLM53_FP8_LMHEAD_SCALE_MODE` env var, default "tensor" (per-tensor, one
+# scale for the whole weight -- this recipe's default boot). Set to
+# "channel" to scale per output row (per vocab token) instead -- the next
+# step in this investigation once per-tensor is validated end-to-end; kept
+# as a runtime switch on the SAME recipe rather than a third YAML file so
+# the two can be A/B'd without a rebuild.
+#
+# WHAT TO CHECK ON BOOT (same bar as v1, this time expected to pass)
+#
+# 1. Boots at all, CUDA graph capture succeeds for the LM head's forward.
+# 2. Real quality check -- coherent multi-turn output, not garbage.
+# 3. Full probe suite: sanity, soak, longctx.
+# 4. Decode/TTFT numbers against the shipped bf16-lm-head baseline.
+
+recipe_version: "2"
+name: GLM-5.3-Flash-EXL3-v2-FP8-LMHead-v2
+description: EXL3 v2 with the LM head dynamically quantized to FP8 via a scale-aware monkeypatch of Exl3Config.get_quant_method that fixes the two load-time bugs found in the v1 attempt (unscaled weight cast + uninitialized weight_scale sentinel) -- everything else unchanged from the shipped v2 recipe
+
+model: Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw
+runtime: vllm
+container: glm53-exl3-v2:c190db1
+
+min_nodes: 2
+
+cluster_config:
+  resolved_model_path: /models
+
+executor_config:
+  entrypoint: ""
+  auto_remove: false
+
+env:
+  TORCH_CUDA_ARCH_LIST: 12.1a
+  FLASHINFER_CUDA_ARCH_LIST: 12.1a
+  FLASHINFER_DISABLE_VERSION_CHECK: "1"
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+  NCCL_DEBUG: WARN
+  TORCH_NCCL_ASYNC_ERROR_HANDLING: "1"
+  EXL3_FUSED_MOE: "1"
+  GLM53_SUPPRESS_STOPS_IN_REASONING: "1"
+  GLM53_MIXED_PREFILL_CHUNK: skip
+  EXL3_FAT_KERNEL: "1"
+  EXL3_MOE_ROW_TILE: "0"
+  GLM53_INDEXER_WORKSPACE: rightsize
+  GLM53_FP8_LMHEAD_SCALE_MODE: tensor
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  served_model_name: glm-5.3-flash-exl3-v2
+  tensor_parallel: 2
+  model_path: /models/models--Mia-AiLab--GLM-5.3-Flash-EXL3-TR3-4bpw/snapshots/024db9f7e9871e8efdf21538ba55af7442be3cd5
+  quantization: exl3
+  max_model_len: 262144
+  max_num_seqs: 4
+  gpu_memory_utilization: 0.86
+  kv_cache_dtype: fp8
+  max_num_batched_tokens: 7168
+  limit_mm: '{"image":4,"video":1}'
+  default_chat_template_kwargs: '{"enable_thinking": false}'
+  speculative_config: '{"method":"mtp","num_speculative_tokens":2}'
+
+command: |
+  cat > /tmp/glm53_fp8_lmhead_v2_shim.py <<'PYSHIM'
+  # See recipe header for the full rationale (why v1 produced garbage, what
+  # this version fixes, and why). Multiprocessing-boundary handling is
+  # identical to v1 and to the spinwait shim: patch at IMPORT TIME
+  # (unconditional, runs in every process that re-imports this file,
+  # spawned or not); only the actual `main()` launch stays behind the
+  # `if __name__ == "__main__"` guard.
+  import os
+  import sys
+
+  import torch
+
+  from vllm.model_executor.layers.linear import LinearBase
+  from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+  from vllm.model_executor.layers.quantization.exl3 import Exl3Config
+  from vllm.model_executor.layers.quantization.fp8 import (
+      Fp8Config,
+      Fp8LinearMethod,
+      MarlinFP8ScaledMMLinearKernel,
+      init_fp8_linear_kernel,
+  )
+  from vllm.model_executor.parameter import ModelWeightParameter
+  from vllm.model_executor.utils import replace_parameter
+
+  _SCALE_MODE = os.environ.get("GLM53_FP8_LMHEAD_SCALE_MODE", "tensor")
+  assert _SCALE_MODE in ("tensor", "channel"), _SCALE_MODE
+
+  _fp8_config = Fp8Config(
+      is_checkpoint_fp8_serialized=False,
+      activation_scheme="dynamic",
+      weight_block_size=None,
+  )
+
+
+  class ScaleAwareFp8LinearMethod(Fp8LinearMethod):
+      """Fp8LinearMethod for on-the-fly quantization from a genuinely bf16
+      checkpoint. See recipe header: upstream's create_weights/
+      process_weights_after_loading assume the checkpoint is ALREADY
+      fp8-serialized (fp8 weight storage from the start + a real
+      `*.weight_scale` tensor on disk); neither holds here, which is what
+      made v1 of this recipe produce garbage. This class fixes both:
+      allocate weight storage in the checkpoint's real dtype so the
+      standard loader does a normal, lossless copy, then compute a REAL
+      scale from the actual loaded weights ourselves before quantizing.
+      """
+
+      def create_weights(
+          self,
+          layer,
+          input_size_per_partition,
+          output_partition_sizes,
+          input_size,
+          output_size,
+          params_dtype,
+          **extra_weight_attrs,
+      ):
+          assert not self.block_quant, "scale-aware path is per-tensor/channel dynamic only"
+          output_size_per_partition = sum(output_partition_sizes)
+          weight_loader = extra_weight_attrs.get("weight_loader")
+          layer.logical_widths = output_partition_sizes
+          layer.input_size_per_partition = input_size_per_partition
+          layer.output_size_per_partition = output_size_per_partition
+          layer.orig_dtype = params_dtype
+          layer.weight_block_size = None
+
+          # params_dtype (bf16), NOT fp8 -- the whole point of this override.
+          # The standard weight_loader now does a normal same-dtype copy
+          # from the checkpoint, so `layer.weight` holds the checkpoint's
+          # real values after loading, not an unscaled fp8 cast of them.
+          weight = ModelWeightParameter(
+              data=torch.empty(
+                  output_size_per_partition, input_size_per_partition,
+                  dtype=params_dtype,
+              ),
+              input_dim=1,
+              output_dim=0,
+              weight_loader=weight_loader,
+          )
+          layer.register_parameter("weight", weight)
+          # Deliberately NOT creating a weight_scale parameter here -- see
+          # process_weights_after_loading, which computes and attaches a
+          # real one once actual weights exist.
+
+          self.fp8_linear = init_fp8_linear_kernel(
+              activation_quant_key=self.activation_quant_key,
+              weight_quant_key=self.weight_quant_key,
+              weight_shape=(output_size_per_partition, input_size_per_partition),
+              input_dtype=self.input_dtype,
+              out_dtype=self.out_dtype,
+              module_name=self.__class__.__name__,
+          )
+          self.use_marlin = isinstance(self.fp8_linear, MarlinFP8ScaledMMLinearKernel)
+
+      def process_weights_after_loading(self, layer) -> None:
+          assert not self.use_marlin, "scale-aware path assumes real SM121 FP8 tensor cores"
+          w = layer.weight.data  # real bf16 weights, correctly loaded by now
+          w32 = w.to(torch.float32)
+
+          if _SCALE_MODE == "channel":
+              # Per output row (per vocab token for lm_head): shape [N, 1].
+              scale = (w32.abs().amax(dim=1, keepdim=True) / 448.0).clamp(min=1e-12)
+          else:
+              # Per-tensor: a single scalar for the whole weight.
+              scale = (w32.abs().amax() / 448.0).clamp(min=1e-12).reshape(1)
+
+          wq = (w32 / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+
+          replace_parameter(layer, "weight", wq.t())
+          layer.weight_scale = torch.nn.Parameter(scale.to(torch.float32), requires_grad=False)
+          layer.input_scale = None
+
+          print(
+              f"[glm53-fp8-lmhead-v2] quantized weight scale_mode={_SCALE_MODE} "
+              f"scale_shape={tuple(scale.shape)} scale_range=[{scale.min().item():.6g}, "
+              f"{scale.max().item():.6g}] weight_max_before={w32.abs().max().item():.4f}",
+              file=sys.stderr, flush=True,
+          )
+
+          # Stock kernel-level post-processing from here (16-alignment
+          # padding etc.) -- everything downstream of weight prep is
+          # unmodified vLLM.
+          self.fp8_linear.process_weights_after_loading(layer)
+
+
+  _original_get_quant_method = Exl3Config.get_quant_method
+
+
+  def _patched_get_quant_method(self, layer, prefix):
+      if isinstance(layer, (LinearBase, ParallelLMHead)) and "lm_head" in prefix:
+          print(f"[glm53-fp8-lmhead-v2] routing '{prefix}' ({type(layer).__name__}) "
+                f"through ScaleAwareFp8LinearMethod (dynamic, scale_mode={_SCALE_MODE})",
+                file=sys.stderr, flush=True)
+          return ScaleAwareFp8LinearMethod(_fp8_config)
+      return _original_get_quant_method(self, layer, prefix)
+
+
+  Exl3Config.get_quant_method = _patched_get_quant_method
+  print(f"[glm53-fp8-lmhead-v2] Exl3Config.get_quant_method patched (pid={os.getpid()}, "
+        f"__name__={__name__!r}, scale_mode={_SCALE_MODE!r})", file=sys.stderr, flush=True)
+
+  if __name__ == "__main__":
+      sys.argv[0] = "vllm"
+      from vllm.entrypoints.cli.main import main
+      sys.exit(main())
+  PYSHIM
+  python3 /tmp/glm53_fp8_lmhead_v2_shim.py serve {model_path} \
+      --served-model-name {served_model_name} \
+      --host {host} --port {port} \
+      --trust-remote-code \
+      --tensor-parallel-size {tensor_parallel} \
+      --quantization {quantization} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} \
+      --kv-cache-dtype {kv_cache_dtype} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --speculative-config '{speculative_config}' \
+      --tool-call-parser glm47 --enable-auto-tool-choice \
+      --reasoning-parser glm45 \
+      --enable-prefix-caching \
+      --no-enable-flashinfer-autotune \
+      --skip-mm-profiling \
+      --limit-mm-per-prompt '{limit_mm}' \
+      --chat-template /opt/glm53/chat_template.jinja \
+      --default-chat-template-kwargs '{default_chat_template_kwargs}' \
+      --distributed-executor-backend mp

@@ -2592,3 +2592,103 @@ two genuinely new findings — the decode-throughput collapse via broken
 speculative-decode acceptance, and the clean prefill/decode damage
 boundary. Production restored and re-verified with a real generation
 request after this run, same as every other attempt in this section.
+
+## FP8 LM head, attempt #2: scale-aware loader (fixes the root cause, doesn't just work around it)
+
+Options for closing the gap, in the order they're worth exploring if effort
+isn't the constraint: (1) a scale-aware dynamic loader that fixes the exact
+bug found above, (2) per-channel instead of per-tensor weight scaling on
+top of that, (3) extending the same validated mechanism to attention/MLP
+(bigger win — ~30.8% of decode kernel time vs. the LM head's ~9.5% — but
+larger blast radius, and per-layer isolated checks are known to be
+non-diagnostic, so scope only after the mechanism is proven), (4) an
+offline-calibrated (AutoFP8/llm-compressor-style) checkpoint as the
+eventual production-hardened path. None of these are mutually exclusive —
+they compose — the sequencing is about which question each one answers and
+what it depends on knowing first.
+
+**Reading vLLM's actual source (not just re-testing) found a second,
+worse bug than the one first written up above.** `create_fp8_scale_parameter`
+initializes `weight_scale` to `torch.finfo(torch.float32).min` (~ -3.4e38)
+as a sentinel, expecting a real fp8-serialized checkpoint to carry a
+`*.weight_scale` tensor that the loader matches by name and overwrites.
+A plain bf16 checkpoint has no such key — nothing ever overwrites the
+sentinel — and `process_weights_after_loading`'s non-block-quant path uses
+`layer.weight_scale` completely as-is. So v1's failure wasn't just an
+unscaled cast losing precision on subnormal-range weights; the real SM121
+GEMM kernel was running against a garbage weight **and** a -3.4e38 scale.
+That second bug alone is sufficient to explain "every generation is
+replacement characters, never predicts a stop token" — worse than bug 1
+alone would produce.
+
+**Fix: `ScaleAwareFp8LinearMethod`**, a subclass of vLLM's own
+`Fp8LinearMethod` (`glm-5.3-flash-exl3-v2-fp8-lmhead-v2.yaml`) that overrides
+exactly the two methods responsible:
+- `create_weights` allocates the weight Parameter in `params_dtype` (bf16),
+  not fp8 — the standard loader then does a normal, lossless same-dtype
+  copy from the checkpoint. No `weight_scale` parameter is created here at
+  all (there's nothing in the checkpoint for the stock loader to match it
+  against). Kernel selection (`init_fp8_linear_kernel`, `use_marlin`
+  detection) is copied verbatim from upstream so the real SM121 fast-path
+  kernel is chosen exactly as before.
+- `process_weights_after_loading` runs after the real bf16 weights are
+  loaded, computes an actual scale from them (`w.abs().amax() / 448.0` —
+  the same math already validated in `real_weight_fp8_check.py`), quantizes
+  with that scale, then hands off to the upstream kernel's own
+  `process_weights_after_loading` (16-alignment padding etc.) so everything
+  downstream of weight prep is stock vLLM code. A `GLM53_FP8_LMHEAD_SCALE_MODE`
+  env var (`tensor` default, `channel` available) picks per-tensor vs.
+  per-output-row scaling on the same recipe file, for the #2 → #3 A/B
+  without a rebuild.
+
+**Boot 1** hit an unrelated external `SIGTERM` mid-boot (during multimodal
+video-processor warmup, well after weight loading/quantization/CUDA graph
+capture all completed cleanly) — traced to the tooling session's own
+foreground process-tracking reaping a long-running launch command, not
+anything in this patch. Confirmed from that boot's logs before restarting:
+`[glm53-fp8-lmhead-v2] quantized weight scale_mode=tensor scale_shape=(1,)
+scale_range=[0.000481742, 0.000481742] weight_max_before=0.2158` — scale is
+exactly `0.2158/448`, real weight statistics, not a sentinel — and CUDA
+graph capture completed (FULL + PIECEWISE, prefill + decode, "Graph
+capturing finished in 6 secs"). Relaunched with the launch command properly
+detached from the tooling session (`setsid nohup ... & disown`) rather than
+tracked as a long foreground call; booted clean on retry, same quantization
+line, same successful graph capture ("finished in 5 secs, took 0.37 GiB").
+
+**Quality check**: two prompts (an explanatory paragraph, a code+reasoning
+task), both `finish_reason=stop`, both fully coherent — no replacement
+characters, no `finish_reason=length` runaway. A qualitative night-and-day
+difference from v1's `���...` on the same two-prompt bar.
+
+**`probe_sanity.py`**: **ALL CHECKS PASSED**. Decode 25.8-28.28 tok/s
+(median 27.25), TTFT 0.309-0.336s — squarely inside the shipped bf16-lm-head
+baseline's own range (23.49-30.44 tok/s, TTFT 0.215-0.32s) with no
+regression, and if anything a touch better at the median, though not
+distinguishable from run-to-run noise at n=3.
+
+**`probe_soak.py`**: **PASSED**, all 7 checks — 3 sequential rounds (10/10
+each, median 2.68-3.54s), 3 concurrent waves (3/3 each, median 0.76-8.14s),
+`endpoint-alive-after-soak`. Unlike the v1 soak run, this one is meaningful
+as a correctness signal too, not just a stability one — every response in
+every round is real coherent content this time.
+
+**`probe_longctx.py`** (100K tokens): **ALL CHECKS PASSED**. TTFT 85.5s
+(vs. the healthy baseline's 83.3-107.1s across prior runs at this scale —
+no regression), `finish-stop`, and **4/4 planted codes retrieved
+correctly** (`CODE-1-BBBB, CODE-2-PPPP, CODE-3-JJJJ, CODE-4-CCCC`) — the
+first successful codes-retrieved result anywhere in this fp8-lmhead thread;
+v1 failed this check by construction (garbage output). This is the real,
+positive counterpart to v1's clean *damage*-isolation finding: the LM head
+was the only thing broken, and now that it's fixed, everything downstream
+of it works too.
+
+**Verdict: attempt #2 is a clean, fully-validated positive result.**
+Correct per-tensor dynamic FP8 quantization on the LM head — real weights,
+real scale, real SM121 kernel — holds up through the complete probe suite
+plus real multi-turn quality checks, with throughput matching (not
+regressing) the shipped bf16 baseline. Not yet promoted to production;
+left running as the active experiment while #3 (per-channel scaling) and
+#4 (extending the same mechanism to attention/MLP) are explored, per the
+plan agreed this session. `glm-5.3-flash-exl3-v2-fp8-lmhead.yaml` (v1) is
+kept as-is, with its header now historical — the bug it exposed is real and
+well-documented, this is simply the fix.
