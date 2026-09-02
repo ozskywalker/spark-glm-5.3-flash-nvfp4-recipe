@@ -2811,3 +2811,84 @@ restored and re-verified with a real generation request after this run.
   materially different and more invasive change than anything tried this
   session, and one that overrides what looks like a deliberate precision
   choice by the model's authors rather than an oversight.
+
+## Does #2 actually move throughput? Rigorous A/B says yes, clearly
+
+The n=3 `probe_sanity.py` numbers throughout this thread (23.49-30.44 tok/s
+baseline vs. 25.8-29.11 across #2/#3/#4) all overlap — not enough signal to
+call a win, given a back-of-envelope ceiling (LM head ~9.5% of decode
+kernel time x 1.54x speedup) suggested only ~3.3 percentage points of
+possible improvement, smaller than that noise band. Built
+`probe_throughput_ab.py` to actually resolve this: one fixed prompt,
+temperature=0, 400-token forced completions (many more decode steps per
+run averages out per-request scheduling jitter), n=20 per config.
+
+| Config | n | mean tok/s | median | stdev | min | max |
+|---|---|---|---|---|---|---|
+| Baseline (bf16 lm_head) | 20 | 23.658 | 23.552 | 0.498 | 22.835 | 25.108 |
+| #2 (fp8 lm_head, tensor) | 20 | 25.599 | 25.520 | 0.716 | 24.447 | 27.269 |
+
+**+1.941 tok/s, +8.2%, pooled-SE t-stat ≈ 9.95 — unambiguous, not noise.**
+Larger than the theoretical ceiling estimate, most likely because that
+estimate used a kernel-time share measured without accounting for MTP-2
+speculative decoding invoking the LM head multiple times per accepted
+step (draft verification + new-token prediction), so its real contribution
+to wall-clock decode time is higher than a single-pass kernel-time-share
+figure suggested. **This is the first real, statistically solid throughput
+win in the whole fp8 investigation.** Production restored and re-verified
+after this benchmark.
+
+## Attention fp8: investigated the "why", not just the "how" — traces to the model creators' own quantization scheme, not a vLLM gap
+
+Per request, dug into *why* attention is excluded before writing any
+override. `vllm.models.glm5next` (this container's model implementation)
+is not on vLLM's released `main` branch at all — it ships from
+**vllm-project/vllm#53906, "[Model] add GLM-5.3-Flash support", still
+OPEN**, an in-flight PR the container was built from at commit
+`487ecf187` (2026-08-25). That alone would be reason for caution, but the
+actual evidence goes further and is more specific than "unfinished PR":
+
+`model.py` has a function, `_try_load_fp8_attn_proj`, whose docstring
+reads: *"Dequantize FP8 q_a_proj / kv_a_proj_with_mqa / o_proj to BF16 on
+load. The FP8 checkpoint stores these as block-FP8 (weight +
+weight_scale_inv) ... When the model target is BF16 (no weight_scale_inv
+param) we dequantize; otherwise we return False so the normal
+stacked/direct path loads the FP8 tensor as-is."* Two things this proves:
+
+1. **The real, official `zai-org/GLM-5.3-Flash` FP8 checkpoint DOES store
+   these attention projections in block-FP8** — with real, calibrated
+   `weight_scale_inv` tensors, produced by the model's own creators, not
+   a gap anyone needs to fill.
+2. **vLLM's model code actively converts them back to BF16 for serving,
+   on purpose** — the function only fires because the attention Linear
+   layers are constructed with `quant_config=None` (so no
+   `weight_scale_inv` param exists on the model side to receive the
+   checkpoint's real fp8 data); if that weren't the case, the function
+   explicitly backs off ("return False") and lets the checkpoint's own
+   real fp8 weight+scale load through untouched.
+
+So the mechanism is conditional, not absolute — but the condition it's
+conditioned on (`quant_config=None`, hardcoded uniformly for every
+sub-projection of both `Glm5NextMLAAttention` and the KDA/mamba
+counterpart, per the two near-identical comments found in `model.py` and
+`kda.py`) is itself a choice, and it means: **even the official
+zai-org checkpoint's own calibrated FP8 attention weights get discarded
+and reconstructed as BF16 by this vLLM support code, every time.** This
+isn't an unimplemented feature or a conservative default pending
+follow-up — it's the vLLM integration faithfully mirroring a quantization
+scope decision the model's own creators made when they produced the
+official FP8 release: MoE experts, dense MLP, LM head get FP8; every
+attention projection (both architectures) stays BF16, unconditionally.
+`o_proj` is additionally confirmed excluded via `modules_to_not_convert`
+per the same docstring.
+
+**Conclusion**: attention fp8 is not "harder to implement," it's working
+against a specific, traceable, first-party accuracy decision — encoded
+independently in two places in the vLLM integration (the hardcoded
+`None`s, and the dequantize-on-load fallback that only exists because
+real fp8 attention data needed somewhere to go). Overriding it is still
+possible (same monkeypatch technique used throughout this session would
+work mechanically), but it would be deliberately serving attention at a
+precision the model's own creators evaluated and rejected, not exploring
+an open question. Flagged back to the user for a decision before any
+further work here.
