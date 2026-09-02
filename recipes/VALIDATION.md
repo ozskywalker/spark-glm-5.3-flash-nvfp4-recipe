@@ -1716,3 +1716,52 @@ now updated to reflect this confirmation rather than the earlier
 **Test artifact**: `recipes/glm-5.3-flash-nvfp4-vllm-dflash2-autotune-off.yaml`
 in the working repo, kept (not deleted) since it's now a working,
 validated config, not a ruled-out one.
+
+## Request pipeline timing: where time actually goes (2026-09-02)
+
+Built a visual "anatomy of a request" breakdown against the live EXL3 v2
+service (`max_num_batched_tokens=7168`, MTP-2), not from theory but from
+before/after deltas on vLLM's own Prometheus counters
+(`vllm:*_seconds_sum`, `vllm:spec_decode_num_*_tokens_total`) across three
+single-stream (concurrency=1) workloads, n=6 requests each. Script:
+`recipes/probes/probe_pipeline_timing.py`.
+
+| Workload | Prompt&rarr;gen tok | e2e | queue | prefill | decode | overhead* | decode tok/s | MTP-2 accept |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| Short prose | 23&rarr;128 | 4.92s | ~0 | 0.227s (4.6%) | 4.644s (94.5%) | 0.046s (0.9%) | 27.35 | 73.8% (pos0 91.6% / pos1 55.9%) |
+| Structured (counting) | 32&rarr;200 | 6.60s | ~0 | 0.222s (3.4%) | 6.310s (95.6%) | 0.068s (1.0%) | 31.54 | 97.1% (pos0 100% / pos1 94.1%) |
+| Medium prompt | 275&rarr;73 | 2.97s | ~0 | 0.513s (17.3%) | 2.383s (80.3%) | 0.071s (2.4%) | 30.35 | 93.0% (pos0 100% / pos1 85.9%) |
+
+*overhead = e2e &minus; (queue+prefill+decode): network/JSON/detokenize, not
+broken out further by current metrics.
+
+**Findings**:
+- **Queue time is genuinely zero at single-stream** (0.00002-0.00003s avg)
+  — the scheduler is never the bottleneck at concurrency=1. Not yet tested
+  at higher concurrency (`num_requests_waiting_by_reason` exists for a
+  future capacity-ceiling probe).
+- **Decode dominates e2e for short/medium completions** (80-96%), not
+  prefill — confirms the `max_num_batched_tokens` win (a prefill-side
+  knob) doesn't touch the thing actually gating short-request latency.
+- Cross-referenced against the `max_num_batched_tokens` promotion's
+  already-measured 100K/250K-token TTFT (83.4s / 199.5s): the picture
+  flips completely at long context — prefill becomes totally dominant.
+  Confirms the fat-expert kernel and the batched-tokens raise targeted
+  the right regime.
+- **MTP-2 acceptance is workload-dependent even with only 2 draft
+  positions** (73.8% prose vs. 97.1% structured) — same shape as DFlash2's
+  much more dramatic 7-position decay (70%&rarr;6% prose vs. flat
+  85-100% structured), just far less pronounced at this shallow depth.
+- **Confirmed gap, not yet closed**: vLLM's `/metrics` on this build has
+  no sub-forward-pass breakdown — no way to separate MLA attention,
+  sparse-indexer, mamba-layer, or MoE/fat-expert-kernel time from each
+  other via Prometheus alone. `vllm:estimated_flops_per_gpu_total` and
+  the paired read/write-byte counters exist but read 0 (not populated by
+  this vLLM version) — a roofline (compute- vs. bandwidth-bound) view
+  wasn't possible from metrics. Next step for real kernel-level attribution:
+  `torch.profiler` or `nsys` trace on a single prefill+decode step.
+
+**Artifact**: published as "Anatomy of a GLM-5.3-Flash Request" —
+pipeline flow diagram, per-workload waterfall, context-length crossover,
+and a speculative-decode funnel comparing MTP-2 against the DFlash2
+reference numbers above, plus a ranked "where to dig next" list.
