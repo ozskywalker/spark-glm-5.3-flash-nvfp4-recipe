@@ -2214,3 +2214,153 @@ too generous; "doesn't reproduce" is the honest read. `VLLM_USE_SPINLOOP_EXT`
 (the native spin-loop extension, confirmed importable but disabled by
 default) is still an untested, independent lever on the same code path and
 remains open.
+
+## The Blackwell-kernel lead investigated: negative result, real pivot found
+
+Dig item #2 from the profiling session: "40%+ of decode GPU time is
+SM80-target CUTLASS WMMA with 16x16 tiles, ~81% empty in M — worth checking
+whether a newer cuBLAS/CUTLASS already dispatches an SM100/SM120 kernel
+before writing anything." Investigated as instructed, in that order.
+
+**Toolchain is already current — not a stale-library problem.** This
+container ships CUDA 13.0 (nvcc `V13.0.88`, built Aug 2025), cuBLAS
+`13.1.1.3`, PyTorch `2.13.0+cu130`, and `nvidia-cutlass-dsl` `4.6.2`. cuBLAS
+still dispatches the SM80-targeted WMMA kernel family for this shape+layout
+on SM121 even at this version — confirmed by reproducing the exact call in
+isolation (below), so this is a genuine coverage gap in cuBLAS's own kernel
+selection for SM121, not an artifact of an old install.
+
+### Identifying the actual GEMM: the LM head, and one real profiling gotcha
+
+Correlated `aten::mm`'s `Input Dims`/`Input Strides` against the dominant
+kernel bucket from the earlier trace. Shape: `[M, 4096] x [4096, 77440]`,
+strides `[[4096,1],[1,4096]]` — the second operand is accessed **transposed**
+(column-major), matching standard `nn.Linear`/`ParallelLMHead` weight
+storage (`[out_features, in_features]`, used via `x @ W.T`). 77440 =
+154,880 (this checkpoint's real vocab size, confirmed in `config.json`) / 2
+(TP=2). This is the LM head / vocab-logits projection.
+
+**CUDA-graph replay breaks normal profiler kernel↔op correlation** — a
+limitation this project's own profiling recipe header already flagged, now
+hit directly: of 27 captured `aten::mm` events in the decode trace, only 2
+(both the rare `M=1` case) had a `cudaLaunchKernel` event whose `External
+id`/`correlation` successfully joined to a kernel event. The 25 `M=3` events
+— the real, steady-state MTP-2 decode shape — never joined, because a
+captured graph replays via `cudaGraphLaunch` without re-emitting individual
+`cudaLaunchKernel` calls through the profiler's RecordFunction machinery.
+Worked around it by reproducing the exact shape and **weight layout** in
+isolation instead (layout matters: a naive contiguous-weight benchmark
+dispatched a *different* kernel, `cutlass_80_tensorop_bf16_s16816gemm_
+bf16_128x64_32x6_nn_align2`, than the real transposed-weight case).
+
+With the correct layout (`F.linear(X, W)`, `W: [77440, 4096]`), the isolated
+repro dispatches the **identical** kernel family seen live in production —
+`cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_16x16_128x2_tn_align8` —
+confirming the reproduction is faithful.
+
+### The tile being "81% empty in M" turns out not to matter
+
+| M | kernel | time | achieved bandwidth |
+|---:|---|---:|---:|
+| 1 | `internal::gemvx::kernel` (dedicated GEMV path) | 3482.1 us | 182.2 GB/s |
+| 3 | `cutlass_80_wmma_..._16x16_128x2_tn_align8` | 2583.1 us | 245.6 GB/s |
+| 8 | same kernel | 2582.9 us | 245.6 GB/s |
+
+**M=3 and M=8 take identical time.** This operation is fully
+memory-bandwidth-bound, not compute-bound: the kernel's job is to stream a
+605 MiB (`77440 x 4096 x 2` bytes) weight matrix out of memory once per
+call, and that cost doesn't change whether 3 rows or 8 rows of activation
+ride along. A mostly-empty 16x16 MMA tile costs nothing when the bottleneck
+is HBM traffic, not tensor-core issue rate — the original framing
+("SM80 WMMA kernel, tile mostly empty, therefore inefficient") was
+structurally accurate but the inference from it doesn't hold.
+
+### Is 245.6 GB/s actually close to this hardware's ceiling? Yes.
+
+Three independent, purpose-built bandwidth microbenchmarks on the same
+node: large elementwise `copy_` (read+write) **231.3 GB/s**, fp32 reduction
+(read-dominant) **222.7 GB/s**, bf16 reduction **230.9 GB/s**. **The
+production LM-head kernel (245.6 GB/s) already beats all three.** There is
+essentially no headroom left for a hand-written kernel to extract from pure
+memory throughput on this shape — the "40%+ of decode GPU time" figure is
+close to the physical cost of reading a 605 MiB matrix from memory every
+decode step, not evidence of a bad kernel implementation.
+
+Checked the same question at smaller sizes — the model's other dense (i.e.
+non-MoE) linear layers, all of which run bf16 (see below) — using this
+checkpoint's real MLA dimensions (`hidden_size=4096, q_lora_rank=1536,
+kv_lora_rank=512, qk_nope_head_dim=v_head_dim=256, num_attention_heads=64`,
+TP=2-sharded where applicable):
+
+| Layer (TP=2 per-rank shape) | weight size | time (M=3) | achieved BW |
+|---|---:|---:|---:|
+| `q_a_proj` [4096→1536] | 12.6 MB | 18.2 us | 691.7 GB/s |
+| `kv_a_proj` [4096→512] | 4.2 MB | 5.9 us | 712.9 GB/s |
+| `q_b_proj` [1536→8192] | 25.2 MB | 53.7 us | 468.4 GB/s |
+| `kv_b_proj` [512→16384] | 16.8 MB | 16.1 us | 1041.8 GB/s |
+| `o_proj` [8192→4096] | 67.1 MB | 250.8 us | 267.5 GB/s |
+| MLP gate/up [4096→6144] | 50.3 MB | 212.0 us | 237.4 GB/s |
+| LM head [4096→77440] | 605.3 MB | 2583.1 us | 245.6 GB/s |
+
+Small matrices (≲25 MB) show much higher apparent bandwidth — almost
+certainly L2 cache locality, not real HBM throughput. Past roughly
+50 MB the number converges cleanly to the same ~235-270 GB/s band the LM
+head and the raw bandwidth tests both landed in. **Every dense GEMM big
+enough to matter is already running near this hardware's practical memory
+ceiling, on the exact same kernel family, regardless of shape.** This
+generalizes the LM-head finding to the whole decode path: there is no
+"write a faster kernel for this shape" opportunity here, because the
+bottleneck is bytes moved, and the existing off-the-shelf cuBLAS kernel is
+already close to moving them as fast as this hardware's memory subsystem
+allows.
+
+### The real lever: this checkpoint quantizes only the MoE experts
+
+Every one of the shapes above is bf16 in production. Checked why:
+`Exl3Config.get_quant_method()` returns `Exl3MoEMethod` only for
+`RoutedExperts` layers and `UnquantizedLinearMethod()` for every other
+`LinearBase` — attention projections, the router, and the LM head all fall
+through unquantized. This isn't a vLLM integration gap: the checkpoint's own
+`config.json` states it explicitly —
+`"quantization_config": {"scope": "glm53_routed_experts_only",
+"non_routed_dtype_policy": "official_source_native", "head_bits": 16}`.
+It's the checkpoint authors' deliberate choice, consistent with common
+practice (output/embedding layers are often kept at higher precision across
+quantization schemes for sensitivity reasons) — not something to "fix" by
+finding a missed flag.
+
+**Given the table above, this is where the real lever is.** These
+operations are bandwidth-bound; halving the bytes read (bf16 → fp8 for the
+LM head and/or attention projections) would roughly halve their time,
+directly cutting the single largest slice of decode GPU time — a much
+larger and more tractable win than a hand-tuned Blackwell kernel for bytes
+that don't change. Not attempted here (it means a different checkpoint or
+an additional quantization pass, out of scope for a kernel-trace
+investigation) — flagged as the next real thread, not this one.
+
+**Verdict: the specific lead ("write a Blackwell-native kernel for the
+M=3 skinny-GEMM tile-fill problem") is a negative result, investigated
+properly rather than assumed.** The tile-fill framing was structurally true
+and functionally irrelevant. Nothing was written; nothing should be, for
+this specific complaint. The productive version of "reduce decode GPU
+time in dense layers" is quantization coverage, not kernel authorship.
+
+### Incident: production went down mid-investigation, cause not confirmed
+
+The isolated-shape benchmarks above ran via `docker exec` directly against
+the same container and GPU as the live production `vllm serve` process
+(read-only from the server's own perspective — no config or file changed).
+~15 minutes after the last benchmark, the API server logged
+`[shutdown] API server: shutdown triggered` with no preceding error,
+warning, or OOM message anywhere in the log — the same "clean" shutdown
+sequence the server runs on a genuine SIGTERM, and the same signature this
+file already has two other unresolved instances of (the multimodal-warmup
+`KeyboardInterrupt` entries above): an external signal with no identified
+sender. Timing is suggestive (during a window of unusually many short-lived
+`docker exec python3` processes against the same container) but not proof —
+no evidence ties the two together beyond proximity, and the benchmarks
+themselves ran to completion and printed correct results beforehand.
+Restored production immediately (stop, flush, relaunch, verified with a real
+generation request). Flagging rather than concluding: if this recurs during
+similarly benchmark-heavy sessions, that pattern would be worth treating as
+a real lead rather than coincidence.
