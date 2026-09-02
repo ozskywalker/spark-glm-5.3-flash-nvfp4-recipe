@@ -1412,11 +1412,24 @@ without incident. Full `probe_sanity.py` (TTFT 0.227-0.33s, decode
 23.55-25.09 tok/s median 24.12) and `probe_soak.py` (10/10 + 10/10
 sequential, 3/3 + 3/3 concurrent) passed.
 
-**Conclusion: one-off, not a reproducible defect.** Restored vision/video
+**Conclusion at the time: treated as a one-off.** Restored vision/video
 (`--skip-mm-profiling --limit-mm-per-prompt '{"image":4,"video":1}'`,
-matching v1's capability) as v2's shipped config — no capability tradeoff
-after all. If this KeyboardInterrupt recurs on a future boot, capture the
-exact SIGTERM sender (host process list / `strace -f` on the container's
+matching v1's capability) as v2's shipped config.
+
+**Correction (2026-09-01, later the same day): this is real and
+intermittent, not a one-off.** The identical `KeyboardInterrupt` during
+multi-modal renderer warmup recurred a third time, on a completely fresh
+boot after both cluster nodes rebooted (clean memory, `uptime` ~3 min on
+both) — ruling out memory pressure or accumulated cruft as the cause. A
+second retry (same config, no changes) booted clean again, matching the
+original pattern: sometimes crashes, sometimes doesn't, no config
+difference between attempts. Genuinely intermittent, not reproducible
+on-demand, and the external SIGTERM's actual sender still hasn't been
+identified. Current stance: keep vision on (2/3 attempts across this
+session's history succeeded), retry once on a boot failure at this exact
+signature before considering `--language-model-only` again. If this
+recurs, capture the exact SIGTERM sender (host process list / `strace -f`
+on the container's
 PID 1) before reaching for `--language-model-only` again as a workaround.
 
 ## Final decision: v2 (vision on) promoted as the default
@@ -1427,3 +1440,252 @@ gets the improvements automatically). No capability regression, no
 performance regression, three of four PR claims independently confirmed
 with real measured gains, the fourth neither confirmed nor disproven.
 Live deployment left running on this exact validated config.
+
+## v3 attempt: PR80 "mixed-prefill gate v2" — built, deployed, negative result (2026-09-01)
+
+Follow-up investigation after the user asked whether anything else from
+the community (specifically Reederey87/glm53-flash-exl3-2x-dgx-spark's
+v1.3.2 release and MiaAI-Lab's own recent activity) had been missed.
+Found two things: v1.3.2's fat-expert-kernel adoption is the same PR77
+already validated above (a second independent same-hardware-class
+confirmation: their own numbers, +11-18% across three context lengths,
+line up with this project's +14.3%/+13.9%); and PR80 "Mixed-prefill gate
+v2" (MiaAI-Lab, still **open/unmerged** against `main` at validation
+time, `mergeable: false`) — a real fix, independently validated by both
+MiaAI-Lab and Reederey87, for a genuine bottleneck the shipped v2 config
+still has: `GLM53_MIXED_PREFILL_CHUNK=skip` holds a fully-cached follow-up
+turn for the *entire* duration of any concurrently-running generation
+(their own receipts: 15-17s TTFT for what should be a near-instant cached
+hit). Gate v2's claimed fix: a request whose uncached remainder fits one
+hybrid block bypasses the hold entirely (their receipts: 15-17s → 1.4-1.6s).
+
+### Build: clean, resolved by hand
+
+PR80's branch conflicted against current `main`@`c190db1` (base was an
+older commit, `493cb88`, predating PR77/86/63/96). Fetched
+`refs/pull/80/head`, merged locally, resolved four conflicted files —
+`.env.example`, `README.md`, `start.sh`, `tests/test_start_overrides.py`
+— all pure two-sided additions except one real value conflict in
+`README.md`'s documented `MAX_NUM_BATCHED_TOKENS` default (`main` had
+already moved it to 7168 post-PR77, an upstream change this project
+hadn't picked up yet — worth its own follow-up test; resolved in favor of
+`main`'s newer value, not PR80's stale 2048). The core scheduler overlay
+(`overlay/patch_scheduler_decode_floor.py`) merged with **zero conflicts**
+— gate v2's actual logic is additive to the existing decode-floor patch.
+Rebuilt (`docker build -t glm53-exl3-v2:c190db1-gate2 .`): 24 seconds total
+— the CUDA extension compile fully cache-hit (gate v2 touches no
+exllamav3 code, pure Python scheduler overlay), confirming this was a
+cheap, low-risk rebuild. Applied this session's hard-won lesson: built
+with `nice -n 15`, actively verified the live deployment's health with
+real generation requests (not just `/health`) throughout, rather than
+fire-and-forget like the incident earlier today. No repeat incident.
+
+Verified the gate v2 markers (`[glm53-decode-floor-v2]`) were genuinely
+present in the built image's `vllm/v1/core/sched/scheduler.py` before
+deploying, not just trusting the build log.
+
+### Boot: two memory-ceiling failures, same "trapped memory" pattern as earlier today
+
+First attempt at `gpu_memory_utilization=0.86` (matching the shipped v2
+value) failed at the identical startup free-memory check hit repeatedly
+earlier today: `102.6/121.69 GiB free ... less than desired ... 104.65
+GiB`. This confirms the "trapped memory" erosion documented earlier
+(105.75 → 105.31 → 104.93 → 102.6 GiB free across today's cumulative
+crashed/killed launches) is real and ongoing, not resolved by cache
+flushing alone. Dialed to `gpu_memory_utilization=0.82` for real margin
+(99.8 GiB budget vs. 102.6 GiB free, not another razor-thin step) — booted
+clean. **If this keeps eroding, a full node reboot is the actual fix, not
+further gmu reduction** — see `~/ai/research/glm-5.3-flash-gb10/README.md`.
+
+### Result: config genuinely active, claimed benefit did NOT reproduce
+
+`probe_sanity.py` and `probe_soak.py` both passed cleanly (decode median
+25.1 tok/s, consistent with every prior v2 measurement — no regression).
+Confirmed via a live request that `_glm53_gate_config()` logged the
+correct values: `{'warm_tokens': 3584, 'max_wait_ms': 1500, 'late_cap':
+512}`.
+
+Reproduced PR80's own test shape directly: primed a ~16K-token cached
+prefix, started a 300-token generation on the identical prompt (so it
+decodes with a warm cache), then fired a **second identical-prompt
+request (max_tokens=1)** while the first was actively decoding — this
+should trigger the warm-bypass path immediately (`remaining` computed
+against the cached prefix should be near-zero, far under the 3584-token
+threshold).
+
+| Attempt | Delay before follow-up | Follow-up TTFT | Concurrent generation's own duration |
+|---|---:|---:|---:|
+| 1 | 0.8s | 14.09s | 15.84s |
+| 2 | 1.5s | 8.73s | 11.53s |
+
+Both runs: the follow-up's wait time scales **proportionally with the
+concurrent generation's remaining duration** (89% and 76% respectively) —
+exactly the signature of the *old* `skip` hold-until-done behavior, not a
+bypass. A control test (sequential warm-cache hit, no concurrent decode)
+confirmed the base prefix-cache mechanism itself is intact and unaffected
+by gate v2: 4.75-4.82s, matching pre-gate-v2 measurements exactly (4.78-
+4.79s) — so this is specifically a gate-timing issue, not a caching
+regression.
+
+Read the gate function's actual logic directly from the built image
+(`_glm53_mixed_prefill_gate`) to rule out a bad merge: the warm-bypass
+check (`remaining <= cfg["warm_tokens"]: return None`) runs *before* the
+mixed-prefill policy check and looks structurally correct. The most
+likely explanation, not yet confirmed: **PR80 was validated by both its
+authors against DFlash2** (Reederey87's and MiaAI-Lab's own receipts both
+reference DFlash2-shaped workloads); this deployment runs **MTP k=2**.
+Something about how `num_computed_tokens` is populated at the scheduling
+point this gate reads from may differ meaningfully between the two
+speculators (MTP's simpler single-layer draft vs. DFlash2's aux-capture/
+mHC pipeline) in a way that defeats the "remaining uncached prefill"
+computation specifically under MTP. Not confirmed — would need scheduler-
+level instrumentation this project has already established is unreliable
+on this cluster (see the profiling-crashes findings earlier in this
+document) to pin down conclusively.
+
+### Decision: reverted, not promoted
+
+Reverted the live deployment to the fully-validated v2 config (four PRs
+confirmed, zero known regressions) rather than ship gate v2 with an
+unconfirmed benefit and an added (if currently harmless) layer of
+unmerged-upstream complexity. Gate v2 is not disproven as a concept —
+Reederey87's own independent production deployment validates the
+mechanism works *somewhere* — but it does not reproduce here under this
+deployment's actual speculator (MTP). Worth revisiting if:
+(a) PR80 merges upstream with additional MTP-specific testing, or
+(b) this deployment ever switches to DFlash2 as the default speculator
+(not recommended right now — see the DFlash2 production-crash findings
+earlier in this document).
+
+**New thread surfaced, not yet pursued**: upstream's own `main` branch
+has moved `MAX_NUM_BATCHED_TOKENS` from 2048 to 7168 as of the fat-expert-
+kernel work (discovered via the README merge conflict above) — this
+project's shipped recipes still use 2048. Worth testing in isolation
+(this cluster's own history includes hitting a wall raising this value on
+the NVFP4 lane, so treat as a fresh experiment, not an assumed win).
+
+## max_num_batched_tokens 2048 -> 7168: substantial confirmed gain, promoted (2026-09-02)
+
+Tested the thread surfaced above, on the shipped v2 config (4 PRs, gmu
+back to 0.86 after both cluster nodes rebooted overnight — the "trapped
+memory" pattern from the previous day is fully resolved, confirmed via
+`uptime` ~3 min and 0B swap used on both nodes at the start of this
+session). Isolated via `-o max_num_batched_tokens=7168`, everything else
+held constant.
+
+**Booted clean** — graph capture (5s, 0.36 GiB) succeeded without
+incident, notable given this exact knob crashed the NVFP4 lane outright
+at just 3584 (less than half this value) earlier in this project. Direct,
+measured confirmation that EXL3's smaller memory footprint is real usable
+headroom, not just a theoretical advantage.
+
+- `probe_sanity.py`: ALL PASSED, decode median 25.68 tok/s — no
+  regression, consistent with every prior v2 measurement.
+- `probe_soak.py` (2 rounds x 2 waves): **PASSED**, including concurrent
+  waves — the exact kind of load that has caused problems elsewhere on
+  this cluster.
+- `probe_longctx.py`, same-day A/B against the 2048 baseline:
+
+| Context | 2048 (baseline) | 7168 | Gain |
+|---|---:|---:|---:|
+| ~100K tokens | 933.3 tok/s (107.1s TTFT) | **1198.5 tok/s (83.4s TTFT)** | **+28.4%** |
+| ~250K tokens | 1048.4 tok/s (238.4s TTFT) | **1252.5 tok/s (199.5s TTFT)** | **+19.5%** |
+
+Both correctness-verified (4/4 planted codes retrieved at both lengths).
+This is a substantial, real, independently-reproducible gain — larger in
+absolute terms than the fat-expert-kernel's own +14.3%/+13.9%, and the two
+appear to compound (this test already had the fat-expert kernel active).
+
+**Promoted**: `max_num_batched_tokens` raised to 7168 in both the working
+repo's `glm-5.3-flash-exl3-v2-vllm.yaml` and the archived
+`~/ai/recipes/glm-5.3-flash-exl3-tp2.yaml`. This now matches upstream's
+own current production value exactly (discovered via the PR80 merge
+conflict — their README already documented "E2 keep 2026-09-01" for this
+exact figure, chosen alongside the fat-expert kernel; this project just
+hadn't picked it up yet before this test).
+
+### Incidental finding: the multimodal-warmup crash is real and intermittent, not a one-off
+
+During the restoration boot that preceded this test (before the
+`max_num_batched_tokens` change), the `KeyboardInterrupt`-during-
+multimodal-warmup crash documented in the "Vision retest" section above
+recurred a **third time** — on a completely fresh boot, immediately after
+both cluster nodes rebooted (ruling out memory pressure/accumulated state
+as the cause). An immediate retry with identical config booted clean, same
+as the pattern established earlier. This is now confirmed **genuinely
+intermittent** (crashes ~1 in 3 boots so far, no config correlation found),
+not a one-off as originally concluded — see the correction inline in the
+"Vision retest" section. Current handling: retry once on this exact
+signature before considering `--language-model-only`; the external
+SIGTERM's actual sender remains unidentified.
+
+## MAJOR FINDING: NVFP4+DFlash2 works after all — FlashInfer autotune was the root cause (2026-09-02)
+
+Retested the exact NVFP4+DFlash2 config that failed 5/5 times earlier in
+this project (`RedHatAI/GLM-5.3-Flash-NVFP4`, `ghcr.io/tonyd2wild/
+vllm-glm53-flash:sm121-v11-dflash2`, 3 GiB KV pin, `num_speculative_
+tokens=7`) with exactly **one** new variable: `--no-enable-flashinfer-
+autotune`. Motivation: every prior crash died with the identical silent-
+kill signature within seconds of `flashinfer.jit: [Autotuner]: Autotuning
+process ends` logging, and while building the EXL3 lane's own image,
+found MiaAI-Lab's own Dockerfile comment independently documenting the
+same failure class: "FlashInfer's sparse-MLA autotune and fused_moe
+gemm1/gemm2 autotune kill rank 0 on SM121" — they disable both
+unconditionally for this exact reason, on the same hardware family. This
+project never tried that specific fix before concluding NVFP4+DFlash2 was
+a hard wall and pivoting to EXL3.
+
+**Result: boots clean, genuinely serves, fully stable.** Confirmed
+`Skipping FlashInfer autotune because it is disabled` in the boot log,
+then watched it sail straight through every phase that killed all 5 prior
+attempts: target-model CUDA graph capture (PIECEWISE 15/15, FULL 6/6) and
+DFlash2's own speculator graph capture (FULL 6/6, one slow first-shape
+JIT compile that looked like a stall — `shm_broadcast.py`'s 60s warning —
+but resolved and finished normally, not a crash). Full engine init: 93.66s.
+
+- Verified with a genuine generation request (not just `/health`) before
+  trusting it, per this project's own established discipline.
+- `probe_sanity.py`: ALL PASSED. Decode **23.49-30.44 tok/s (median
+  28.19)** — actually **beats the NVFP4+MTP-4 baseline outright** (21.56
+  tok/s median), TTFT 0.215-0.32s.
+- `probe_soak.py` (2 rounds x 2 waves): **PASSED**, including concurrent
+  waves — the same class of load that has caused problems elsewhere on
+  this cluster. Genuinely stable, not a lucky single request.
+- Structured-content test (counting task, 300 tokens): **66.42 tok/s**,
+  final-window acceptance **93.4%**, mean acceptance length **7.54 of a
+  possible 8** — this actually **beats the EXL3+DFlash2 lane's own
+  56.35 tok/s** structured-content result from earlier this session.
+
+### What this means
+
+**The original "NVFP4+DFlash2 is not viable on this cluster" conclusion
+was wrong in its stated mechanism.** It was never really a memory-
+headroom problem specific to NVFP4/Marlin's larger footprint (the theory
+this project built the entire EXL3 pivot on) — it was FlashInfer's
+autotune routine crashing rank 0 during warmup, a bug independent of
+which quantization scheme is in use. The EXL3 pivot itself remains fully
+justified on its own separate merits (smaller checkpoint, more prefill/
+caching wins from the four validated PRs, already in production) — but
+the *specific* claim that NVFP4 structurally cannot run DFlash2 on this
+hardware is now known to be false, and the credit for "why EXL3 succeeded
+where NVFP4 failed" should go partly to this project's own late-arriving
+discovery of the autotune bug, not solely to memory headroom as
+originally concluded.
+
+**This does not change the shipped default.** EXL3 v2 (now with
+`max_num_batched_tokens=7168`) remains the better overall choice — proven
+in longer production use today, smaller memory footprint leaving more
+margin for the cluster's other volatility (the "trapped memory" pattern,
+the intermittent multimodal-warmup crash), and this NVFP4+DFlash2 result
+is from a single validation session, not the extended production
+exposure EXL3 has had. But it closes an open question this project
+carried since the DFlash2 postmortem, and the finding itself
+(`--no-enable-flashinfer-autotune` as a fix for SM121 rank-0 crashes) is
+worth remembering for any future GB10/SM121 work regardless of
+quantization scheme — see `~/ai/research/glm-5.3-flash-gb10/README.md`,
+now updated to reflect this confirmation rather than the earlier
+"worth retrying" framing.
+
+**Test artifact**: `recipes/glm-5.3-flash-nvfp4-vllm-dflash2-autotune-off.yaml`
+in the working repo, kept (not deleted) since it's now a working,
+validated config, not a ruled-out one.

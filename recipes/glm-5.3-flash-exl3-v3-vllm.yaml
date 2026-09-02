@@ -1,7 +1,57 @@
-# Recipe: GLM-5.3-Flash EXL3 v2 (TP=2 across 2x DGX Spark, vLLM native multi-node)
+# Recipe: GLM-5.3-Flash EXL3 v3 (TP=2 across 2x DGX Spark, vLLM native multi-node)
 #
-# *** VALIDATED AND PROMOTED TO DEFAULT 2026-09-01 — full results in
-# VALIDATION.md "EXL3 v2: validating four new upstream PRs" ***
+# *** NOT PROMOTED — NEGATIVE RESULT (2026-09-01), full writeup in
+# VALIDATION.md "v3 attempt: PR80 'mixed-prefill gate v2' — built,
+# deployed, negative result" ***
+# Boots clean, config genuinely active (verified `[glm53-decode-floor-v2]`
+# markers in the built image and the correct `_glm53_gate_config()` log
+# line at runtime), full sanity+soak suites pass, zero regressions — but
+# the claimed warm-follow-up-bypass benefit did NOT reproduce here: a
+# cached follow-up fired while a concurrent generation was decoding still
+# waited proportionally to that generation's remaining duration (two
+# reproductions: 89% and 76% of the concurrent generation's own length),
+# indistinguishable from the OLD `skip`-hold behavior gate v2 is supposed
+# to fix. Sequential (non-concurrent) warm-cache hits are unaffected and
+# still fast (4.75-4.82s, matching pre-gate-v2 numbers), so this is
+# specifically a gate-timing issue, not a caching regression. Working
+# theory (unconfirmed): PR80 was validated by both its authors against
+# DFlash2; this deployment runs MTP k=2, and something about how
+# `num_computed_tokens` is populated at the gate's read point may differ
+# between the two speculators. **The live deployment was reverted to v2
+# (glm-5.3-flash-exl3-v2-vllm.yaml) — this file is kept for a future
+# revisit (if PR80 merges upstream with MTP-specific testing, or if this
+# deployment ever switches to DFlash2), not as the shipped config.**
+#
+# *** ORIGINAL TESTING RATIONALE (below), preserved for context ***
+# Everything from v2 (fat-expert prefill kernel, indexer workspace
+# rightsizing, prefix-cache thinking-toggle fix, spinwait tuning) plus
+# PR80's mixed-prefill gate v2 (GLM53_MIXED_PREFILL_WARM_TOKENS/_MAX_WAIT_MS/
+# _LATE_CAP), which was still OPEN/unmerged against MiaAI-Lab main at
+# validation time (mergeable:false — genuine conflict, not a clean build).
+# Fetched the PR branch, resolved four conflicted files by hand (all
+# additive except one real value conflict in README.md's documented
+# MAX_NUM_BATCHED_TOKENS default, resolved in favor of main's newer 7168 —
+# see the working repo's git history for the exact resolution), rebuilt
+# locally: `docker build -t glm53-exl3-v2:c190db1-gate2 .` — cache-hit the
+# CUDA compile entirely (gate v2 is a pure Python scheduler overlay, no
+# exllamav3 changes), 24s total build. Verified the gate v2 markers
+# (`[glm53-decode-floor-v2]`) are genuinely present in the built image's
+# vllm/v1/core/sched/scheduler.py before deploying, not just trusting the
+# build log.
+#
+# The problem PR80 fixes: our shipped `GLM53_MIXED_PREFILL_CHUNK=skip`
+# holds a fully-cached follow-up turn for the ENTIRE duration of any
+# concurrently-running generation (their own measured 15-17s TTFT for a
+# cached follow-up) — gate v2 lets a request whose uncached remainder fits
+# one hybrid block (GLM53_MIXED_PREFILL_WARM_TOKENS=3584) bypass that hold
+# entirely. Independently measured by both MiaAI-Lab and Reederey87 (a
+# separate downstream deployer) with matching numbers (~1.4-1.6s vs.
+# 15-17s). Directly relevant to this deployment's actual conversational
+# usage pattern — any follow-up arriving mid-generation pays this tax
+# right now.
+#
+# *** PREVIOUS VALIDATED SUMMARY (v2, full results in VALIDATION.md
+# "EXL3 v2: validating four new upstream PRs") ***
 # Summary: prefill +14% at 100K-250K context (real, same-day A/B vs. v1,
 # both at gmu=0.86 — their own claim was +20-21%, ours is smaller but
 # genuine, matching the PR author's own "geometry-sensitive" caveat),
@@ -103,12 +153,12 @@
 # `docker save | ssh <other-node> docker load`.
 
 recipe_version: "2"
-name: GLM-5.3-Flash-EXL3-v2
-description: vLLM serving GLM-5.3-Flash via EXL3 quantization, testing PR77/86/63/96 (fat-expert prefill, indexer rightsizing, prefix-cache fix, spinwait tuning) on 2x DGX Spark, TP=2
+name: GLM-5.3-Flash-EXL3-v3
+description: vLLM serving GLM-5.3-Flash via EXL3 quantization, v2 + PR80 mixed-prefill gate v2 (warm-follow-up bypass) on 2x DGX Spark, TP=2
 
 model: Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw
 runtime: vllm
-container: glm53-exl3-v2:c190db1
+container: glm53-exl3-v2:c190db1-gate2
 
 min_nodes: 2
 
@@ -135,6 +185,12 @@ env:
   EXL3_FUSED_MOE: "1"
   GLM53_SUPPRESS_STOPS_IN_REASONING: "1"
   GLM53_MIXED_PREFILL_CHUNK: skip
+  # --- NEW in v3: PR80 mixed-prefill gate v2 (unmerged upstream, hand-
+  # applied) — cached follow-ups bypass the `skip` hold entirely instead
+  # of waiting behind any running generation.
+  GLM53_MIXED_PREFILL_WARM_TOKENS: "3584"
+  GLM53_MIXED_PREFILL_MAX_WAIT_MS: "1500"
+  GLM53_MIXED_PREFILL_LATE_CAP: "512"
   # --- NEW in v2: PR77 fat-expert prefill kernel ---
   # Tier E2 (direct + scatter CUDA kernel). Implies EXL3_FAT_BATCHED=1 and
   # EXL3_FAT_SORTED=1. Now the shipped default in upstream .env.example.
@@ -151,7 +207,7 @@ env:
 defaults:
   port: 8000
   host: 0.0.0.0
-  served_model_name: glm-5.3-flash-exl3-v2
+  served_model_name: glm-5.3-flash-exl3-v3
   tensor_parallel: 2
   model_path: /models/models--Mia-AiLab--GLM-5.3-Flash-EXL3-TR3-4bpw/snapshots/024db9f7e9871e8efdf21538ba55af7442be3cd5
   quantization: exl3
@@ -167,19 +223,17 @@ defaults:
   # a *different* problem (post-weight-load KV-sizing shortfall, not this
   # startup free-memory check) — 0.86 splits the difference with informed
   # backing rather than guessing.
-  gpu_memory_utilization: 0.86
+  # Dialed further to 0.82 (2026-09-01): the "trapped memory" pattern from
+  # earlier today continued eroding — free memory at startup was 102.6 GiB
+  # this time (needed 104.65 GiB at 0.86), down from 105.75 GiB just a few
+  # hours earlier. Real margin this time (121.69*0.82=99.8 GiB budget vs.
+  # 102.6 GiB actual free), not another razor-thin step. If boots keep
+  # landing short even at this value, a full node reboot (not just cache
+  # flushing) is very likely the actual fix — see the GB10 "trapped
+  # memory" finding in ~/ai/research/glm-5.3-flash-gb10/README.md.
+  gpu_memory_utilization: 0.82
   kv_cache_dtype: fp8
-  # Raised 2048 -> 7168 (2026-09-02): matches upstream's own current
-  # production value (discovered via the PR80 merge conflict in README.md
-  # — their doc says "E2 keep 2026-09-01", chosen specifically alongside
-  # the fat-expert prefill kernel). Measured on this cluster: +28.4%
-  # prefill at 100K tokens (933->1199 tok/s), +19.5% at 250K (1048->1253
-  # tok/s), zero decode regression, full sanity+soak (incl. concurrent
-  # waves) passed. A substantial, real, independently-confirmed gain — see
-  # VALIDATION.md. Contrast with the NVFP4 lane, which crashed raising
-  # this same knob to just 3584 — direct, measured confirmation that
-  # EXL3's smaller memory footprint is real headroom, not just theory.
-  max_num_batched_tokens: 7168
+  max_num_batched_tokens: 2048
   limit_mm: '{"image":4,"video":1}'
   default_chat_template_kwargs: '{"enable_thinking": false}'
   # MTP k=2 — matches v1's safe default. DFlash2 not reintroduced here;

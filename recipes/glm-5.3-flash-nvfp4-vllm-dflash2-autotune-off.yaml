@@ -1,0 +1,113 @@
+# Recipe: GLM-5.3-Flash NVFP4 + DFlash2, FlashInfer autotune DISABLED
+# (TP=2 across 2x DGX Spark, vLLM native multi-node)
+#
+# *** RETEST — NOT YET VALIDATED (2026-09-02) ***
+#
+# Retests NVFP4+DFlash2 (5/5 boot failures earlier in this project,
+# documented in VALIDATION.md "DFlash2 lane" section) with ONE new
+# variable: --no-enable-flashinfer-autotune. Motivation: every one of
+# those 5 crashes died with the identical silent-kill signature (`exit
+# code: None`) within seconds of `flashinfer.jit: [Autotuner]:
+# Autotuning process ends` logging. Independently, while building the
+# EXL3 lane's own image, found MiaAI-Lab's own Dockerfile comment:
+# "FlashInfer's sparse-MLA autotune and fused_moe gemm1/gemm2 autotune
+# kill rank 0 on SM121" — they disable both unconditionally for this
+# exact reason. This project never tried that specific fix before
+# pivoting to EXL3 — worth testing in isolation before concluding NVFP4+
+# DFlash2 is a hard wall on this cluster, since the two failure
+# descriptions (rank 0 dying right around FlashInfer autotuning) line up
+# structurally.
+#
+# Everything else matches the last DFlash2 attempt from VALIDATION.md
+# exactly (same image, same checkpoint, same 3 GiB KV pin that failed
+# every time before) so this is a clean, single-variable isolation test.
+#
+# Image: ghcr.io/tonyd2wild/vllm-glm53-flash:sm121-v11-dflash2 (built FROM
+# sm121-v8, no InstantTensor — --load-format instanttensor is dropped,
+# expect the documented ~15 min no-direct-I/O boot).
+#
+# Drafter: incoai/GLM-5.3-Flash-DFlash2, num_speculative_tokens=7 (the
+# drafter's own block size is 8; one position is the target's own
+# verified token, so 7 is correct, not 8). Using the `main` snapshot
+# (dc77ff1c...) matching every prior NVFP4 attempt exactly — this test is
+# about the autotune fix, not the checkpoint-pin question the EXL3 lane's
+# own DFlash2 usage already resolved separately.
+#
+# If this boots clean: run the full probe suite, capture performance, and
+# decide whether to promote a full NVFP4+DFlash2 lane (unlikely to beat
+# the already-shipped, faster, more capable EXL3 v2 lane on raw numbers,
+# but a useful data point either way, and directly answers "was memory
+# headroom or FlashInfer autotune the real root cause"). If it still
+# crashes: FlashInfer autotune is ruled out as the cause, and the
+# original memory-ceiling theory (already the shipped conclusion, EXL3 is
+# the answer) is reinforced, not weakened.
+
+recipe_version: "2"
+name: GLM-5.3-Flash-NVFP4-DFlash2-AutotuneOff
+description: vLLM serving RedHatAI/GLM-5.3-Flash-NVFP4 with DFlash2 k=7, FlashInfer autotune disabled, on 2x DGX Spark, TP=2
+
+model: RedHatAI/GLM-5.3-Flash-NVFP4
+runtime: vllm
+container: ghcr.io/tonyd2wild/vllm-glm53-flash:sm121-v11-dflash2
+
+min_nodes: 2
+
+cluster_config:
+  resolved_model_path: /models
+
+executor_config:
+  entrypoint: ""
+  auto_remove: false
+
+env:
+  # --- image / GPU arch (GB10 = SM121) ---
+  TORCH_CUDA_ARCH_LIST: 12.1a
+  FLASHINFER_CUDA_ARCH_LIST: 12.1a
+  FLASHINFER_DISABLE_VERSION_CHECK: "1"
+  # --- GB10 unified-memory hygiene ---
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  # --- long boot tolerance (no InstantTensor in this image) ---
+  VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+  # --- NCCL diagnostics (fabric selection itself is sparkrun-detected) ---
+  NCCL_DEBUG: WARN
+  TORCH_NCCL_ASYNC_ERROR_HANDLING: "1"
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  served_model_name: glm-5.3-flash-nvfp4-dflash2-test
+  tensor_parallel: 2
+  model_path: /models/models--RedHatAI--GLM-5.3-Flash-NVFP4/snapshots/36c184c6cda000a481711306df5adde42f63321a
+  chat_template: /models/glm53-flash-chat_template_mm.jinja
+  max_model_len: 262144
+  max_num_seqs: 6
+  gpu_memory_utilization: 0.85
+  # Same 3 GiB pin that failed every prior DFlash2 attempt — isolating
+  # ONLY the autotune variable this time.
+  kv_cache_memory: 3221225472
+  block_size: 2304
+  moe_backend: marlin
+  kv_cache_dtype: fp8_e4m3
+  max_num_batched_tokens: 2048
+  speculative_config: '{"method":"dflash","model":"/models/models--incoai--GLM-5.3-Flash-DFlash2/snapshots/dc77ff1c99eeb2df044ee3d4f0094eb033fee410","num_speculative_tokens":7,"kv_cache_dtype":"auto","draft_sample_method":"probabilistic","rejection_sample_method":"standard"}'
+  default_chat_template_kwargs: '{"enable_thinking": false}'
+
+command: |
+  vllm serve {model_path} \
+      --served-model-name {served_model_name} \
+      --host {host} --port {port} \
+      --trust-remote-code \
+      --tensor-parallel-size {tensor_parallel} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} --block-size {block_size} \
+      --moe-backend {moe_backend} \
+      --speculative-config '{speculative_config}' \
+      --kv-cache-dtype {kv_cache_dtype} --kv-cache-memory {kv_cache_memory} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --no-enable-flashinfer-autotune \
+      --tool-call-parser glm47 --enable-auto-tool-choice \
+      --reasoning-parser glm45 \
+      --chat-template {chat_template} \
+      --default-chat-template-kwargs '{default_chat_template_kwargs}' \
+      --distributed-executor-backend mp
