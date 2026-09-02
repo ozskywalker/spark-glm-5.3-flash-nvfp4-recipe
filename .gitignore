@@ -1,3 +1,9 @@
 __pycache__/
 *.pyc
 .opencode/
+
+# Raw profiler output — multi-MB per run, regenerate with recipes/probes/.
+# Derived summaries live in analysis/ and are committed.
+traces/
+cpu_profiles/
+recipes/probes/__pycache__/

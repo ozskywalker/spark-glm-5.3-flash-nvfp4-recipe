@@ -1,0 +1,123 @@
+{
+  "profile": "cpu_profiles/pyspy_Worker_TP0.speedscope.json",
+  "unit": "seconds",
+  "total_weight": 16.855,
+  "buckets": {
+    "ipc_spinwait": {
+      "weight": 16.28,
+      "pct": 96.59
+    },
+    "model_fwd": {
+      "weight": 0.315,
+      "pct": 1.87
+    },
+    "spec_decode": {
+      "weight": 0.09,
+      "pct": 0.53
+    },
+    "gpu_wait": {
+      "weight": 0.085,
+      "pct": 0.5
+    },
+    "sleep_idle": {
+      "weight": 0.055,
+      "pct": 0.33
+    },
+    "other_python": {
+      "weight": 0.02,
+      "pct": 0.12
+    },
+    "sampler": {
+      "weight": 0.005,
+      "pct": 0.03
+    },
+    "nccl_comm": {
+      "weight": 0.005,
+      "pct": 0.03
+    }
+  },
+  "top_self": [
+    {
+      "frame": "sched_yield (utils.py:48)",
+      "weight": 5.455,
+      "pct": 32.36
+    },
+    {
+      "frame": "memory_fence (shm_broadcast.py:95)",
+      "weight": 2.91,
+      "pct": 17.26
+    },
+    {
+      "frame": "wait (shm_broadcast.py:204)",
+      "weight": 2.35,
+      "pct": 13.94
+    },
+    {
+      "frame": "acquire_read (shm_broadcast.py:794)",
+      "weight": 1.66,
+      "pct": 9.85
+    },
+    {
+      "frame": "should_warn (shm_broadcast.py:757)",
+      "weight": 0.91,
+      "pct": 5.4
+    },
+    {
+      "frame": "acquire_read (shm_broadcast.py:786)",
+      "weight": 0.835,
+      "pct": 4.95
+    },
+    {
+      "frame": "acquire_read (shm_broadcast.py:773)",
+      "weight": 0.765,
+      "pct": 4.54
+    },
+    {
+      "frame": "check (shm_broadcast.py:774)",
+      "weight": 0.51,
+      "pct": 3.03
+    },
+    {
+      "frame": "sched_yield (utils.py:46)",
+      "weight": 0.23,
+      "pct": 1.36
+    },
+    {
+      "frame": "acquire_read (shm_broadcast.py:800)",
+      "weight": 0.225,
+      "pct": 1.33
+    },
+    {
+      "frame": "check (shm_broadcast.py:777)",
+      "weight": 0.14,
+      "pct": 0.83
+    },
+    {
+      "frame": "synchronize (streams.py:254)",
+      "weight": 0.08,
+      "pct": 0.47
+    },
+    {
+      "frame": "replay (graphs.py:186)",
+      "weight": 0.075,
+      "pct": 0.44
+    },
+    {
+      "frame": "should_warn (shm_broadcast.py:758)",
+      "weight": 0.055,
+      "pct": 0.33
+    },
+    {
+      "frame": "async_output_busy_loop (multiproc_executor.py:1009)",
+      "weight": 0.055,
+      "pct": 0.33
+    },
+    {
+      "frame": "wait (shm_broadcast.py:202)",
+      "weight": 0.05,
+      "pct": 0.3
+    }
+  ],
+  "wait_pct": 97.45,
+  "work_pct": 2.55
+}

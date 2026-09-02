@@ -1,0 +1,99 @@
+{
+  "output_sweep": [
+    {
+      "prompt_tokens": 17.0,
+      "gen_tokens": 16.0,
+      "srv_e2e_s": 0.9558,
+      "accounted_s": 0.9437,
+      "overhead_s": 0.01215,
+      "overhead_pct": 1.27,
+      "client_wall_s": 0.9605,
+      "transport_s": 0.0047,
+      "case": "out=16"
+    },
+    {
+      "prompt_tokens": 17.0,
+      "gen_tokens": 64.0,
+      "srv_e2e_s": 3.1014,
+      "accounted_s": 3.0582,
+      "overhead_s": 0.04329,
+      "overhead_pct": 1.4,
+      "client_wall_s": 3.107,
+      "transport_s": 0.00559,
+      "case": "out=64"
+    },
+    {
+      "prompt_tokens": 17.0,
+      "gen_tokens": 160.0,
+      "srv_e2e_s": 7.1782,
+      "accounted_s": 7.1341,
+      "overhead_s": 0.04408,
+      "overhead_pct": 0.61,
+      "client_wall_s": 7.1834,
+      "transport_s": 0.00518,
+      "case": "out=160"
+    },
+    {
+      "prompt_tokens": 17.0,
+      "gen_tokens": 320.0,
+      "srv_e2e_s": 13.0484,
+      "accounted_s": 12.9831,
+      "overhead_s": 0.06533,
+      "overhead_pct": 0.5,
+      "client_wall_s": 13.0555,
+      "transport_s": 0.00711,
+      "case": "out=320"
+    }
+  ],
+  "prompt_sweep": [
+    {
+      "prompt_tokens": 42.0,
+      "gen_tokens": 28.0,
+      "srv_e2e_s": 1.3104,
+      "accounted_s": 1.2321,
+      "overhead_s": 0.07822,
+      "overhead_pct": 5.97,
+      "client_wall_s": 1.3146,
+      "transport_s": 0.00427,
+      "case": "filler=1"
+    },
+    {
+      "prompt_tokens": 978.0,
+      "gen_tokens": 26.8,
+      "srv_e2e_s": 3.172,
+      "accounted_s": 3.1297,
+      "overhead_s": 0.04237,
+      "overhead_pct": 1.34,
+      "client_wall_s": 3.1767,
+      "transport_s": 0.00468,
+      "case": "filler=40"
+    },
+    {
+      "prompt_tokens": 3858.0,
+      "gen_tokens": 25.8,
+      "srv_e2e_s": 4.2193,
+      "accounted_s": 4.157,
+      "overhead_s": 0.06235,
+      "overhead_pct": 1.48,
+      "client_wall_s": 4.2241,
+      "transport_s": 0.0048,
+      "case": "filler=160"
+    },
+    {
+      "prompt_tokens": 9618.0,
+      "gen_tokens": 25.0,
+      "srv_e2e_s": 6.4039,
+      "accounted_s": 6.342,
+      "overhead_s": 0.06188,
+      "overhead_pct": 0.97,
+      "client_wall_s": 6.4086,
+      "transport_s": 0.0047,
+      "case": "filler=400"
+    }
+  ],
+  "summary": {
+    "us_per_output_token": 145.4,
+    "us_per_prompt_token": -0.12,
+    "mean_transport_s": 0.00513
+  }
+}

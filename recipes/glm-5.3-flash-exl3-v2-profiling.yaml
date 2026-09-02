@@ -1,0 +1,133 @@
+# Recipe: GLM-5.3-Flash EXL3 v2 + torch profiler (TP=2 across 2x DGX Spark)
+#
+# *** INSTRUMENTATION VARIANT — not for production serving ***
+#
+# Identical to the shipped glm-5.3-flash-exl3-v2-vllm.yaml except it enables
+# vLLM's built-in torch profiler surface, which this build exposes as
+# `--profiler-config` (JSON) plus /start_profile and /stop_profile HTTP
+# endpoints. Purpose: get sub-forward-pass attribution (which kernels
+# actually consume the time inside a forward pass) and engine-step CPU
+# attribution (preprocess / forward / sample / draft / bookkeep), neither of
+# which vLLM's Prometheus /metrics exposition can answer — see VALIDATION.md
+# "Request pipeline timing", Gap #1.
+#
+# Two knobs matter here and are deliberately NOT defaults:
+#
+#   VLLM_CUSTOM_SCOPES_FOR_PROFILING=1 — turns vLLM's own
+#     record_function_or_nullcontext() call sites into real
+#     torch.autograd.profiler.record_function scopes. Without it every one of
+#     those scopes is a nullcontext and the trace has no engine-phase
+#     structure at all. Scopes this unlocks (grepped from the installed
+#     package): gpu_model_runner {preprocess, forward, postprocess, sample,
+#     draft, bookkeep, ModelRunnerOutput}, llm_engine step {get_output,
+#     process_outputs, abort_requests, record_stats}, schedule
+#     {allocate_slots, get_num_common_prefix_blocks, make_cached_request_data,
+#     update_after_schedule}.
+#
+#   profiler_config.max_iterations — MUST BE 0 (unlimited) on a long-lived
+#     server. It looks like a convenient trace-size cap, but in this build
+#     hitting the limit does not merely stop the profiler: wrapper.py:126
+#     logs "Max profiling iterations reached. Stopping profiler..." and then
+#     triggers a full API-server shutdown (launcher.py:114 "[shutdown] API
+#     server: shutdown triggered", SIGTERM to EngineCore). Confirmed the hard
+#     way — a 120-token generation hit the 40-iteration cap mid-request and
+#     killed the server. It is built for benchmark scripts that profile N
+#     iterations and exit. Bound trace size with a short workload and an
+#     explicit /stop_profile instead.
+#
+# Trace dir lives under /tmp: the container runs as an unprivileged user and
+# cannot create a directory at the filesystem root.
+#
+# record_shapes + with_flops are on because GEMM shapes and FLOP estimates are
+# exactly what's needed to reason about whether a given kernel is compute- or
+# bandwidth-bound on GB10. with_stack is OFF: it multiplies trace size and the
+# named scopes above already provide the CPU-side attribution we want.
+#
+# NOTE ON CUDA GRAPHS: with graphs enabled (as here) decode steps replay as a
+# single graph launch, so per-kernel attribution inside decode is largely
+# opaque. This recipe is the "realistic timing" arm; pair it with an
+# --enforce-eager run (see -o enforce_eager=true override, or the eager
+# sibling recipe) for the "full kernel attribution" arm. Compare the two
+# rather than trusting either alone.
+
+recipe_version: "2"
+name: GLM-5.3-Flash-EXL3-v2-Profiling
+description: vLLM serving GLM-5.3-Flash EXL3 v2 with torch profiler + custom scopes enabled, for sub-forward-pass and decode-loop instrumentation
+
+model: Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw
+runtime: vllm
+container: glm53-exl3-v2:c190db1
+
+min_nodes: 2
+
+cluster_config:
+  resolved_model_path: /models
+
+executor_config:
+  entrypoint: ""
+  auto_remove: false
+
+env:
+  # --- image / GPU arch (GB10 = SM121) ---
+  TORCH_CUDA_ARCH_LIST: 12.1a
+  FLASHINFER_CUDA_ARCH_LIST: 12.1a
+  FLASHINFER_DISABLE_VERSION_CHECK: "1"
+  # --- GB10 unified-memory hygiene ---
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  # --- long boot tolerance ---
+  VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+  # --- NCCL diagnostics ---
+  NCCL_DEBUG: WARN
+  TORCH_NCCL_ASYNC_ERROR_HANDLING: "1"
+  # --- EXL3-specific (unchanged from shipped v2) ---
+  EXL3_FUSED_MOE: "1"
+  GLM53_SUPPRESS_STOPS_IN_REASONING: "1"
+  GLM53_MIXED_PREFILL_CHUNK: skip
+  EXL3_FAT_KERNEL: "1"
+  EXL3_MOE_ROW_TILE: "0"
+  GLM53_INDEXER_WORKSPACE: rightsize
+  GLM53_SPINWAIT_MS: "16"
+  # --- NEW: named engine scopes in the profiler trace ---
+  VLLM_CUSTOM_SCOPES_FOR_PROFILING: "1"
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  served_model_name: glm-5.3-flash-exl3-v2
+  tensor_parallel: 2
+  model_path: /models/models--Mia-AiLab--GLM-5.3-Flash-EXL3-TR3-4bpw/snapshots/024db9f7e9871e8efdf21538ba55af7442be3cd5
+  quantization: exl3
+  max_model_len: 262144
+  max_num_seqs: 4
+  gpu_memory_utilization: 0.86
+  kv_cache_dtype: fp8
+  max_num_batched_tokens: 7168
+  limit_mm: '{"image":4,"video":1}'
+  default_chat_template_kwargs: '{"enable_thinking": false}'
+  speculative_config: '{"method":"mtp","num_speculative_tokens":2}'
+  profiler_config: '{"profiler":"torch","torch_profiler_dir":"/tmp/profiles","torch_profiler_with_stack":false,"torch_profiler_record_shapes":true,"torch_profiler_with_flops":true,"torch_profiler_use_gzip":true,"max_iterations":0,"ignore_frontend":false}'
+  extra_flags: ""
+
+command: |
+  mkdir -p /tmp/profiles && vllm serve {model_path} \
+      --served-model-name {served_model_name} \
+      --host {host} --port {port} \
+      --trust-remote-code \
+      --tensor-parallel-size {tensor_parallel} \
+      --quantization {quantization} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} \
+      --kv-cache-dtype {kv_cache_dtype} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --speculative-config '{speculative_config}' \
+      --profiler-config '{profiler_config}' \
+      --tool-call-parser glm47 --enable-auto-tool-choice \
+      --reasoning-parser glm45 \
+      --enable-prefix-caching \
+      --no-enable-flashinfer-autotune \
+      --skip-mm-profiling \
+      --limit-mm-per-prompt '{limit_mm}' \
+      --chat-template /opt/glm53/chat_template.jinja \
+      --default-chat-template-kwargs '{default_chat_template_kwargs}' \
+      --distributed-executor-backend mp {extra_flags}

@@ -1,0 +1,101 @@
+# Recipe: GLM-5.3-Flash EXL3 v2 + DFlash2 k=7 at max_num_batched_tokens=7168
+#
+# *** RE-VALIDATION — the one combination never tested together ***
+#
+# DFlash2 k=7 on the EXL3 lane was validated at MNBT=2048 (see VALIDATION.md,
+# "DFlash2 k=7: boots clean where NVFP4 failed 5/5"): 24.30 tok/s median on
+# prose (a ~9% regression vs MTP-2's 26.75) but 56.35 tok/s on structured
+# content at 88.9-91.4% acceptance. MTP-2 shipped as the safe default.
+#
+# Separately, MNBT was later raised 2048 -> 7168 and validated — but only
+# under MTP-2. So the shipped default moved out from under the DFlash2
+# measurement, and the two have never been measured together. That matters
+# more than a version bump normally would: MNBT bounds
+# max_num_scheduled_tokens, and vLLM warns at boot that the speculator's
+# draft-token slots are budgeted from the same allowance
+# ("max_num_scheduled_tokens is set to N based on the speculative decoding
+# settings"). A 7-deep drafter asks for far more of that budget per step than
+# a 2-deep one, so a knob that was worth +28.4% prefill under MTP-2 is not
+# guaranteed to behave the same here — it could help more, or it could
+# starve the drafter.
+#
+# Everything except max_num_batched_tokens matches the original DFlash2 run:
+# same drafter, same k, same sampling methods, same context, CUDA graphs on.
+#
+# DRAFTER PIN: snapshot 7d74cdd, not the newer dc77ff1c on `main`. Reederey87's
+# README: the Hub repo has shipped three different weights under the same name,
+# and the two newer ones were A/B-tested there and won nothing (one loses 6% on
+# prose). Both snapshots are present locally; this uses their vetted pin, which
+# is also what the original measurement above used — changing it would break
+# the comparison this recipe exists to make.
+
+recipe_version: "2"
+name: GLM-5.3-Flash-EXL3-v2-DFlash2-7168
+description: EXL3 v2 with DFlash2 k=7 at max_num_batched_tokens=7168, re-validating the 7-deep speculator against the raised prefill budget
+
+model: Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw
+runtime: vllm
+container: glm53-exl3-v2:c190db1
+
+min_nodes: 2
+
+cluster_config:
+  resolved_model_path: /models
+
+executor_config:
+  entrypoint: ""
+  auto_remove: false
+
+env:
+  TORCH_CUDA_ARCH_LIST: 12.1a
+  FLASHINFER_CUDA_ARCH_LIST: 12.1a
+  FLASHINFER_DISABLE_VERSION_CHECK: "1"
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+  NCCL_DEBUG: WARN
+  TORCH_NCCL_ASYNC_ERROR_HANDLING: "1"
+  EXL3_FUSED_MOE: "1"
+  GLM53_SUPPRESS_STOPS_IN_REASONING: "1"
+  GLM53_MIXED_PREFILL_CHUNK: skip
+  EXL3_FAT_KERNEL: "1"
+  EXL3_MOE_ROW_TILE: "0"
+  GLM53_INDEXER_WORKSPACE: rightsize
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  served_model_name: glm-5.3-flash-exl3-v2
+  tensor_parallel: 2
+  model_path: /models/models--Mia-AiLab--GLM-5.3-Flash-EXL3-TR3-4bpw/snapshots/024db9f7e9871e8efdf21538ba55af7442be3cd5
+  quantization: exl3
+  max_model_len: 262144
+  max_num_seqs: 4
+  gpu_memory_utilization: 0.86
+  kv_cache_dtype: fp8
+  max_num_batched_tokens: 7168
+  limit_mm: '{"image":4,"video":1}'
+  default_chat_template_kwargs: '{"enable_thinking": false}'
+  speculative_config: '{"method":"dflash","model":"/models/models--incoai--GLM-5.3-Flash-DFlash2/snapshots/7d74cdd881ed7e32c31175984a67823127b66cfe","num_speculative_tokens":7,"kv_cache_dtype":"auto","draft_sample_method":"probabilistic","rejection_sample_method":"standard","draft_tensor_parallel_size":2}'
+
+command: |
+  vllm serve {model_path} \
+      --served-model-name {served_model_name} \
+      --host {host} --port {port} \
+      --trust-remote-code \
+      --tensor-parallel-size {tensor_parallel} \
+      --quantization {quantization} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} \
+      --kv-cache-dtype {kv_cache_dtype} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --speculative-config '{speculative_config}' \
+      --tool-call-parser glm47 --enable-auto-tool-choice \
+      --reasoning-parser glm45 \
+      --enable-prefix-caching \
+      --no-enable-flashinfer-autotune \
+      --skip-mm-profiling \
+      --limit-mm-per-prompt '{limit_mm}' \
+      --chat-template /opt/glm53/chat_template.jinja \
+      --default-chat-template-kwargs '{default_chat_template_kwargs}' \
+      --distributed-executor-backend mp

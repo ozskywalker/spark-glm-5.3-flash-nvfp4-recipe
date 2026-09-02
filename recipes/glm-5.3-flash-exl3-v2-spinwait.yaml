@@ -1,0 +1,127 @@
+# Recipe: GLM-5.3-Flash EXL3 v2 with GLM53_SPINWAIT_MS actually applied
+#
+# *** EXPERIMENT — tests a knob the shipped recipe sets but never applies ***
+#
+# THE BUG THIS FIXES
+#
+# The shipped recipe sets GLM53_SPINWAIT_MS=16 and has since v2 was promoted.
+# It has never had any effect. Verified directly in the running container
+# (2026-09-02): the env var is present, and
+# vllm/distributed/device_communicators/shm_broadcast.py line 134 still reads
+# `busy_loop_s: float = 1,` — the stock 1-second value.
+#
+# Root cause: of the seven EXL3/GLM53 knobs the shipped recipe sets, six are
+# read at runtime by code that the Dockerfile bakes into the installed
+# packages (EXL3_FUSED_MOE / EXL3_FAT_KERNEL / EXL3_MOE_ROW_TILE via
+# overlay/exl3.py; GLM53_SUPPRESS_STOPS_IN_REASONING via the patched
+# detokenizer; GLM53_MIXED_PREFILL_CHUNK via the patched scheduler;
+# GLM53_INDEXER_WORKSPACE via an injected _glm53_workspace_mode() that reads
+# the environment on each call). GLM53_SPINWAIT_MS is the one exception: it is
+# not read at runtime at all. patch_spinwait.py rewrites the default parameter
+# value in the source text, reading the env var at patch time, and upstream's
+# start.sh runs it at container startup. This project's sparkrun recipes set
+# `entrypoint: ""` and invoke `vllm serve` directly, which bypasses start.sh
+# and therefore bypasses that patch. The Dockerfile's own build-time
+# application ran with the variable unset, i.e. stock.
+#
+# This is very likely why PR96's claimed -85.3% EngineCore CPU came back
+# "inconclusive" when this project validated the four v2 PRs: the feature was
+# never actually enabled during that measurement.
+#
+# WHAT THE PROFILE SHOWS AT STOCK
+#
+# py-spy against the live shipped config (2026-09-02, batch=1 decode):
+# EngineCore 99.9% and Worker_TP0 96.6% of sampled main-thread wall time
+# inside the shm_broadcast reader spin — sched_yield 32.4%, memory_fence
+# 17.3% (a Python lock acquire/release per spin iteration), plus should_warn
+# / timeout_ms / check bookkeeping burning another ~20-35% of the spin path.
+# With busy_loop_s=1 and decode steps arriving every ~30 ms, the reader is
+# always inside the busy window, so it never reaches the zmq park path.
+#
+# THE ONLY CHANGE
+#
+# `python3 /opt/glm53/patch_spinwait.py` runs before `vllm serve`, on every
+# node, using the image's own patch tooling rather than a reimplementation.
+# It rewrites the source default to 0.016 and is idempotent (it recognises an
+# already-patched file and no-ops), so a relaunch is safe. Everything else
+# matches the shipped recipe exactly.
+#
+# Related but deliberately NOT changed here, to keep this single-variable:
+# VLLM_USE_SPINLOOP_EXT. The image ships a compiled native spin loop
+# (vllm/spinloop.abi3.so, importable) but vLLM's default for that env var is
+# False, so the spinning runs in pure Python. That is a separate experiment.
+
+recipe_version: "2"
+name: GLM-5.3-Flash-EXL3-v2-Spinwait
+description: EXL3 v2 with the spinwait patch actually applied (GLM53_SPINWAIT_MS=16 honored), isolating a knob the shipped recipe sets but never activates
+
+model: Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw
+runtime: vllm
+container: glm53-exl3-v2:c190db1
+
+min_nodes: 2
+
+cluster_config:
+  resolved_model_path: /models
+
+executor_config:
+  entrypoint: ""
+  auto_remove: false
+
+env:
+  TORCH_CUDA_ARCH_LIST: 12.1a
+  FLASHINFER_CUDA_ARCH_LIST: 12.1a
+  FLASHINFER_DISABLE_VERSION_CHECK: "1"
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+  NCCL_DEBUG: WARN
+  TORCH_NCCL_ASYNC_ERROR_HANDLING: "1"
+  EXL3_FUSED_MOE: "1"
+  GLM53_SUPPRESS_STOPS_IN_REASONING: "1"
+  GLM53_MIXED_PREFILL_CHUNK: skip
+  EXL3_FAT_KERNEL: "1"
+  EXL3_MOE_ROW_TILE: "0"
+  GLM53_INDEXER_WORKSPACE: rightsize
+  # Now actually honored, because the command below applies the patch.
+  GLM53_SPINWAIT_MS: "16"
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  served_model_name: glm-5.3-flash-exl3-v2
+  tensor_parallel: 2
+  model_path: /models/models--Mia-AiLab--GLM-5.3-Flash-EXL3-TR3-4bpw/snapshots/024db9f7e9871e8efdf21538ba55af7442be3cd5
+  quantization: exl3
+  max_model_len: 262144
+  max_num_seqs: 4
+  gpu_memory_utilization: 0.86
+  kv_cache_dtype: fp8
+  max_num_batched_tokens: 7168
+  limit_mm: '{"image":4,"video":1}'
+  default_chat_template_kwargs: '{"enable_thinking": false}'
+  speculative_config: '{"method":"mtp","num_speculative_tokens":2}'
+
+command: |
+  python3 /opt/glm53/patch_spinwait.py && \
+  grep -n 'busy_loop_s: float' /usr/local/lib/python3.12/dist-packages/vllm/distributed/device_communicators/shm_broadcast.py && \
+  vllm serve {model_path} \
+      --served-model-name {served_model_name} \
+      --host {host} --port {port} \
+      --trust-remote-code \
+      --tensor-parallel-size {tensor_parallel} \
+      --quantization {quantization} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} \
+      --kv-cache-dtype {kv_cache_dtype} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --speculative-config '{speculative_config}' \
+      --tool-call-parser glm47 --enable-auto-tool-choice \
+      --reasoning-parser glm45 \
+      --enable-prefix-caching \
+      --no-enable-flashinfer-autotune \
+      --skip-mm-profiling \
+      --limit-mm-per-prompt '{limit_mm}' \
+      --chat-template /opt/glm53/chat_template.jinja \
+      --default-chat-template-kwargs '{default_chat_template_kwargs}' \
+      --distributed-executor-backend mp

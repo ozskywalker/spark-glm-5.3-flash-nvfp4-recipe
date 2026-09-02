@@ -1765,3 +1765,356 @@ broken out further by current metrics.
 pipeline flow diagram, per-workload waterfall, context-length crossover,
 and a speculative-decode funnel comparing MTP-2 against the DFlash2
 reference numbers above, plus a ranked "where to dig next" list.
+
+# Deep instrumentation night (2026-09-02)
+
+Goal: extend the harness far enough to see under the hood — sub-forward-pass
+timing, process-level CPU attribution, and concurrency — then use it. The
+production recipe was explicitly cleared for disruption for this work.
+
+New tooling added under `recipes/probes/`:
+
+| Script | What it gets that `/metrics` cannot |
+|---|---|
+| `probe_concurrency_pipeline.py` | Per-stage server-side splits across a concurrency sweep, plus sampled scheduler gauges (running/waiting/KV%) that are gauges and vanish after the run |
+| `probe_cpu_profile.sh` | py-spy speedscope + flamegraph of EngineCore and Worker under a live decode load |
+| `analyze_pyspy.py` | Buckets sampled stacks into wait-vs-work (GPU sync / IPC spin / idle / real Python work) |
+| `probe_profile_run.py` | Drives `/start_profile` → workload → `/stop_profile` |
+| `collect_traces.sh` | Pulls traces out of both TP ranks' containers |
+| `analyze_trace.py` | Aggregates a Chrome trace into kernel-family attribution, engine-scope CPU time, and GPU-busy vs wall |
+
+Two container facts worth recording, since both cost time to discover:
+py-spy needs `docker exec -u root --privileged` (the container runs as an
+unprivileged user under `ptrace_scope=1`, and without both flags py-spy
+returns a bare "Permission Denied"); and the profiler's `torch_profiler_dir`
+must live under `/tmp`, because that same unprivileged user cannot create a
+directory at the filesystem root.
+
+## Concurrency: throughput saturates at c=8, and KV cache is 90% idle
+
+`probe_concurrency_pipeline.py --workload prose --levels 1,2,4,8,16 --waves 3`
+against the shipped config (MTP-2, `max_num_batched_tokens=7168`,
+`max_num_seqs=4`):
+
+| c | wall | aggregate tok/s | client e2e p50 | server queue avg | queue % of e2e | TTFT avg | running max | waiting max | KV peak |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 14.8s | 25.96 | 4.88s | 0.00001s | 0.0% | 0.291s | 1 | 0 | 2.39% |
+| 2 | 20.3s | 37.79 | 5.25s | 0.771s | 13.0% | 1.145s | 2 | 1 | 4.78% |
+| 4 | 32.7s | 46.91 | 8.33s | 1.114s | 11.3% | 2.728s | 4 | 3 | 9.57% |
+| 8 | 53.7s | 57.21 | 12.65s | 6.080s | 45.3% | 6.563s | 4 | 7 | 9.57% |
+| 16 | 102.1s | 60.19 | 22.91s | 13.696s | 63.0% | 14.132s | 4 | 15 | 9.57% |
+
+- **Throughput saturates at c=8.** c=8 → c=16 buys +5.2% aggregate throughput
+  for +81% client latency. There is no reason to run this deployment above
+  c=8 as configured.
+- **Queue time becomes the dominant cost, and it is not a memory limit.**
+  `num_requests_running` pins at exactly 4 — `max_num_seqs` — from c=4
+  upward, while everything else waits. Meanwhile **KV cache usage peaks at
+  9.57% and stops rising**, because the cap on concurrent sequences prevents
+  the KV pool from ever being used. Over 90% of the KV pool this deployment
+  spent its whole bring-up fighting to enlarge is idle at saturation.
+- MTP-2 acceptance is unaffected by batching (0.731 → 0.748 across the
+  sweep), so deeper batching does not cost speculative-decode efficiency.
+- Zero preemptions at every level.
+
+`max_num_seqs=4` is inherited from the NVFP4 lane, where raising it past 6 hit
+the memory ceiling documented earlier in this file. That constraint was never
+re-tested on EXL3, which has ~10 GiB more headroom — and the KV figure says
+the headroom is real and unused. Follow-up test below.
+
+## Process-level CPU: both engine processes are ~97-99% inside an IPC spin
+
+`probe_cpu_profile.sh` (py-spy, 200 Hz, 25 s, during a steady single-stream
+900-token generation), analyzed by `analyze_pyspy.py`:
+
+| Process | ipc_spinwait | real Python work | top self-time frames |
+|---|---:|---:|---|
+| EngineCore | 99.9% | 0.1% | `wait` 27.9%, `acquire_read` 15.8%, `should_warn` 19.8% (two lines), `check` 7.6%, `timeout_ms` 8.5% (three lines) |
+| Worker_TP0 | 96.6% | 2.6% | `sched_yield` 32.4%, `memory_fence` 17.3%, `wait` 13.9%, `acquire_read` 19.3% (three lines) |
+
+Everything above is `vllm/distributed/device_communicators/shm_broadcast.py`.
+Caveat on method: py-spy ran `--nonblocking` and reported ~33% sampling
+errors, which biases toward frames it can unwind (pure Python) and away from
+native execution — so treat these as "of the samples that resolved" rather
+than as absolute wall-clock shares. The *composition* is the finding, not the
+exact percentage.
+
+What the composition shows is that the spin loop is not merely waiting, it is
+doing repeated Python bookkeeping while waiting. Each `acquire_read`
+iteration calls `check()` → `memory_fence()` (which is
+`with _memory_fence_lock: pass`, a real Python lock acquire/release),
+then `self._spin_condition.wait(timeout_ms=read_timeout.timeout_ms())` and
+`read_timeout.should_warn()` — each of which calls `time.monotonic()` and does
+arithmetic, per iteration, forever. Roughly a third of the sampled spin time
+is in those helpers rather than in the yield itself.
+
+## Root cause: `GLM53_SPINWAIT_MS=16` has never been applied
+
+The shipped recipe has set `GLM53_SPINWAIT_MS=16` since v2 was promoted.
+**It does nothing.** Verified in the live container: the env var is set, and
+`shm_broadcast.py` line 134 still reads `busy_loop_s: float = 1,` — stock.
+
+Audit of every EXL3/GLM53 knob the shipped recipe sets, checking where each is
+actually read:
+
+| Knob | Read by | Live? |
+|---|---|---|
+| `EXL3_FUSED_MOE` | `overlay/exl3.py` (installed module, runtime) | yes |
+| `EXL3_FAT_KERNEL` | `overlay/exl3.py` | yes |
+| `EXL3_MOE_ROW_TILE` | `overlay/exl3.py` | yes |
+| `GLM53_SUPPRESS_STOPS_IN_REASONING` | patched `vllm/v1/engine/detokenizer.py` | yes |
+| `GLM53_MIXED_PREFILL_CHUNK` | patched `vllm/v1/core/sched/scheduler.py` | yes |
+| `GLM53_INDEXER_WORKSPACE` | injected `_glm53_workspace_mode()`, reads env per call | yes |
+| `GLM53_SPINWAIT_MS` | **only `patch_spinwait.py`**, at patch time | **NO** |
+
+Six of seven knobs are read at runtime by code the Dockerfile bakes in, so
+they work regardless of how the container is started. `GLM53_SPINWAIT_MS` is
+the exception: `patch_spinwait.py` *rewrites the default parameter value in
+the source text*, reading the env var at patch time. Upstream's `start.sh`
+runs it at container startup (start.sh lines 1038-1039); this project's
+sparkrun recipes set `entrypoint: ""` and call `vllm serve` directly, which
+bypasses start.sh entirely. The Dockerfile's own build-time run of that patch
+happened with the variable unset, i.e. stock.
+
+**This retroactively explains the PR96 "inconclusive" verdict** recorded
+earlier in this file. That validation measured a feature that was never on.
+The honest correction is not "the claim is unproven" but "the claim was never
+tested" — and the py-spy numbers above are what stock actually looks like:
+with `busy_loop_s=1` and decode steps arriving every ~30 ms, the reader never
+leaves the busy window, so the zmq park path is unreachable by construction.
+
+Test recipe: `recipes/glm-5.3-flash-exl3-v2-spinwait.yaml`, which runs the
+image's own `patch_spinwait.py` before `vllm serve` and echoes the patched
+line at boot so the change is visible in the log rather than assumed.
+
+Separately: the image ships a compiled native spin loop
+(`vllm/spinloop.abi3.so`, importable) but `VLLM_USE_SPINLOOP_EXT` defaults to
+False, so all of the above spinning runs in Python. That is a second,
+independent lever on the same code path.
+
+## Profiler gotcha: `max_iterations` kills the server
+
+Worth recording because it cost a boot cycle and the name gives no hint.
+`--profiler-config` accepts `max_iterations`, which reads like a trace-size
+cap. It is not a cap — it is a benchmark-harness exit. On reaching the limit
+mid-request the server logged:
+
+```
+[wrapper.py:126] Max profiling iterations reached. Stopping profiler...
+[launcher.py:114] [shutdown] API server: shutdown triggered
+[utils.py:640] Process manager: force killing remaining process EngineCore
+```
+
+...and the deployment went down. It is intended for scripts that profile N
+iterations and exit. **On a long-lived server set `max_iterations: 0`** and
+bound trace size with a short workload plus an explicit `/stop_profile`.
+
+Also visible in that first attempt, and a finding in its own right: the first
+profiled request logged Triton JIT compilation *during inference* for
+`_compute_local_logits_stats_kernel`, `_rejection_kernel`, and
+`_resample_kernel` — vLLM's own `jit_monitor` flags these as latency spikes.
+These are speculative-decode rejection-sampling kernels being compiled on
+first use, so the first request after every boot pays a JIT penalty that no
+steady-state benchmark will show.
+
+One more limit found the same way: **profiling a long-context prefill kills
+the engine.** A `--prefill-only` trace of a ~33K-token prompt produced enough
+trace events that the worker missed its shm_broadcast deadline, and the read
+raised `RuntimeError: cancelled` → `RuntimeError: Executor failed.` →
+`EngineDeadError`. Keep profiled prefills small (a few thousand tokens); the
+long-context prefill numbers already come from `probe_longctx.py`, which does
+not need the profiler.
+
+## Sub-forward-pass attribution: decode is GEMM+MoE bound, attention is 0.3%
+
+This is what Gap #1 was asking for. Traces via `/start_profile`, collected
+from both TP ranks, analyzed with `analyze_trace.py`. **CUDA graphs did not
+have to be disabled** — CUPTI resolved kernels inside graph replays, so these
+are production-configuration numbers, not an eager-mode approximation.
+
+Prose decode, batch=1, MTP-2 (each step verifies 3 tokens: 1 + 2 draft),
+2.53 s window, 74,777 kernel events:
+
+| kernel family | rank 0 | rank 1 | calls | µs/call |
+|---|---:|---:|---:|---:|
+| gemm | **52.5%** | 49.8% | 13,827 | 96 |
+| moe_exl3 | **32.8%** | 31.3% | 2,288 | 363 |
+| comms (NCCL) | 7.2% | **11.9%** | 2,600 | 70 / 124 |
+| elementwise + memory | 3.6% | 3.4% | 41,208 | ~2 |
+| **attention** | **0.3%** | 0.3% | 1,391 | 6 |
+| mamba_ssm | 0.2% | 0.2% | 962 | 6 |
+| norm / quant / sampling | 0.3% | 0.3% | 2,667 | ~3 |
+
+**GPU busy 96.0% of the wall span.** Decode at batch=1 is GPU-bound, not
+CPU-bound — which reframes the py-spy result above: both engine processes sit
+in the spin loop because they are waiting on a genuinely busy GPU, not because
+CPU orchestration is the bottleneck.
+
+Three findings worth acting on:
+
+**1. Attention is irrelevant at short-context decode (0.3%).** All the
+sparse-MLA / indexer machinery that dominates this model's reputation matters
+for prefill; it is noise during decode. Optimization effort aimed at decode
+should ignore it entirely.
+
+**2. The dominant GEMM kernels are Ampere-era, with 16×16 tiles.** Named in
+full:
+
+| kernel | calls | µs/call | total |
+|---|---:|---:|---:|
+| `cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_16x16_128x1_tn_align8` | 5,850 | 133.5 | 781 ms (30.8%) |
+| `cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_16x16_128x2_tn_align8` | 3,876 | 62.0 | 240 ms (9.5%) |
+| `internal::gemvx::kernel<...__nv_bfloat16...>` (cuBLAS GEMV) | 209 | 943.0 | 197 ms (7.8%) |
+| `exl3_moe_kernel<4, 256>` | 1,144 | 720.0 | 824 ms (32.5%) |
+
+`cutlass_80` is the SM80/Ampere target and `wmma_tensorop` is the legacy WMMA
+path — running on SM121 Blackwell. The tiles are 16×16. At batch=1 with MTP-2
+the GEMM's M dimension is **3**, so a 16×16 tile is ~81% empty in M: these are
+GEMVs being pushed through tensor-core GEMM kernels that need M≥16 to fill a
+tile. That is simultaneously the explanation for the modest decode throughput
+and the strongest available lead for kernel work — a Blackwell-native
+(SM100/SM120-class, TMA, warpgroup MMA) path for these shapes, or a genuine
+GEMV/skinny-GEMM kernel, is attacking 40%+ of decode GPU time.
+
+**3. Cross-node TP costs 7-12% and is asymmetric.** Both ranks issue
+identical kernel counts (13,827 gemm / 2,288 moe / 2,600 comms — perfectly
+symmetric work division), but rank 1 spends 323 ms in `ncclDevKernel_AllReduce`
+against rank 0's 183 ms (124.9 vs 70.5 µs/call). Rank 1 is arriving at the
+collective first and waiting on rank 0. That ~140 ms delta is ~5% of the
+window, spent idling inside the collective.
+
+## Batching is the dominant decode lever, and the trace says why
+
+Same trace methodology at 8 concurrent requests (`max_num_seqs=16`):
+
+| | batch=1 | batch=8 |
+|---|---:|---:|
+| GPU busy | 96.0% | 64.1% |
+| `exl3_moe_kernel<4,256>` per call | 720.0 µs | 1512.6 µs |
+| gemm µs/call (family avg) | 96.2 | 92.7 |
+| moe_exl3 share | 32.8% | 46.5% |
+| attention share | 0.3% | 0.3% |
+
+**The MoE kernel costs 2.1× more time while serving 8× the sequences**, and
+per-call GEMM time is flat. These kernels are dominated by reading weights,
+not by the arithmetic on any one sequence, so their cost is almost independent
+of how many sequences ride along. That is the mechanism behind the concurrency
+numbers, and it is why `max_num_seqs` mattered so much.
+
+(The drop to 64.1% GPU-busy at batch=8 is partly ramp-up/tail — 8 requests of
+unequal length in one 13 s window — but 4.7 s of GPU idle is large enough to
+be worth a dedicated look; see the open threads at the end.)
+
+## `max_num_seqs` 4 → 16: +171% aggregate throughput *and* lower latency
+
+The concurrency sweep above showed `num_requests_running` pinned at 4 while KV
+sat at 9.57%. Re-ran the identical sweep with `-o max_num_seqs=16`, everything
+else held constant:
+
+| c | agg tok/s @4 | agg tok/s @16 | change | e2e p50 @4 | e2e p50 @16 | KV peak @16 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 25.96 | 25.46 | −1.9% | 4.88s | 4.98s | 2.56% |
+| 2 | 37.79 | 35.42 | −6.3% | 5.25s | 5.74s | 5.13% |
+| 4 | 46.91 | 49.90 | +6.4% | 8.33s | 9.09s | 10.26% |
+| 8 | 57.21 | 95.10 | **+66.2%** | 12.65s | **7.87s** | 20.51% |
+| 16 | 60.19 | **163.45** | **+171.6%** | 22.91s | **14.13s** | 41.03% |
+
+Latency *improves* at the same time as throughput at c≥8 — this is not a
+throughput-for-latency trade. Zero preemptions at every level, MTP-2
+acceptance unchanged (0.726-0.750), and KV still only 41% used at c=16, so
+the ceiling has not been found. The small regressions at c=1-2 are within
+run-to-run noise for this bench but are reported as measured.
+
+**Caveat before promoting this**: every prompt in this sweep is short. KV
+demand scales with context length, and at 262,144-token context 16
+simultaneous sequences cannot fit — the scheduler would queue and eventually
+preempt. `max_num_seqs=4` came from the NVFP4 lane's memory ceiling and was
+inherited untested; the right follow-up is a long-context concurrency sweep to
+find the safe value, not a blind promotion of 16.
+
+## DFlash2 k=7 re-validated at MNBT=7168: bigger wins, and a new crash
+
+Recipe: `recipes/glm-5.3-flash-exl3-v2-dflash2-7168.yaml` (drafter pinned to
+snapshot `7d74cdd`, matching the original measurement). Booted clean; vLLM
+logged the expected `max_num_scheduled_tokens is set to 7168 based on the
+speculative decoding settings` warning. Available KV cache with the drafter
+resident: **14.6 GiB** (versus a materially larger pool under MTP-2 — the
+drafter is not free).
+
+| workload | DFlash2 @7168 | DFlash2 @2048 (historical) | MTP-2 @7168 |
+|---|---:|---:|---:|
+| prose (23→128 tok) | 24.04 tok/s, 28.9% accept | 24.30 tok/s | **27.35** tok/s, 73.8% |
+| structured (counting) | **61.07** tok/s, 94.1% accept | 56.35 tok/s | 31.54 tok/s, 97.1% |
+| medium summarize (275→73) | **50.52** tok/s, 75.5% accept | not measured | 30.35 tok/s, 93.0% |
+
+Per-position acceptance (out of the 7 draft slots) is where the workload
+dependence lives:
+
+| position | 0 | 1 | 2 | 3 | 4 | 5 | 6 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| prose | 222 | 138 | 90 | 36 | 24 | 18 | 6 |
+| structured | 158 | 158 | 157 | 156 | 154 | 133 | 125 |
+| medium | 70 | 62 | 54 | 46 | 46 | 46 | 46 |
+
+- **The MNBT raise helps DFlash2 too**: structured decode 56.35 → 61.07 tok/s
+  (+8.4%). The worry in this recipe's header — that a 7-deep drafter might be
+  starved by sharing the scheduling budget — did not materialize.
+- **Prose is unchanged** (24.30 → 24.04, noise) and still ~12% behind MTP-2.
+- **New result: mid-length semi-structured work is a large DFlash2 win.** The
+  summarization workload runs 50.52 vs MTP-2's 30.35 tok/s — +66%. Its
+  per-position curve decays and then *plateaus* at 46/70 (66%) rather than
+  collapsing like prose. Previous validation only tested prose and a counting
+  task, so the useful middle of the workload space had never been sampled;
+  DFlash2's win zone is wider than "code and counting".
+- **But it crashed.** During a prompt-length sweep (filler prompts up to
+  ~8-11K tokens) the worker died with this project's documented silent-kill
+  signature — `EngineDeadError`, no CUDA OOM, no assertion, no traceback from
+  the worker. Short prompts had been fine for dozens of requests immediately
+  prior. With only 14.6 GiB of KV and a 7168-token scheduling budget plus a
+  resident drafter, a multi-thousand-token prefill is a plausible memory
+  trigger, consistent with every prior instance of this signature on this
+  cluster.
+
+**Verdict: still not promotable, for a new reason.** The performance case is
+now stronger than it was (two of three workloads win big, and one of those is
+newly discovered), but a config that dies on an 8K-token prompt cannot ship.
+The next step is a prompt-length bisection under DFlash2@7168 to find where it
+breaks, and whether lowering MNBT or `max_num_seqs` back down buys stability
+without giving up the structured-content win. MTP-2 remains the default.
+
+## Stretch goal closed: the 1-2% "overhead" bucket is a fixed per-request cost
+
+`probe_overhead_bucket.py` varies one dimension at a time and regresses the
+residual (server `e2e` minus queue+prefill+decode) against each. Run on the
+restored shipped config, n=4 per point:
+
+| output tokens (prompt fixed at 17) | overhead | % of e2e |
+|---:|---:|---:|
+| 16 | 12.2 ms | 1.27% |
+| 64 | 43.3 ms | 1.40% |
+| 160 | 44.1 ms | 0.61% |
+| 320 | 65.3 ms | 0.50% |
+
+| prompt tokens (output ~26) | overhead | % of e2e |
+|---:|---:|---:|
+| 42 | 78.2 ms | 5.97% |
+| 978 | 42.4 ms | 1.34% |
+| 3,858 | 62.4 ms | 1.48% |
+| 9,618 | 61.9 ms | 0.97% |
+
+Fitted slopes: **145 µs per output token, −0.12 µs per prompt token** (i.e.
+zero), and a strikingly stable **5.1 ms** gap between client wall time and
+server-side e2e across all eight points.
+
+Conclusion: the residual is **a roughly fixed per-request cost of tens of
+milliseconds, not a scaling problem**. About 5 ms of it is HTTP transport to
+the probe host; the rest is per-request server-side work (response assembly,
+detokenizer finalization, usage accounting) that is *completely independent of
+prompt length* and grows only weakly with output length. As a share of e2e it
+therefore **shrinks** as requests get larger — 5.97% on the shortest request
+measured, 0.50% on the longest. Run-to-run scatter at n=4 is comparable to the
+trend itself, which is the other reason not to chase this further.
+
+**Not worth optimizing.** It only reaches a few percent on trivially short
+requests, and nothing about it degrades under load or context growth. Closing
+this thread rather than leaving it open.

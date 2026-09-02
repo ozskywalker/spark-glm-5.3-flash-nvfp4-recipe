@@ -1,0 +1,53 @@
+{
+  "profile": "cpu_profiles/pyspy_EngineCore.speedscope.json",
+  "unit": "seconds",
+  "total_weight": 17.51,
+  "buckets": {
+    "ipc_spinwait": {
+      "weight": 17.5,
+      "pct": 99.94
+    },
+    "other_python": {
+      "weight": 0.005,
+      "pct": 0.03
+    },
+    "scheduler": {
+      "weight": 0.005,
+      "pct": 0.03
+    }
+  },
+  "top_self": [
+    {
+      "frame": "wait (shm_broadcast.py:204)",
+      "weight": 4.88,
+      "pct": 27.87
+    },
+    {
+      "frame": "acquire_read (shm_broadcast.py:794)",
+      "weight": 2.765,
+      "pct": 15.79
+    },
+    {
+      "frame": "should_warn (shm_broadcast.py:757)",
+      "weight": 1.665,
+      "pct": 9.51
+    },
+    {
+      "frame": "should_warn (shm_broadcast.py:754)",
+      "weight": 1.505,
+      "pct": 8.6
+    },
+    {
+      "frame": "check (shm_broadcast.py:774)",
+      "weight": 1.335,
+      "pct": 7.62
+    },
+    {
+      "frame": "wait (shm_broadcast.py:202)",
+      "weight": 1.205,
+      "pct": 6.88
+    }
+  ],
+  "wait_pct": 99.94,
+  "work_pct": 0.06
+}

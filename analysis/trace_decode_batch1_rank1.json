@@ -1,0 +1,135 @@
+{
+  "trace": "10_7_0_142__dp0_pp0_tp1_dcp0_ep1_rank1.1788322262490086063.pt.trace.json.gz",
+  "n_kernel_events": 74777,
+  "n_profiler_steps": 0,
+  "wall_span_ms": 2716.765,
+  "gpu_busy_ms": 2601.484,
+  "gpu_busy_pct": 95.76,
+  "gpu_idle_ms": 115.282,
+  "sum_kernel_ms": 2709.226,
+  "categories": {
+    "gemm": {
+      "ms": 1349.284,
+      "pct_of_kernel_time": 49.8,
+      "count": 13827,
+      "us_per_call": 97.58
+    },
+    "moe_exl3": {
+      "ms": 847.072,
+      "pct_of_kernel_time": 31.27,
+      "count": 2288,
+      "us_per_call": 370.22
+    },
+    "comms": {
+      "ms": 323.175,
+      "pct_of_kernel_time": 11.93,
+      "count": 2600,
+      "us_per_call": 124.3
+    },
+    "other": {
+      "ms": 68.101,
+      "pct_of_kernel_time": 2.51,
+      "count": 8500,
+      "us_per_call": 8.01
+    },
+    "elementwise": {
+      "ms": 54.112,
+      "pct_of_kernel_time": 2.0,
+      "count": 21298,
+      "us_per_call": 2.54
+    },
+    "memory": {
+      "ms": 37.531,
+      "pct_of_kernel_time": 1.39,
+      "count": 19910,
+      "us_per_call": 1.89
+    },
+    "attention": {
+      "ms": 8.404,
+      "pct_of_kernel_time": 0.31,
+      "count": 1391,
+      "us_per_call": 6.04
+    },
+    "embedding": {
+      "ms": 8.107,
+      "pct_of_kernel_time": 0.3,
+      "count": 1334,
+      "us_per_call": 6.08
+    },
+    "mamba_ssm": {
+      "ms": 6.082,
+      "pct_of_kernel_time": 0.22,
+      "count": 962,
+      "us_per_call": 6.32
+    },
+    "norm": {
+      "ms": 3.979,
+      "pct_of_kernel_time": 0.15,
+      "count": 1742,
+      "us_per_call": 2.28
+    },
+    "quant": {
+      "ms": 1.754,
+      "pct_of_kernel_time": 0.06,
+      "count": 406,
+      "us_per_call": 4.32
+    },
+    "sampling": {
+      "ms": 1.625,
+      "pct_of_kernel_time": 0.06,
+      "count": 519,
+      "us_per_call": 3.13
+    }
+  },
+  "scopes": {},
+  "top_kernels": [
+    {
+      "name": "void exl3_moe_kernel<4, 256>(__half const*, __half*, __half*, __half*, __half*, float*, unsigned short const**, __half const**, __half const**, unsigned short const**, __half const**, __half const**, unsigned short const**, __half const**, __half const**, long const*, long const*, __half const*, int, int, int, int, int, int, float, int, int, int, int, int*)",
+      "cat": "moe_exl3",
+      "ms": 839.63,
+      "pct": 30.99,
+      "count": 1144,
+      "us_per_call": 733.94
+    },
+    {
+      "name": "void cutlass::Kernel2<cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_16x16_128x1_tn_align8>(cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_16x16_128x1_tn_align8::Params)",
+      "cat": "gemm",
+      "ms": 792.705,
+      "pct": 29.26,
+      "count": 5850,
+      "us_per_call": 135.51
+    },
+    {
+      "name": "ncclDevKernel_AllReduce_Sum_bf16_RING_LL(ncclDevKernelArgsStorage<4096ul>)",
+      "cat": "comms",
+      "ms": 315.068,
+      "pct": 11.63,
+      "count": 2522,
+      "us_per_call": 124.93
+    },
+    {
+      "name": "void cutlass::Kernel2<cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_16x16_128x2_tn_align8>(cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_16x16_128x2_tn_align8::Params)",
+      "cat": "gemm",
+      "ms": 245.369,
+      "pct": 9.06,
+      "count": 3876,
+      "us_per_call": 63.3
+    },
+    {
+      "name": "std::enable_if<!(false), void>::type internal::gemvx::kernel<int, int, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16, float, false, true, true, false, 7, false, cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<__nv_bfloat16 const>, cublasGemvTensorStridedBatched<__nv_bfloat16 const>, cublasGemvTensorStridedBatched<__nv_bfloat16>, float> >(cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<__nv_bfloat16 const>, cublasGemvTensorStridedBatched<__nv_bfloat16 const>, cublasGemvTensorStridedBatched<__nv_bfloat16>, float>)",
+      "cat": "gemm",
+      "ms": 197.211,
+      "pct": 7.28,
+      "count": 209,
+      "us_per_call": 943.6
+    },
+    {
+      "name": "mhc_fused_tilelang_kernel",
+      "cat": "other",
+      "ms": 27.349,
+      "pct": 1.01,
+      "count": 2225,
+      "us_per_call": 12.29
+    }
+  ]
+}

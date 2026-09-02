@@ -1,0 +1,231 @@
+{
+  "trace": "10_7_0_87__dp0_pp0_tp0_dcp0_ep0_rank0.1788322262528965187.pt.trace.json.gz",
+  "n_kernel_events": 74777,
+  "n_profiler_steps": 0,
+  "wall_span_ms": 2530.855,
+  "gpu_busy_ms": 2428.603,
+  "gpu_busy_pct": 95.96,
+  "gpu_idle_ms": 102.253,
+  "sum_kernel_ms": 2533.892,
+  "categories": {
+    "gemm": {
+      "ms": 1330.673,
+      "pct_of_kernel_time": 52.51,
+      "count": 13827,
+      "us_per_call": 96.24
+    },
+    "moe_exl3": {
+      "ms": 831.165,
+      "pct_of_kernel_time": 32.8,
+      "count": 2288,
+      "us_per_call": 363.27
+    },
+    "comms": {
+      "ms": 183.406,
+      "pct_of_kernel_time": 7.24,
+      "count": 2600,
+      "us_per_call": 70.54
+    },
+    "other": {
+      "ms": 67.395,
+      "pct_of_kernel_time": 2.66,
+      "count": 8500,
+      "us_per_call": 7.93
+    },
+    "elementwise": {
+      "ms": 54.356,
+      "pct_of_kernel_time": 2.15,
+      "count": 21298,
+      "us_per_call": 2.55
+    },
+    "memory": {
+      "ms": 37.233,
+      "pct_of_kernel_time": 1.47,
+      "count": 19910,
+      "us_per_call": 1.87
+    },
+    "embedding": {
+      "ms": 8.429,
+      "pct_of_kernel_time": 0.33,
+      "count": 1334,
+      "us_per_call": 6.32
+    },
+    "attention": {
+      "ms": 8.348,
+      "pct_of_kernel_time": 0.33,
+      "count": 1391,
+      "us_per_call": 6.0
+    },
+    "mamba_ssm": {
+      "ms": 5.904,
+      "pct_of_kernel_time": 0.23,
+      "count": 962,
+      "us_per_call": 6.14
+    },
+    "norm": {
+      "ms": 3.779,
+      "pct_of_kernel_time": 0.15,
+      "count": 1742,
+      "us_per_call": 2.17
+    },
+    "quant": {
+      "ms": 1.69,
+      "pct_of_kernel_time": 0.07,
+      "count": 406,
+      "us_per_call": 4.16
+    },
+    "sampling": {
+      "ms": 1.514,
+      "pct_of_kernel_time": 0.06,
+      "count": 519,
+      "us_per_call": 2.92
+    }
+  },
+  "scopes": {},
+  "top_kernels": [
+    {
+      "name": "void exl3_moe_kernel<4, 256>(__half const*, __half*, __half*, __half*, __half*, float*, unsigned short const**, __half const**, __half const**, unsigned short const**, __half const**, __half const**, unsigned short const**, __half const**, __half const**, long const*, long const*, __half const*, int, int, int, int, int, int, float, int, int, int, int, int*)",
+      "cat": "moe_exl3",
+      "ms": 823.736,
+      "pct": 32.51,
+      "count": 1144,
+      "us_per_call": 720.05
+    },
+    {
+      "name": "void cutlass::Kernel2<cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_16x16_128x1_tn_align8>(cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_16x16_128x1_tn_align8::Params)",
+      "cat": "gemm",
+      "ms": 780.949,
+      "pct": 30.82,
+      "count": 5850,
+      "us_per_call": 133.5
+    },
+    {
+      "name": "void cutlass::Kernel2<cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_16x16_128x2_tn_align8>(cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_16x16_128x2_tn_align8::Params)",
+      "cat": "gemm",
+      "ms": 240.498,
+      "pct": 9.49,
+      "count": 3876,
+      "us_per_call": 62.05
+    },
+    {
+      "name": "std::enable_if<!(false), void>::type internal::gemvx::kernel<int, int, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16, float, false, true, true, false, 7, false, cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<__nv_bfloat16 const>, cublasGemvTensorStridedBatched<__nv_bfloat16 const>, cublasGemvTensorStridedBatched<__nv_bfloat16>, float> >(cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<__nv_bfloat16 const>, cublasGemvTensorStridedBatched<__nv_bfloat16 const>, cublasGemvTensorStridedBatched<__nv_bfloat16>, float>)",
+      "cat": "gemm",
+      "ms": 197.08,
+      "pct": 7.78,
+      "count": 209,
+      "us_per_call": 942.97
+    },
+    {
+      "name": "ncclDevKernel_AllReduce_Sum_bf16_RING_LL(ncclDevKernelArgsStorage<4096ul>)",
+      "cat": "comms",
+      "ms": 176.095,
+      "pct": 6.95,
+      "count": 2522,
+      "us_per_call": 69.82
+    },
+    {
+      "name": "mhc_fused_tilelang_kernel",
+      "cat": "other",
+      "ms": 27.388,
+      "pct": 1.08,
+      "count": 2225,
+      "us_per_call": 12.31
+    },
+    {
+      "name": "void cutlass::Kernel2<cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_128x1_tn_align8>(cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_128x1_tn_align8::Params)",
+      "cat": "gemm",
+      "ms": 22.562,
+      "pct": 0.89,
+      "count": 50,
+      "us_per_call": 451.24
+    },
+    {
+      "name": "void gemmSN_NN_kernel<float, 256, 4, 2, 8, 3, 4, false, cublasGemvTensorStridedBatched<float const>, cublasGemvTensorStridedBatched<float const>, cublasGemvTensorStridedBatched<float> >(cublasGemmSmallNParams<cublasGemvTensorStridedBatched<float const>, cublasGemvTensorStridedBatched<float const>, cublasGemvTensorStridedBatched<float>, float>)",
+      "cat": "gemm",
+      "ms": 20.608,
+      "pct": 0.81,
+      "count": 300,
+      "us_per_call": 68.69
+    },
+    {
+      "name": "fused_recurrent_gated_delta_rule_fwd_kernel",
+      "cat": "other",
+      "ms": 15.904,
+      "pct": 0.63,
+      "count": 850,
+      "us_per_call": 18.71
+    },
+    {
+      "name": "void cutlass::Kernel2<cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_64x2_nn_align8>(cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_64x2_nn_align8::Params)",
+      "cat": "gemm",
+      "ms": 13.587,
+      "pct": 0.54,
+      "count": 312,
+      "us_per_call": 43.55
+    },
+    {
+      "name": "void at::native::vectorized_elementwise_kernel<2, at::native::FillFunctor<long>, std::array<char*, 1ul> >(int, at::native::FillFunctor<long>, std::array<char*, 1ul>)",
+      "cat": "elementwise",
+      "ms": 13.514,
+      "pct": 0.53,
+      "count": 3511,
+      "us_per_call": 3.85
+    },
+    {
+      "name": "mhc_pre_big_fuse_with_norm_tilelang_kernel",
+      "cat": "other",
+      "ms": 12.241,
+      "pct": 0.48,
+      "count": 2340,
+      "us_per_call": 5.23
+    },
+    {
+      "name": "void cutlass::Kernel2<cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_128x2_tn_align8>(cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_128x2_tn_align8::Params)",
+      "cat": "gemm",
+      "ms": 11.404,
+      "pct": 0.45,
+      "count": 300,
+      "us_per_call": 38.01
+    },
+    {
+      "name": "std::enable_if<!(false), void>::type internal::gemvx::kernel<int, int, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16, float, false, true, true, false, 6, false, cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<__nv_bfloat16 const>, cublasGemvTensorStridedBatched<__nv_bfloat16 const>, cublasGemvTensorStridedBatched<__nv_bfloat16>, float> >(cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<__nv_bfloat16 const>, cublasGemvTensorStridedBatched<__nv_bfloat16 const>, cublasGemvTensorStridedBatched<__nv_bfloat16>, float>)",
+      "cat": "gemm",
+      "ms": 11.312,
+      "pct": 0.45,
+      "count": 130,
+      "us_per_call": 87.01
+    },
+    {
+      "name": "void cutlass::Kernel2<cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_128x1_tn_align2>(cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_128x1_tn_align2::Params)",
+      "cat": "gemm",
+      "ms": 10.739,
+      "pct": 0.42,
+      "count": 92,
+      "us_per_call": 116.72
+    },
+    {
+      "name": "void at::native::index_elementwise_kernel<128, 4, at::native::gpu_index_kernel<at::native::index_kernel_impl<at::native::OpaqueType<2> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1}>(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>, at::native::index_kernel_impl<at::native::OpaqueType<2> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1} const&, bool)::{lambda(int)#1}>(long, at::native::gpu_index_kernel<at::native::index_kernel_impl<at::native::OpaqueType<2> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1}>(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>, at::native::index_kernel_impl<at::native::OpaqueType<2> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1} const&, bool)::{lambda(int)#1})",
+      "cat": "elementwise",
+      "ms": 7.961,
+      "pct": 0.31,
+      "count": 1172,
+      "us_per_call": 6.79
+    },
+    {
+      "name": "void at::native::_scatter_gather_elementwise_kernel<128, 8, at::native::_cuda_scatter_gather_internal_kernel<true, long, long>::operator()<at::native::ReduceAdd>(at::TensorIterator&, long, long, long, at::native::ReduceAdd const&)::{lambda(int)#1}>(int, at::native::_cuda_scatter_gather_internal_kernel<true, long, long>::operator()<at::native::ReduceAdd>(at::TensorIterator&, long, long, long, at::native::ReduceAdd const&)::{lambda(int)#1})",
+      "cat": "embedding",
+      "ms": 7.857,
+      "pct": 0.31,
+      "count": 1144,
+      "us_per_call": 6.87
+    },
+    {
+      "name": "void vllm::moe::single_group_topk::detail::single_group_topk_block_kernel<float, float, int, (vllm::moe::ScoringFunc)1, 384, 8>(float const*, float*, int*, float const*, long, long, bool, float, bool)",
+      "cat": "moe_exl3",
+      "ms": 7.429,
+      "pct": 0.29,
+      "count": 1144,
+      "us_per_call": 6.49
+    }
+  ]
+}
