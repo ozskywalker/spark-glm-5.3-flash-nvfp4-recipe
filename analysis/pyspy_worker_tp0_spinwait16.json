@@ -1,0 +1,93 @@
+{
+  "profile": "cpu_profiles_spinwait/pyspy_Worker_TP0.speedscope.json",
+  "unit": "seconds",
+  "total_weight": 23.48,
+  "buckets": {
+    "ipc_spinwait": {
+      "weight": 23.02,
+      "pct": 98.04
+    },
+    "model_fwd": {
+      "weight": 0.24,
+      "pct": 1.02
+    },
+    "spec_decode": {
+      "weight": 0.09,
+      "pct": 0.38
+    },
+    "gpu_wait": {
+      "weight": 0.06,
+      "pct": 0.26
+    },
+    "other_python": {
+      "weight": 0.03,
+      "pct": 0.13
+    },
+    "sleep_idle": {
+      "weight": 0.02,
+      "pct": 0.09
+    },
+    "sampler": {
+      "weight": 0.01,
+      "pct": 0.04
+    },
+    "nccl_comm": {
+      "weight": 0.01,
+      "pct": 0.04
+    }
+  },
+  "top_self": [
+    {
+      "frame": "sched_yield (utils.py:48)",
+      "weight": 15.305,
+      "pct": 65.18
+    },
+    {
+      "frame": "acquire_read (shm_broadcast.py:794)",
+      "weight": 2.925,
+      "pct": 12.46
+    },
+    {
+      "frame": "memory_fence (shm_broadcast.py:78)",
+      "weight": 1.275,
+      "pct": 5.43
+    },
+    {
+      "frame": "wait (shm_broadcast.py:204)",
+      "weight": 0.875,
+      "pct": 3.73
+    },
+    {
+      "frame": "memory_fence (shm_broadcast.py:95)",
+      "weight": 0.63,
+      "pct": 2.68
+    },
+    {
+      "frame": "check (shm_broadcast.py:774)",
+      "weight": 0.53,
+      "pct": 2.26
+    },
+    {
+      "frame": "wait (shm_broadcast.py:202)",
+      "weight": 0.255,
+      "pct": 1.09
+    },
+    {
+      "frame": "acquire_read (shm_broadcast.py:786)",
+      "weight": 0.25,
+      "pct": 1.06
+    },
+    {
+      "frame": "acquire_read (shm_broadcast.py:773)",
+      "weight": 0.23,
+      "pct": 0.98
+    },
+    {
+      "frame": "wait (shm_broadcast.py:203)",
+      "weight": 0.16,
+      "pct": 0.68
+    }
+  ],
+  "wait_pct": 98.42,
+  "work_pct": 1.58
+}

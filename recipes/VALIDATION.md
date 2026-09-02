@@ -2118,3 +2118,99 @@ trend itself, which is the other reason not to chase this further.
 **Not worth optimizing.** It only reaches a few percent on trivially short
 requests, and nothing about it degrades under load or context growth. Closing
 this thread rather than leaving it open.
+
+## Spinwait actually turned on: two new bugs on the way there, then a clean negative result
+
+Dig item #4 from the previous session's list. Goal: get `GLM53_SPINWAIT_MS=16`
+genuinely active (it never has been, per the finding above) and re-measure
+PR96's claim honestly instead of leaving it "inconclusive against a feature
+that was off."
+
+**Attempt 1 — run `patch_spinwait.py` before `vllm serve`, failed.**
+Crashed every relaunch:
+`PermissionError: ... '.shm_broadcast.py.glm53-spinwait.tmp'`. Root cause,
+distinct from the entrypoint/`start.sh` bypass already documented: `docker
+inspect` on the live container shows sparkrun runs it as `1000:1000`
+(the image itself has no `USER` directive, so this is sparkrun's own
+convention, presumably for `/models` bind-mount ownership) —
+`shm_broadcast.py` is `root:root 0644` in a `root:root 0755` directory,
+unwritable and unreplaceable by that uid. Even a recipe that correctly
+invoked `start.sh` would hit this same wall; the constraint is filesystem
+permissions, not which script performs the edit.
+
+**Fix — in-process monkeypatch instead of a source edit.** vLLM forks
+EngineCore/Worker as OS processes (confirmed:
+`envs.VLLM_WORKER_MULTIPROC_METHOD == "fork"`), and fork gives children a
+copy-on-write snapshot of the parent's memory, already-imported modules
+included. `SpinCondition.__init__` (the only place `busy_loop_s` is
+defined) has exactly one defaulted parameter, so
+`SpinCondition.__init__.__defaults__` is a 1-tuple — reassigning it before
+`vllm serve`'s own top-level process forks anything propagates the change
+to every child with zero file writes. `recipes/glm-5.3-flash-exl3-v2-spinwait.yaml`
+now writes this as a small shim to `/tmp` (writable) and launches
+`vllm.entrypoints.cli.main:main()` directly — the same function the real
+`vllm` executable calls, so argument parsing is unaffected.
+
+**Attempt 2 — the shim itself crashed the engine, a second, independent
+bug.** First version had no `if __name__ == "__main__":` guard. vLLM's
+API-server bootstrap turned out to use a `multiprocessing` **spawn**
+boundary above the fork-based EngineCore/Worker layer — separate from
+`VLLM_WORKER_MULTIPROC_METHOD`, which only governs the latter. `spawn`
+re-imports the launching script to reconstruct child state; with no guard,
+that re-import re-executed every top-level statement, including the
+`sys.exit(main())` call itself — so the "child" launched a second, fully
+independent `vllm serve` from inside what should have been a lightweight
+bootstrap. Visible in the log as a second complete startup banner and a
+second `[glm53-spinwait-monkeypatch]` line at a later timestamp, followed
+by `EngineCore initialization failed`. Standard fix: wrap the patch-and-run
+call in the guard. Confirmed by exact log-line counts: exactly one
+`[glm53-spinwait-monkeypatch]` line per node after the fix, versus two
+before.
+
+**Booted clean.** Verified with a real generation request, both nodes
+show exactly one patch-confirmation line.
+
+### The measurement, done honestly this time
+
+py-spy time-in-frame percentages **cannot distinguish real CPU burn from a
+blocked syscall** — both look like "the process is in this frame" to a
+wall-clock sampler, which is exactly the ambiguity a claim about *CPU*
+usage needs resolved. Added `probe_cpu_ticks.sh`, which reads
+`/proc/<pid>/stat` utime+stime deltas across an identical 900-token
+generation — actual CPU-seconds, not sampled frame occupancy — for both
+configs, same hardware, back-to-back:
+
+| Process | stock (busy_loop_s=1s) | patched (busy_loop_s=16ms) | change |
+|---|---:|---:|---:|
+| EngineCore | 98.5% of wall (1 core) | 99.8% of wall (1 core) | none (noise) |
+| Worker_TP0 | 200.1% of wall (2 cores) | 202.0% of wall (2 cores) | none (noise) |
+
+**No CPU reduction at all** — not a smaller effect than claimed, no effect.
+py-spy's frame composition did shift with the patch (e.g. Worker's
+`sched_yield` self-time share rose from 32.4% to 65.2%), consistent with
+the busy window genuinely getting shorter and the reader cycling more
+often — but total time spent across the whole spin-wait code path, and
+actual CPU-seconds consumed, did not move.
+
+Decode throughput, same three workloads as the pipeline-timing baseline,
+same live server, immediately before/after the swap:
+
+| Workload | stock decode tok/s | patched decode tok/s | change |
+|---|---:|---:|---:|
+| short prose | 26.46 | 27.29 | +3.1% |
+| structured (counting) | 30.85 | 31.03 | +0.6% |
+| medium summarize | 29.80 | 29.83 | ~0% |
+
+Small, plausibly-real gains roughly in line with PR96's own claimed +0.95%
+decode — the throughput half of the claim holds up reasonably. **The CPU
+half does not**, now that it has actually been tested rather than measured
+against a feature that was off.
+
+**Verdict: genuinely tested now, and it's a clean negative on the headline
+number.** Decode is a wash-to-slightly-better; the promised CPU win isn't
+there on this cluster's build/hardware. Not promoting `GLM53_SPINWAIT_MS`
+into the shipped recipe on this evidence — the earlier "inconclusive" was
+too generous; "doesn't reproduce" is the honest read. `VLLM_USE_SPINLOOP_EXT`
+(the native spin-loop extension, confirmed importable but disabled by
+default) is still an untested, independent lever on the same code path and
+remains open.

@@ -38,13 +38,45 @@
 # With busy_loop_s=1 and decode steps arriving every ~30 ms, the reader is
 # always inside the busy window, so it never reaches the zmq park path.
 #
-# THE ONLY CHANGE
+# ATTEMPT 1 (failed): `python3 /opt/glm53/patch_spinwait.py` before `vllm
+# serve`. This crashed on relaunch:
+#   PermissionError: [Errno 13] Permission denied:
+#   '.../device_communicators/.shm_broadcast.py.glm53-spinwait.tmp'
+# sparkrun runs this cluster's containers as uid:gid 1000:1000
+# (`docker inspect` on a live container: Config.User is empty on the image
+# itself — no USER directive — but the *running* container reports
+# `1000:1000`, i.e. sparkrun passes --user explicitly, most likely for
+# /models bind-mount ownership). shm_broadcast.py is root:root 0644 in a
+# root:root 0755 directory, so uid 1000 can neither edit it nor replace it.
+# This is a SEPARATE bug from the entrypoint/start.sh bypass documented
+# above: even a recipe that called start.sh's patch step directly would hit
+# this same wall, because the constraint is filesystem permissions, not
+# which script runs the patch.
 #
-# `python3 /opt/glm53/patch_spinwait.py` runs before `vllm serve`, on every
-# node, using the image's own patch tooling rather than a reimplementation.
-# It rewrites the source default to 0.016 and is idempotent (it recognises an
-# already-patched file and no-ops), so a relaunch is safe. Everything else
-# matches the shipped recipe exactly.
+# THE ACTUAL FIX: in-process monkeypatch, not a source edit
+#
+# vLLM forks EngineCore/Worker as OS processes rather than spawning fresh
+# Python interpreters (confirmed: envs.VLLM_WORKER_MULTIPROC_METHOD == "fork"
+# on this image). fork() gives each child a copy-on-write snapshot of the
+# parent's memory — including already-imported modules and any mutation
+# made to them — so a patch applied in the top-level `vllm serve` process
+# BEFORE it forks propagates to every worker without touching a single file
+# on disk. `SpinCondition.__init__` (shm_broadcast.py) has exactly one
+# defaulted parameter, so `SpinCondition.__init__.__defaults__` is a 1-tuple
+# `(1.0,)` — reassigning that tuple is the whole patch. `MessageQueue`
+# (the reader-facing class actually used at the call sites profiled above)
+# constructs `SpinCondition(...)` without passing `busy_loop_s` explicitly,
+# relying on this same default, so patching the one class covers both
+# readers profiled by py-spy.
+#
+# The command below writes a tiny shim to /tmp (writable by uid 1000),
+# which applies that one-line monkeypatch, relabels sys.argv[0] back to
+# "vllm" (argparse's `prog` is cosmetic — vllm's CLI main() takes its
+# subcommand and flags from sys.argv[1:] the same way whether launched via
+# the `vllm` console script or `python3 /tmp/shim.py`), and calls vLLM's own
+# `vllm.entrypoints.cli.main:main()` — the exact function the `vllm`
+# executable calls — so nothing about argument parsing or startup behavior
+# changes apart from the one default.
 #
 # Related but deliberately NOT changed here, to keep this single-variable:
 # VLLM_USE_SPINLOOP_EXT. The image ships a compiled native spin loop
@@ -102,9 +134,54 @@ defaults:
   speculative_config: '{"method":"mtp","num_speculative_tokens":2}'
 
 command: |
-  python3 /opt/glm53/patch_spinwait.py && \
-  grep -n 'busy_loop_s: float' /usr/local/lib/python3.12/dist-packages/vllm/distributed/device_communicators/shm_broadcast.py && \
-  vllm serve {model_path} \
+  cat > /tmp/glm53_spinwait_shim.py <<'PYSHIM'
+  # In-process replacement for patch_spinwait.py: this container's runtime
+  # user (uid 1000, per sparkrun) cannot write to the root-owned
+  # dist-packages tree, so the default is flipped in memory instead, before
+  # vLLM forks its EngineCore/Worker children (VLLM_WORKER_MULTIPROC_METHOD
+  # == "fork" on this image), which inherit it via copy-on-write. See the
+  # recipe header for why this is equivalent to the source-edit patch.
+  import os
+  import sys
+
+
+  def _patch_and_run():
+      import vllm.distributed.device_communicators.shm_broadcast as sb
+
+      target_ms = os.environ.get("GLM53_SPINWAIT_MS", "stock")
+      if target_ms != "stock":
+          old = sb.SpinCondition.__init__.__defaults__[0]
+          new = int(target_ms) / 1000.0
+          sb.SpinCondition.__init__.__defaults__ = (new,)
+          print(f"[glm53-spinwait-monkeypatch] SpinCondition busy_loop_s: "
+                f"{old} -> {new} ({target_ms} ms)", file=sys.stderr, flush=True)
+      else:
+          print("[glm53-spinwait-monkeypatch] GLM53_SPINWAIT_MS=stock, no change",
+                file=sys.stderr, flush=True)
+
+      sys.argv[0] = "vllm"
+      from vllm.entrypoints.cli.main import main
+      sys.exit(main())
+
+
+  # REQUIRED, not decorative: vLLM's API-server bootstrap uses a
+  # multiprocessing `spawn` boundary above the fork-based EngineCore/Worker
+  # layer (separate from VLLM_WORKER_MULTIPROC_METHOD, which only governs
+  # the latter). `spawn` re-imports this launching script to reconstruct
+  # child state. Without this guard, that re-import re-executes every
+  # top-level statement — including `_patch_and_run()` itself — so the
+  # child launches a second, fully independent `vllm serve` from inside
+  # what should be a lightweight bootstrap, which is what a first attempt
+  # here did (visible as a second "non-default args" banner and a second
+  # copy of this file's own [glm53-spinwait-monkeypatch] line at a later
+  # timestamp, immediately followed by `EngineCore initialization failed`).
+  # `__name__ == "__main__"` is true only for the original invocation, so
+  # gating on it is the standard fix for exactly this multiprocessing
+  # footgun — not specific to this shim.
+  if __name__ == "__main__":
+      _patch_and_run()
+  PYSHIM
+  python3 /tmp/glm53_spinwait_shim.py serve {model_path} \
       --served-model-name {served_model_name} \
       --host {host} --port {port} \
       --trust-remote-code \
