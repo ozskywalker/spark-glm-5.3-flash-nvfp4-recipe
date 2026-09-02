@@ -2364,3 +2364,169 @@ Restored production immediately (stop, flush, relaunch, verified with a real
 generation request). Flagging rather than concluding: if this recurs during
 similarly benchmark-heavy sessions, that pattern would be worth treating as
 a real lead rather than coincidence.
+
+## FP8 LM head: real hardware win confirmed, then a hard end-to-end failure
+
+Follow-up to the bf16-vs-fp8 scoping question above. Goal: get from "here's
+what it would take" to an actual patched boot with a real quality check.
+
+### Attention/MLP-shaped FP8: bigger and more genuinely Blackwell-native than the LM head
+
+Same isolated-benchmark methodology as the LM head test, applied to this
+checkpoint's real MLA attention and MLP dense-layer shapes (TP=2 per-rank):
+
+| Layer | weight | bf16 | fp8 | speedup | fp8 kernel |
+|---|---:|---:|---:|---:|---|
+| `q_a_proj` [4096→1536] | 12.6 MB | 19.0us | 13.4us | 1.41x | `nvjet_sm121_..._tmaAB` |
+| `kv_a_proj` [4096→512] | 4.2 MB | 11.7us | 8.5us | 1.38x | `nvjet_sm121_..._tmaAB` |
+| `q_b_proj` [1536→8192] | 25.2 MB | 77.9us | 76.1us | 1.02x | `nvjet_sm121_..._tmaAB` |
+| `kv_b_proj` [512→16384] | 16.8 MB | 48.8us | 21.6us | **2.26x** | `nvjet_sm121_..._tmaAB` |
+| `o_proj` [8192→4096] | 67.1 MB | 313.4us | 170.2us | 1.84x | `nvjet_sm121_..._tmaAB` |
+| MLP gate/up [4096→6144] | 50.3 MB | 249.6us | 91.0us | **2.74x** | `nvjet_sm121_..._tmaAB` |
+
+**These dispatch genuinely SM121-native kernels** (`nvjet_sm121_qqtst_mma_..._tmaAB`,
+using TMA — a real Blackwell code path), unlike the LM head's own fp8 kernel,
+which fell back to an SM89-targeted one. Five of six shapes show real,
+sometimes better-than-2x speedups (MLP gate/up: 2.74x — beyond what halving
+bytes alone predicts, meaning the fp8 kernel is also more *efficient* here,
+not just moving less data). `q_b_proj` is the outlier at 1.02x, not yet
+explained. This is a substantially better result than the LM head's 1.54x —
+worth its own follow-up regardless of what happened below.
+
+### Real-checkpoint validation (before booting anything)
+
+Loaded this checkpoint's actual `lm_head.weight` and layer 3's real MLA
+attention weights (layer 3 confirmed via `model.safetensors.index.json` as
+one of 12 MLA layers out of 45 — the other 34 use mamba/gated-linear
+attention) directly via `safetensors.safe_open`, no synthetic data:
+
+- **Zero outlier channels** (>10x mean magnitude) in any checked tensor —
+  the classic per-tensor-FP8 failure mode (a few extreme-magnitude channels
+  crushing everyone else's precision) doesn't apply here.
+- LM head fp8 vs fp32 reference (random probe activations): 100% argmax
+  agreement, 93.3% top-10 overlap, matching bf16's own 100%/100%.
+- Attention-layer intermediate projections showed lower "argmax agreement"
+  under fp8 (66.7% on some), but **so did bf16 on the same layers** — this
+  metric isn't meaningful for intermediate hidden states (argmax over an
+  arbitrary feature vector has no natural interpretation, unlike logits).
+  Correctly read as "isolated synthetic-activation testing has hit its
+  limit here," not as a quality signal either way.
+
+This all pointed toward "worth a real boot" — and vLLM's own
+`cutlass_fp8_supported()` / `cutlass_block_fp8_supported()` both confirmed
+`True` for SM121 beforehand, per the earlier scoping conversation.
+
+### Two multiprocessing bugs before the patch even reached the right layer
+
+Recipe: `recipes/glm-5.3-flash-exl3-v2-fp8-lmhead.yaml`. Same in-process
+monkeypatch technique validated for the spinwait fix (`Exl3Config` lives in
+root-owned site-packages; this container runs as uid 1000 per sparkrun, so
+no file on disk gets edited) — wraps `Exl3Config.get_quant_method()` to
+route the LM head through vLLM's own `Fp8LinearMethod`
+(`is_checkpoint_fp8_serialized=False`, `activation_scheme="dynamic"`;
+`weight_block_size` must be `None` — vLLM's `Fp8Config` rejects block-wise
+scaling unless the checkpoint is already fp8-serialized, so per-tensor
+dynamic isn't a compromise, it's the only scheme this load-time approach
+can use).
+
+**Attempt 1**: `isinstance(layer, LinearBase)` as the gate. Booted clean,
+generated real (if untested) text — but silently did nothing. No "routing"
+log line ever appeared; GPU memory usage was *higher* than the bf16
+baseline (88.34 GiB vs ~86.48 GiB), not lower. Root cause: `ParallelLMHead`
+is **not** a `LinearBase` subclass (MRO: `ParallelLMHead` →
+`VocabParallelEmbedding` → `PluggableLayer` → `Module`) — confirmed
+directly (`issubclass(ParallelLMHead, LinearBase)` → `False`). The
+isinstance check silently excluded the one layer this whole recipe exists
+to patch.
+
+**Attempt 2**: widened the check to `isinstance(layer, (LinearBase,
+ParallelLMHead))`. Verified this is architecturally sound before
+relaunching: `Fp8LinearMethod.create_weights`'s positional signature
+(`input_size_per_partition, output_partition_sizes, input_size,
+output_size, params_dtype`) lines up exactly with how
+`VocabParallelEmbedding.__init__` calls `quant_method.create_weights`, and
+vLLM's own source explicitly exempts `ParallelLMHead` from the "quant
+method must implement `.embedding()`" requirement it enforces for real
+embedding layers. Should have worked — **still didn't fire, zero times,
+for any layer at all**, confirmed with an unconditional debug print inside
+the patched method (not even `RoutedExperts`, which every boot this whole
+project has ever done proves gets a real `get_quant_method` call).
+
+Root cause: the `if __name__ == "__main__":` guard that fixed the
+*previous* recipe's fork-bomb bug (see the spinwait section above) was
+gating the wrong thing here. Two separate multiprocessing boundaries are in
+play — (1) vLLM's API-server bootstrap crosses a `multiprocessing.spawn`
+boundary that re-imports the launching script as a module, and (2)
+EngineCore/Worker — where model construction and `get_quant_method` calls
+actually happen — are **forked from that spawned child**, not from the
+original top-level invocation. Gating the patch call itself behind
+`__main__` (matching the spinwait shim's structure exactly) meant the
+spawned child, which re-imports the file with `__name__ != "__main__"`,
+never applied the patch at all — and everything forked from it inherited
+the unpatched class. The spinwait patch never hit this because
+`shm_broadcast` gets used by the original top-level process directly, not
+only inside the spawned/forked descendants.
+
+**Fix**: split the two concerns. The monkeypatch itself now runs
+unconditionally at import time (every process that loads this file gets
+it, `__main__` or not); only the actual `vllm.entrypoints.cli.main:main()`
+call stays behind the `__main__` guard, so vLLM still only launches once.
+Confirmed working via a `pid`/`__name__` tag on the confirmation log line:
+patched in 3 separate processes this boot (`pid=75 __main__`, `pid=175
+__mp_main__`, `pid=207 __mp_main__`), and the routing line finally fired
+for the real layer: `routing 'language_model.lm_head' (ParallelLMHead)
+through Fp8LinearMethod`.
+
+### It booted, CUDA graphs captured clean, memory dropped — and output was garbage
+
+With the patch actually reaching the right layer: booted without error,
+`Graph capturing finished in 5 secs, took 0.37 GiB` (CUDA graph capture
+survives fine), and consumed weight memory dropped to 83.99 GiB (down from
+~86.48 GiB baseline and the two broken attempts' 88-89 GiB) — real
+confirmation the fp8 path was structurally active this time.
+
+**Every single generated response was garbage** —
+`����...` (Unicode replacement characters, meaning
+invalid/nonsensical token IDs) followed by unrelated repeated letters.
+Reproduced on two separate prompts, `finish_reason: length` both times (it
+ran to the token cap rather than hitting a stop token, consistent with
+totally incoherent logits rather than a formatting quirk). This is total
+failure, not subtle degradation — the isolated real-weight correctness
+check earlier in this session (100% argmax agreement) did not predict it,
+because that check used synthetic random activations, not real hidden
+states from an actual 45-layer forward pass.
+
+**Root cause, found by reading `create_fp8_weight_parameter`** (not yet
+independently reproduced in isolation, so flagged as a strong hypothesis,
+not a fully closed loop): it allocates the weight parameter as
+`torch.float8_e4m3fn` **from the start** —
+`torch.empty(..., dtype=torch.float8_e4m3fn)` — before any weight data has
+been loaded. Standard vLLM weight loading then copies the checkpoint's
+bf16 tensor into this fp8-typed parameter, which means an implicit,
+**unscaled** dtype cast happens at load time, before
+`process_weights_after_loading` ever gets a chance to compute a proper
+scale. This checkpoint's real lm_head weights are small in magnitude
+(max ≈0.22, mean ≈0.015-0.02, confirmed directly from the safetensors
+data) — right down in e4m3's subnormal range, where a handful of mantissa
+bits leaves almost no usable precision without first scaling the values up
+into e4m3's useful dynamic range (up to ±448). A naive unscaled cast at
+those magnitudes doesn't lose a little precision, it destroys nearly all
+of it. `Fp8LinearMethod`, used this way — attached directly to a layer via
+a patched `get_quant_method`, bypassing whatever the real `--quantization
+fp8` top-level CLI flag's own model-loading integration does — appears to
+assume either an already-fp8-serialized checkpoint or a scale-aware
+weight-loading path that a bare per-layer monkeypatch doesn't provide.
+
+**Verdict: the hardware/kernel case for fp8 remains strong (confirmed real
+speedups, genuinely SM121-native kernels on 5 of 6 attention/MLP shapes),
+but this specific implementation path — attach `Fp8LinearMethod` directly
+via a patched `get_quant_method`, dynamic/per-tensor, no checkpoint
+changes — does not work as built.** The likely fix is either a custom
+weight loader that stages through bf16 and computes+applies a scale before
+casting (replicating what a genuine `--quantization fp8` model-loading
+integration presumably does), or accepting that real fp8 serving needs an
+actual offline-converted, scale-calibrated checkpoint (AutoFP8/
+llm-compressor-style) rather than a live monkeypatch — which is also the
+more standard way production fp8 deployments are done. Not attempted
+further this session. Production restored and verified after every attempt
+in this section; nothing here shipped.

@@ -1,0 +1,230 @@
+# Recipe: GLM-5.3-Flash EXL3 v2 with the LM head dynamically quantized to FP8
+#
+# *** EXPERIMENT — tests the bf16->fp8 pivot from the Blackwell-kernel
+# investigation (VALIDATION.md "The Blackwell-kernel lead investigated") ***
+#
+# BACKGROUND
+#
+# That investigation found this checkpoint's EXL3 quantization covers only
+# `RoutedExperts` — every other Linear layer (attention projections, the
+# router, the LM head) runs bf16 by the checkpoint's own declared design
+# (`"scope": "glm53_routed_experts_only"`, confirmed in config.json), and
+# that those bf16 GEMMs are memory-bandwidth-bound on this hardware, not
+# compute-bound. Halving the bytes read should roughly halve their time.
+#
+# Confirmed directly on this node before writing this recipe (see
+# VALIDATION.md for the full numbers, not repeated here):
+#   - SM121 has genuine tensor-core FP8 support: vLLM's own
+#     `cutlass_fp8_supported()` returns True, and `torch._scaled_mm`
+#     dispatches a real e4m3 tensor-core kernel, not a dequant fallback.
+#   - LM head shape ([M,4096]x[4096,77440]): 1.54x measured speedup.
+#   - Attention/MLP shapes: 1.4x-2.74x, using genuinely SM121-native
+#     `nvjet_sm121_..._tmaAB` kernels (TMA-based) — better than the LM
+#     head's own kernel, which falls back to an SM89-targeted kernel for
+#     reasons not yet root-caused.
+#   - Real-weight check (this checkpoint's actual lm_head.weight and layer
+#     3's MLA attention weights, loaded via safetensors, not synthetic
+#     data): zero outlier channels (>10x mean) in any checked tensor, LM
+#     head fp8 gives 100% argmax agreement / 93.3% top-10 overlap on
+#     random probe activations. Isolated intermediate-layer checks
+#     (q_b_proj etc.) were inconclusive by design — argmax over an
+#     arbitrary hidden-state vector isn't a meaningful metric, only real
+#     end-to-end generation quality is, which is what this recipe is for.
+#
+# SCOPE: LM HEAD ONLY, DELIBERATELY
+#
+# Not attention, not MLP — one variable at a time, per this project's
+# established discipline. The LM head is the easiest layer to reason about
+# in isolation (its output IS the thing quality gets judged on directly —
+# logits, sampling, generated text) and the smallest blast radius if
+# something's wrong. If this holds up, attention/MLP are the larger,
+# separate follow-up (their combined kernel-time share was ~30.8% vs the
+# LM head's ~9.5%, per the kernel-trace breakdown in VALIDATION.md).
+#
+# HOW: an in-process monkeypatch, not a checkpoint conversion
+#
+# `Exl3Config.get_quant_method()` returns `UnquantizedLinearMethod()` for
+# every non-expert `LinearBase` layer, source-unmodified (site-packages is
+# root-owned; this container runs as uid 1000 per sparkrun, so — same
+# constraint hit and solved for the spinwait patch — no file on disk gets
+# edited). This shim wraps that method: for any layer whose `prefix`
+# contains "lm_head", it returns vLLM's own `Fp8LinearMethod` instead,
+# configured for DYNAMIC quantization (`is_checkpoint_fp8_serialized=False`,
+# `activation_scheme="dynamic"`) — weights are quantized once at load time
+# from the existing bf16 checkpoint, no new files, no offline conversion.
+# `weight_block_size` is deliberately left `None`: vLLM's own Fp8Config
+# rejects block-wise scaling unless `is_checkpoint_fp8_serialized=True`
+# (block quant needs a checkpoint pre-converted to blocked fp8 on disk) —
+# per-tensor dynamic is not a compromise here, it is the only scheme this
+# load-time approach can use, and it's what every correctness check above
+# already used.
+#
+# Same fork-before-monkeypatch technique validated for the spinwait fix:
+# vLLM's EngineCore/Worker children inherit the patched class via
+# copy-on-write (`VLLM_WORKER_MULTIPROC_METHOD=fork`), and the shim is
+# guarded by `if __name__ == "__main__":` so the API-server's own internal
+# `multiprocessing.spawn` boundary (which re-imports this launching script)
+# doesn't re-run the patch-and-launch code a second time — the exact bug
+# that cost a boot cycle on the spinwait recipe.
+#
+# WHAT TO CHECK ON BOOT
+#
+# 1. Boots at all — Fp8LinearMethod's create_weights/process_weights_after_
+#    loading path has never been exercised against this model's actual
+#    lm_head shape before.
+# 2. CUDA graph capture succeeds for the LM head's forward — this is the
+#    open question from the goal ("confirm it survives CUDA graph
+#    capture"); vLLM captures the sampler/logits step as part of its
+#    normal graph, so a shape or dtype mismatch here would show up as a
+#    capture-time failure, not a silent one.
+# 3. Full probe suite (sanity, soak, longctx) plus a real quality read —
+#    coherent multi-turn output, not just "the graph replays".
+# 4. Decode/TTFT numbers against the shipped bf16-lm-head baseline.
+
+recipe_version: "2"
+name: GLM-5.3-Flash-EXL3-v2-FP8-LMHead
+description: EXL3 v2 with the LM head dynamically quantized to FP8 (per-tensor, load-time) via an in-process monkeypatch of Exl3Config.get_quant_method — everything else unchanged from the shipped v2 recipe
+
+model: Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw
+runtime: vllm
+container: glm53-exl3-v2:c190db1
+
+min_nodes: 2
+
+cluster_config:
+  resolved_model_path: /models
+
+executor_config:
+  entrypoint: ""
+  auto_remove: false
+
+env:
+  TORCH_CUDA_ARCH_LIST: 12.1a
+  FLASHINFER_CUDA_ARCH_LIST: 12.1a
+  FLASHINFER_DISABLE_VERSION_CHECK: "1"
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+  NCCL_DEBUG: WARN
+  TORCH_NCCL_ASYNC_ERROR_HANDLING: "1"
+  EXL3_FUSED_MOE: "1"
+  GLM53_SUPPRESS_STOPS_IN_REASONING: "1"
+  GLM53_MIXED_PREFILL_CHUNK: skip
+  EXL3_FAT_KERNEL: "1"
+  EXL3_MOE_ROW_TILE: "0"
+  GLM53_INDEXER_WORKSPACE: rightsize
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  served_model_name: glm-5.3-flash-exl3-v2
+  tensor_parallel: 2
+  model_path: /models/models--Mia-AiLab--GLM-5.3-Flash-EXL3-TR3-4bpw/snapshots/024db9f7e9871e8efdf21538ba55af7442be3cd5
+  quantization: exl3
+  max_model_len: 262144
+  max_num_seqs: 4
+  gpu_memory_utilization: 0.86
+  kv_cache_dtype: fp8
+  max_num_batched_tokens: 7168
+  limit_mm: '{"image":4,"video":1}'
+  default_chat_template_kwargs: '{"enable_thinking": false}'
+  speculative_config: '{"method":"mtp","num_speculative_tokens":2}'
+
+command: |
+  cat > /tmp/glm53_fp8_lmhead_shim.py <<'PYSHIM'
+  # See recipe header for the full rationale.
+  #
+  # TWO SEPARATE multiprocessing boundaries matter here, and conflating
+  # them cost two boot cycles before this shape was right:
+  #
+  #   1. vLLM's API-server bootstrap crosses a `multiprocessing.spawn`
+  #      boundary that RE-IMPORTS this launching script as a module
+  #      (confirmed directly: with the patch-and-launch call unguarded, a
+  #      second complete "non-default args" banner and a second copy of
+  #      this shim's own log line appeared at a later timestamp, followed
+  #      by "EngineCore initialization failed" — the exact bug the
+  #      spinwait shim hit and fixed with `if __name__ == "__main__":`).
+  #   2. EngineCore/Worker — where model construction and
+  #      `get_quant_method` calls actually happen — are FORKED
+  #      (`VLLM_WORKER_MULTIPROC_METHOD=fork`) from *that spawned child*,
+  #      not from this file's original top-level invocation.
+  #
+  # A naive `if __name__ == "__main__": patch(); main()` (what the first
+  # two attempts here did) fixes (1) correctly but silently reintroduces a
+  # different failure: the patch call is now INSIDE the guard, so the
+  # spawned child that re-imports this module (__name__ != "__main__"
+  # there) never applies it — and everything forked from that child
+  # inherits the *unpatched* class. Confirmed directly: an unconditional
+  # debug print inside the patched method fired zero times across an
+  # entire boot, including for RoutedExperts layers that this project's
+  # own validation history proves get_quant_method DOES handle every time
+  # this image boots — proof the call was happening somewhere this
+  # process's patch never reached.
+  #
+  # Fix: patch at IMPORT TIME (runs in every process that re-imports this
+  # file, spawned or not); keep only the actual `main()` launch behind the
+  # `__main__` guard, so vLLM only starts once.
+  import sys
+
+  from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
+  from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+  from vllm.model_executor.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
+  from vllm.model_executor.layers.quantization.exl3 import Exl3Config
+
+  # ParallelLMHead is NOT a LinearBase subclass (MRO: ParallelLMHead ->
+  # VocabParallelEmbedding -> PluggableLayer -> Module) — an
+  # isinstance(layer, LinearBase) check alone silently misses it.
+  # Fp8LinearMethod.create_weights' positional signature
+  # (input_size_per_partition, output_partition_sizes, input_size,
+  # output_size, params_dtype) lines up exactly with how
+  # VocabParallelEmbedding.__init__ calls quant_method.create_weights, and
+  # vLLM's own source explicitly exempts ParallelLMHead from the "quant
+  # method must implement .embedding()" requirement it enforces for real
+  # embedding layers — this checkpoint also has tie_word_embeddings=False,
+  # so lm_head and embed_tokens are separate modules and only lm_head's
+  # quant_method is touched here.
+  _fp8_config = Fp8Config(
+      is_checkpoint_fp8_serialized=False,
+      activation_scheme="dynamic",
+      weight_block_size=None,
+  )
+  _original_get_quant_method = Exl3Config.get_quant_method
+
+
+  def _patched_get_quant_method(self, layer, prefix):
+      if isinstance(layer, (LinearBase, ParallelLMHead)) and "lm_head" in prefix:
+          print(f"[glm53-fp8-lmhead] routing '{prefix}' ({type(layer).__name__}) "
+                f"through Fp8LinearMethod (dynamic, per-tensor)", file=sys.stderr, flush=True)
+          return Fp8LinearMethod(_fp8_config)
+      return _original_get_quant_method(self, layer, prefix)
+
+
+  Exl3Config.get_quant_method = _patched_get_quant_method
+  print(f"[glm53-fp8-lmhead] Exl3Config.get_quant_method patched (pid={__import__('os').getpid()}, "
+        f"__name__={__name__!r})", file=sys.stderr, flush=True)
+
+  if __name__ == "__main__":
+      sys.argv[0] = "vllm"
+      from vllm.entrypoints.cli.main import main
+      sys.exit(main())
+  PYSHIM
+  python3 /tmp/glm53_fp8_lmhead_shim.py serve {model_path} \
+      --served-model-name {served_model_name} \
+      --host {host} --port {port} \
+      --trust-remote-code \
+      --tensor-parallel-size {tensor_parallel} \
+      --quantization {quantization} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} \
+      --kv-cache-dtype {kv_cache_dtype} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --speculative-config '{speculative_config}' \
+      --tool-call-parser glm47 --enable-auto-tool-choice \
+      --reasoning-parser glm45 \
+      --enable-prefix-caching \
+      --no-enable-flashinfer-autotune \
+      --skip-mm-profiling \
+      --limit-mm-per-prompt '{limit_mm}' \
+      --chat-template /opt/glm53/chat_template.jinja \
+      --default-chat-template-kwargs '{default_chat_template_kwargs}' \
+      --distributed-executor-backend mp
