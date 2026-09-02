@@ -2692,3 +2692,34 @@ left running as the active experiment while #3 (per-channel scaling) and
 plan agreed this session. `glm-5.3-flash-exl3-v2-fp8-lmhead.yaml` (v1) is
 kept as-is, with its header now historical — the bug it exposed is real and
 well-documented, this is simply the fix.
+
+## FP8 LM head, attempt #3: per-channel scaling — no measurable difference from per-tensor
+
+Same recipe, `GLM53_FP8_LMHEAD_SCALE_MODE=channel` (env override, no
+rebuild). One shape bug caught before booting by reading vLLM's own kernel
+padding code rather than trusting the `cutlass_scaled_mm` docstring's
+broadcast description: the docstring implies `scale_b` for a `[K,N]`
+weight should be `[1,N]`, but `CutlassFP8ScaledMMLinearKernel.process_
+weights_after_loading`'s own padding logic (`.view(-1, *weight_scale.shape
+[1:])` after flattening) only reshapes cleanly if the real convention is
+`[N,1]` — confirmed against real executable code, not documentation, before
+spending a boot cycle on it.
+
+Booted clean: `scale_shape=(77440, 1)`, `scale_range=[8.99e-05, 4.82e-04]`
+— a genuine >5x spread across vocab rows, so there IS real per-row
+variation for per-channel scaling to capture. CUDA graphs captured (5s,
+0.36 GiB). Quality check: identical coherent output to per-tensor mode on
+the same prompt. `probe_sanity.py`: **ALL PASSED**, decode 27.66-29.04
+tok/s (median 28.64) — statistically indistinguishable from per-tensor's
+25.8-28.28 (median 27.25).
+
+**Verdict: no measurable win from per-channel over per-tensor, on this
+layer.** Consistent with the original correctness check's finding of zero
+outlier channels (>10x mean) in `lm_head.weight` — the checkpoint's actual
+weight distribution is well-behaved enough that a single global scale
+already captures nearly all the precision per-channel could add. Not worth
+carrying the extra complexity for this layer; per-tensor (attempt #2)
+remains the simpler, equally-correct choice. Skipped a full soak/longctx
+re-run here — the underlying mechanism is identical to the already
+fully-validated #2, and the only variable (scale granularity) shows no
+signal worth chasing further with more probe time.

@@ -234,22 +234,38 @@ command: |
           w32 = w.to(torch.float32)
 
           if _SCALE_MODE == "channel":
-              # Per output row (per vocab token for lm_head): shape [N, 1].
-              scale = (w32.abs().amax(dim=1, keepdim=True) / 448.0).clamp(min=1e-12)
+              # Per output row (per vocab token for lm_head). w32 is [N, K]
+              # here (pre-transpose), so the scale used to DIVIDE it must be
+              # [N, 1] to broadcast correctly per row.
+              scale_div = (w32.abs().amax(dim=1, keepdim=True) / 448.0).clamp(min=1e-12)
           else:
               # Per-tensor: a single scalar for the whole weight.
-              scale = (w32.abs().amax() / 448.0).clamp(min=1e-12).reshape(1)
+              scale_div = (w32.abs().amax() / 448.0).clamp(min=1e-12).reshape(1)
 
-          wq = (w32 / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+          wq = (w32 / scale_div).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+
+          # weight_scale is stored as [N, 1] for channel mode -- NOT [1, N]
+          # -- even after weight is transposed to [K, N] below. Confirmed
+          # from vLLM's own kernel-level padding code (not just the
+          # cutlass_scaled_mm docstring, which describes a Python-broadcast
+          # equivalence that doesn't literally hold for [N,1] against
+          # [K,N]): CutlassFP8ScaledMMLinearKernel.process_weights_after_
+          # loading pads a per-channel scale by flattening, padding dim 0,
+          # then `.view(-1, *weight_scale.shape[1:])` -- that reshape only
+          # divides evenly when the original shape's trailing dim is 1, i.e.
+          # the real convention is [N, 1]. The native cutlass_scaled_mm
+          # binding applies it as N per-output-column scales directly, not
+          # via a literal torch broadcast against B's [K, N] shape.
+          scale_store = scale_div
 
           replace_parameter(layer, "weight", wq.t())
-          layer.weight_scale = torch.nn.Parameter(scale.to(torch.float32), requires_grad=False)
+          layer.weight_scale = torch.nn.Parameter(scale_store.to(torch.float32), requires_grad=False)
           layer.input_scale = None
 
           print(
               f"[glm53-fp8-lmhead-v2] quantized weight scale_mode={_SCALE_MODE} "
-              f"scale_shape={tuple(scale.shape)} scale_range=[{scale.min().item():.6g}, "
-              f"{scale.max().item():.6g}] weight_max_before={w32.abs().max().item():.4f}",
+              f"scale_shape={tuple(scale_store.shape)} scale_range=[{scale_store.min().item():.6g}, "
+              f"{scale_store.max().item():.6g}] weight_max_before={w32.abs().max().item():.4f}",
               file=sys.stderr, flush=True,
           )
 
