@@ -2530,3 +2530,65 @@ llm-compressor-style) rather than a live monkeypatch — which is also the
 more standard way production fp8 deployments are done. Not attempted
 further this session. Production restored and verified after every attempt
 in this section; nothing here shipped.
+
+### Full probe suite, run through to completion against the known-broken build
+
+The write-up above stopped at two ad-hoc curl checks once garbage output
+was confirmed and reproduced. Went back and ran the actual project probe
+suite against the same fp8-lmhead boot anyway — partly because "quality
+check" deserves the same standard tooling this project uses for every
+other recipe, not ad-hoc curl, and partly because a formal run surfaced
+real information the curl checks didn't: which specific mechanisms survive
+the corrupted LM head and which don't.
+
+**`probe_sanity.py`** — 3 of 9 checks failed, and the *pattern* of what
+passed is the useful part:
+
+```
+[PASS] models-lists-served-id / metrics-enabled / chat-nonempty
+[FAIL] chat-finish-stop — finish_reason=length (never predicts a stop token)
+[FAIL] chat-coherent — garbage (Unicode replacement chars)
+[PASS] stream-first-token — ttft=0.30s (matches the healthy baseline)
+[PASS] stream-usage
+[FAIL] stream-counts — can't even count 1 to 5
+```
+
+Every structural/mechanical check passes (routing, streaming, usage
+accounting, TTFT); every check that touches actual generated content
+fails. **Decode throughput also collapsed**: 11.6-11.7 tok/s across three
+bench runs, versus the healthy baseline's 25-31 tok/s — a new finding the
+earlier ad-hoc checks didn't surface. The likely mechanism: MTP's draft
+model still predicts against the *original* (undamaged) hidden-state
+distribution, but the corrupted LM head means the target model's verified
+tokens no longer match those drafts, so acceptance collapses toward zero
+and decode falls back to slow single-token-per-step generation on top of
+already-wrong output.
+
+**`probe_soak.py`** — **PASSED**, all 7 checks, including
+`endpoint-alive-after-soak`. Worth stating plainly so this isn't
+misread out of context: soak only checks that requests complete without
+crashing or timing out and the server survives concurrent load — it has
+no content-correctness check. A soak pass here means "the broken model
+serves garbage stably," not "the model works." The two probes are
+answering different questions and both results are exactly what a correct
+run should show.
+
+**`probe_longctx.py`** (100K tokens, matching the scale used throughout
+this file): **TTFT 83.3s — matches the healthy baseline's 83.4s at the same
+context length almost exactly**, and `prompt-tokens-near-target` passed.
+This is the most precise localization in this whole investigation: prefill
+and context-handling are completely unaffected by the fp8 LM head patch,
+exactly as the architecture predicts (prefill only touches the LM head
+once, for the first generated token's logits — the other 45 layers of
+actual context processing never go near it). `finish-stop` and
+`codes-retrieved` (0/4) failed for the same reason as every other content
+check. The damage is precisely isolated to the LM head's own weight, not
+anything upstream.
+
+**Net effect of running the full suite**: the conclusion is unchanged (this
+implementation doesn't work, root cause is the unscaled fp8 cast) but now
+backed by the project's standard tooling rather than two curl calls, with
+two genuinely new findings — the decode-throughput collapse via broken
+speculative-decode acceptance, and the clean prefill/decode damage
+boundary. Production restored and re-verified with a real generation
+request after this run, same as every other attempt in this section.
