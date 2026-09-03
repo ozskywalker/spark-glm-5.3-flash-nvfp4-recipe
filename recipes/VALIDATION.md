@@ -3576,3 +3576,63 @@ validation is about confirming safe deployment, not re-litigating whether
 to apply an already-correct upstream fix.
 
 **v8 promoted to default 2026-09-03.**
+
+## A FOURTH production crash, ~18 minutes after v8 went live: new shape, strongest lead yet on the #54317 pattern
+
+Same generic surface as every crash today: "Worker proc VllmWorker-0 died
+unexpectedly (exit code: None)" -> `EngineDeadError` -> `RuntimeError:
+cancelled`. But the scheduler dump this time rules out all four bugs
+already fixed today:
+
+- `scheduled_new_reqs`: **one** brand-new request, `prompt_token_ids_len=
+  531`, `num_computed_tokens=0` -- first prefill step of an ordinary short
+  prompt. Not v7's large-prefill trigger (needs ~18K+ tokens), not v5's
+  long-generation trigger (needs ~2.2K *generated* tokens, here zero),
+  not Crash B's long-multi-turn shape (85K computed tokens, here zero).
+- `scheduled_cached_reqs`: empty. `num_running_reqs=1`,
+  `num_waiting_reqs=0`. No concurrent batching at all.
+- `kv_cache_usage=0.025`. Nowhere near capacity.
+- No CUDA traceback -- same "silent NVRM kill" signature as Crash B.
+  Checked `dmesg -T` on both nodes for a correlated Xid/MMU-fault entry
+  around the crash timestamp (21:14:37): **nothing** -- the most recent
+  Xid-class entry on either node was hours earlier. The worker just
+  vanished, no kernel-level fault logged at all, consistent with this
+  platform's known silent-kill behavior.
+
+**What's new and more useful this time**: the log lines immediately
+before the crash --
+
+```
+21:14:13  TileLang begins to compile kernel `mhc_pre_big_fuse_with_norm_tilelang`
+21:14:17  TileLang completes to compile kernel `mhc_pre_big_fuse_with_norm_tilelang`
+21:14:37  Worker proc VllmWorker-0 died unexpectedly (exit code: None)
+```
+
+20 seconds after a TileLang JIT compile of `mhc_pre_big_fuse_with_norm_
+tilelang` finishes, the worker dies. TileLang JIT-compiles per unique
+shape/config, so this was plausibly the first time since boot a request
+hit this exact kernel shape -- consistent with why 20+ minutes of prior
+probe traffic (`probe_sanity.py`, `probe_longctx.py` at 85K tokens,
+`probe_soak.py`'s mixed concurrent load) didn't trigger it: none of those
+happened to need this particular compiled shape.
+
+This is a materially stronger match to vllm-project/vllm#54317 than
+Crash B was -- that issue names three kernel families
+("KDA linear-attention, **MHC TileLang**, TRT-LLM fused MoE"), and this
+crash lands right on a fresh compile of an MHC TileLang kernel by name,
+not just "the general subsystem." Searched for anything more specific
+tied to this exact kernel (`mhc_pre_big_fuse_with_norm_tilelang`,
+upstream in `deepseek-ai/TileKernels`): found one open issue there
+(`deepseek-ai/TileKernels#22`, "`mhc_pre` ignores `norm_weight` in the
+no-grad fused path") but it's a silent-numerical-correctness bug (wrong
+values, not a memory-safety issue) -- unrelated to a crash, ruled out.
+No crash-specific fix found anywhere for this kernel.
+
+**No patch attempted** -- same reasoning as Crash B: no code-level lead
+to fix, only a much better-specified correlation. Restored via
+stop/flush/relaunch (same v8 recipe -- nothing here implicates the v8
+Mamba-race patch itself, wrong subsystem entirely). Given this is the
+THIRD silent-kill incident in one production day with no available
+code-level fix (Crash B and this one), an automated watchdog for faster
+detection+recovery is worth doing regardless of whether a root cause is
+ever found -- proposed to the user, not yet built.
