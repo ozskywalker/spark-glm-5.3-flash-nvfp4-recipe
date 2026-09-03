@@ -2981,3 +2981,40 @@ numbers, no regression from the fix.
 how directly this bug applies to real usage (any sufficiently long
 generation, not an edge case), this took priority over the throughput
 investigation items still open.
+
+## Unexplained production shutdown during the long-context concurrency sweep (2026-09-03, 01:10)
+
+Started `probe_longctx_concurrency.py` against the freshly-promoted v5
+(2 concurrent 20K-token prefills, the first of 6 planned cells). At
+01:10:22 — mid-request — the API server logged a completely clean,
+graceful shutdown sequence (`[shutdown] API server: shutdown triggered`
+-> SIGTERM to EngineCore -> HTTP server shutdown -> `Application shutdown
+complete`), no traceback, no CUDA error, no OOM
+(`docker inspect --format '{{.State.OOMKilled}}'` -> `false`). The
+container itself never died (`docker ps` showed it still "Up", just the
+server process inside was gone) — an external SIGTERM, not an engine
+crash. `journalctl`/`dmesg` on the node were inaccessible from this
+session (permission-restricted) so the actual sender could not be
+identified this time either.
+
+**This is now the THIRD occurrence of this exact signature in this
+project's history**: once noted in the v2 recipe's own header (during
+multimodal warmup, sender never identified), once during this session's
+first fp8-lmhead-v2 boot (traced that time to this tooling session's own
+background-task reaping of a long-running foreground launch — fixed by
+switching to `setsid nohup ... & disown` for all subsequent launches),
+and now this third time, well after a stable 26-minute boot, during
+legitimate concurrent read load. The tooling-reaping explanation from the
+second occurrence does NOT apply here (the launch itself had completed
+and been serving successfully for 26 minutes). `fleet_watchdog.sh`
+(this repo's own auto-recovery script) was checked and ruled out — it
+targets an entirely different, inactive topology (TP4/4-node,
+`vllm_glm53` container naming) and was not running.
+
+Restored via stop/flush/relaunch, reverified with a real generation
+request. Not treated as a regression from anything shipped this
+session (the shutdown sequence is textbook external-SIGTERM, structurally
+distinct from the K-pool tail crash just fixed, which would show a CUDA
+illegal-access traceback, not a clean shutdown). Flagged to the user
+before resuming the concurrency sweep, given the pattern is now
+recurring and still uncorrelated with a specific trigger.
