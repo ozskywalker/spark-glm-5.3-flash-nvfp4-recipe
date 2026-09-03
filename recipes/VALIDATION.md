@@ -2892,3 +2892,28 @@ work mechanically), but it would be deliberately serving attention at a
 precision the model's own creators evaluated and rejected, not exploring
 an open question. Flagged back to the user for a decision before any
 further work here.
+
+**Decision: promote #2, leave attention alone** — not worth the error risk
+of going against a calibrated, first-party decision, given #2 alone is
+already a real, statistically solid +8.2% win.
+
+## Promoted: glm-5.3-flash-exl3-v4-vllm.yaml is now the shipped default (2026-09-02)
+
+`glm-5.3-flash-exl3-v4-vllm.yaml` = v2's fully validated base (all four
+PR77/86/63/96 changes, MTP-2, MNBT=7168, gpu_memory_utilization=0.86)
+plus the `ScaleAwareFp8LinearMethod` LM-head patch from attempt #2, scale
+mode `tensor` (the validated default — `channel` remains available via
+`GLM53_FP8_LMHEAD_SCALE_MODE=channel`, same recipe, no rebuild). Verified
+byte-for-byte against `glm-5.3-flash-exl3-v2-fp8-lmhead-v2.yaml`'s diff
+against `glm-5.3-flash-exl3-v2-vllm.yaml` before merging, so nothing
+production-relevant was dropped in the promotion.
+
+Booted clean on the first attempt: patch fired
+(`scale_shape=(1,) scale_range=[0.000481742, 0.000481742]
+weight_max_before=0.2158` — matches every prior #2 boot exactly), CUDA
+graphs captured (5s, 0.38 GiB), real generation request coherent
+(finish_reason=stop), `probe_sanity.py` all-pass (decode 25.23-28.77
+tok/s, matching the validated #2 numbers). This is now the live default;
+`glm-5.3-flash-exl3-v2-vllm.yaml` remains on disk as the pre-FP8 baseline
+(and the fallback if anything regresses), same pattern as v1 being kept
+after v2 superseded it.

@@ -1,0 +1,451 @@
+# Recipe: GLM-5.3-Flash EXL3 v4 (TP=2 across 2x DGX Spark, vLLM native multi-node)
+#
+# *** VALIDATED AND PROMOTED TO DEFAULT 2026-09-02 — full results in
+# VALIDATION.md "FP8 LM head attempt #2: scale-aware loader fixes the root
+# cause, fully validated" and "Does #2 actually move throughput? Rigorous
+# A/B says yes, clearly" ***
+#
+# WHAT'S NEW: the LM head runs FP8 instead of BF16
+#
+# `Exl3Config` quantizes only `RoutedExperts` by this checkpoint's own
+# declared design (`"scope": "glm53_routed_experts_only"`) — every other
+# Linear layer, including the LM head, ran BF16 through v2/v3. This recipe
+# adds `ScaleAwareFp8LinearMethod`, an in-process monkeypatch of
+# `Exl3Config.get_quant_method` that routes `lm_head` through a subclass of
+# vLLM's own `Fp8LinearMethod`, configured for dynamic per-tensor
+# quantization from the checkpoint's real BF16 weights (not an offline
+# conversion — quantized once at load time, every boot).
+#
+# Two real bugs in vLLM's stock `Fp8LinearMethod` had to be fixed to get
+# here (both root-caused by reading vLLM's actual source, not just its
+# docstrings — see VALIDATION.md "FP8 LM head: real hardware win confirmed,
+# then a hard end-to-end failure" for the full forensics): (1)
+# `create_fp8_weight_parameter()` unconditionally allocates FP8 storage
+# regardless of whether the checkpoint is actually FP8-serialized, so the
+# stock loader does an UNSCALED cast straight from BF16 into FP8 — this
+# checkpoint's `lm_head.weight` sits deep in e4m3's subnormal range
+# (max ≈ 0.22), so an unscaled cast destroys nearly all of it; (2) worse,
+# `create_fp8_scale_parameter()` initializes `weight_scale` to
+# `torch.finfo(torch.float32).min` (≈ -3.4e38) as a sentinel that a plain
+# BF16 checkpoint never overwrites, so the real SM121 GEMM kernel was
+# running against a garbage weight AND a garbage scale — this is what
+# produced the first attempt's `���...` output, not just
+# precision loss. `ScaleAwareFp8LinearMethod` allocates weight storage in
+# the checkpoint's real dtype (so loading is lossless) and computes an
+# actual scale from the loaded weights before quantizing, instead of
+# trusting vLLM's checkpoint-already-FP8 assumption.
+#
+# VALIDATION: full probe suite (sanity/soak/longctx) passed clean, CUDA
+# graph capture confirmed, and — critically — a rigorous n=20 A/B
+# throughput benchmark (`probe_throughput_ab.py`, fixed prompt, 400-token
+# forced completions to average out per-request scheduling noise; the
+# project's usual n=3 sanity-bench numbers were too noisy to resolve this)
+# found **+8.2% decode throughput** (23.658 → 25.599 tok/s, pooled-SE
+# t-stat ≈ 9.95 — not noise) with zero quality regression. Larger than a
+# naive kernel-time-share estimate predicted, most likely because MTP-2
+# speculative decoding invokes the LM head multiple times per accepted
+# step (draft verification + new-token prediction), so its real
+# contribution to wall-clock decode time exceeds a single-pass kernel-time
+# figure.
+#
+# SCOPE NOTE — why not attention too: investigated widening this same
+# mechanism to attention (the larger remaining bf16 surface, ~30.8% of
+# decode kernel time vs. the LM head's ~9.5%) and found it isn't reachable
+# by this technique at all: `vllm/models/glm5next/nvidia/{model,kda}.py`
+# hardcode `quant_config=None` for every attention sub-projection in both
+# the MLA and KDA/mamba families, and — per `_try_load_fp8_attn_proj`'s own
+# docstring — this holds even for the OFFICIAL `zai-org/GLM-5.3-Flash` FP8
+# checkpoint, which does ship real calibrated FP8 attention weights that
+# vLLM actively dequantizes back to BF16 on load. That's a first-party
+# quantization-scope decision by the model's own creators (MoE/MLP/LM head
+# get FP8, attention stays BF16, unconditionally), not an unimplemented
+# vLLM feature or a conservative default — see VALIDATION.md "Attention
+# fp8: investigated the 'why', not just the 'how'". Deliberately not
+# pursued further: not worth the accuracy risk of going against a
+# calibrated decision by the people who trained the model.
+#
+# GLM53_FP8_LMHEAD_SCALE_MODE=tensor (default, and what's shipped here) —
+# per-channel scaling was tested (`channel` mode, same recipe, env
+# override) and showed no measurable quality or throughput difference from
+# per-tensor on this layer, consistent with the original correctness
+# check's finding of zero outlier channels in `lm_head.weight`. Not worth
+# the extra complexity; per-tensor is what's promoted.
+#
+# *** PREVIOUS VALIDATED SUMMARY (v2, full results in VALIDATION.md
+# "EXL3 v2: validating four new upstream PRs") ***
+# Summary: prefill +14% at 100K-250K context (real, same-day A/B vs. v1,
+# both at gmu=0.86 — their own claim was +20-21%, ours is smaller but
+# genuine, matching the PR author's own "geometry-sensitive" caveat),
+# prefix-cache thinking-toggle fix confirmed clean (toggle now hits warm
+# cache, ~3x faster than a cold prefill, indistinguishable from a same-
+# effort repeat), indexer workspace rightsizing confirmed exact formula
+# match (~1287 MiB reclaimed at our 262K context — scales correctly from
+# their 1M-context ~4.5-4.8 GiB headline). Spinwait CPU claim (85.3%
+# reduction) inconclusive at this measurement's resolution (docker-stats-
+# level, not process-level) — see VALIDATION.md, not disproven, just not
+# independently confirmed at that magnitude. Zero regressions: decode
+# throughput comparable to v1, full sanity+soak suites pass.
+#
+# VISION: back ON, matching v1's parity choice. One earlier boot attempt
+# hit a KeyboardInterrupt in vLLM's own SIGTERM-during-init handler
+# (api_server.py's _interrupt_init) during multi-modal renderer warmup —
+# root cause traced to a real signal.signal(SIGTERM, ...) handler, not an
+# internal vLLM timeout, but the actual sender was never identified (not
+# a Docker healthcheck — none is defined on this image; not this
+# project's own tooling — no stop/kill command was issued during that
+# window). A clean retest of the identical config immediately after
+# booted with vision on with no issue whatsoever ("Multi-modal warmup
+# completed in 13.978s", "Readonly multi-modal warmup completed in
+# 3.478s") and passed the full sanity+soak suite. Treated as a one-off,
+# not a reproducible defect — if it recurs, capture the exact signal
+# source before disabling vision again.
+#
+# MiaAI-Lab merged four perf/correctness PRs today (all 2026-09-01, all on
+# `main` at commit c190db1) after the v1 recipe (glm-5.3-flash-exl3-vllm.yaml)
+# was validated and put into use. None had reached the published
+# `ghcr.io/miaai-lab/...:exl3` image tag as of this recipe (confirmed
+# empirically: pulled the tag fresh and grepped the baked-in chat_template.jinja
+# for PR63's fix — it wasn't there, so `:exl3` still predates all four merges).
+# Built our own image from `main`@c190db1 instead of waiting on a republish:
+# `docker build -t glm53-exl3-v2:c190db1 .` from a fresh clone.
+#
+# The four PRs, read directly from GitHub (title, body, diffs — not the
+# social-media summary that prompted this recipe):
+#
+#   PR77 "perf(exl3): accelerate fat-expert prefill" — purpose-built CUDA
+#     kernels (exl3_fat_gemm direct + scatter) for the routed-expert GEMM
+#     during prefill. Claimed +20-21% uncached prefill at 8K/100K/300K,
+#     decode unchanged. Rigorously benchmarked (45 accepted cold
+#     observations, cache-hit exclusion, CV reported, complete separation
+#     between on/off arms) but explicitly flagged by the author as
+#     "geometry-sensitive" and NOT reproduced on a separate deployment —
+#     genuinely worth validating ourselves, not just trusting. Now the
+#     shipped default in .env.example (EXL3_FAT_KERNEL=1, tier E2, implies
+#     BATCHED+SORTED).
+#
+#   PR86 "Indexer prefill-workspace right-sizing" — the sparse-MLA indexer's
+#     prefill workspace was sized at max_model_len*40 entries (a stock vLLM
+#     sizing bug shared with deepseek_v4's call site, which already divides
+#     by compress_ratio; glm5next's doesn't). Rightsizing to the legal
+#     per-step maximum reclaims KV capacity. THEIR measured ~4.5-4.8 GiB /
+#     +26.6% was at max_model_len=1,000,000 — the workspace scales with
+#     max_model_len, so at OUR 262,144 context (~26% of theirs) the absolute
+#     GiB reclaimed will be proportionally much smaller. Validate directly,
+#     don't assume the headline number transfers. Opt-in:
+#     GLM53_INDEXER_WORKSPACE=rightsize (default remains `stock`).
+#
+#   PR63 "emit Reasoning Effort unconditionally to keep the prefix cache" —
+#     chat_template.jinja fix, not a flag. The old template gated the
+#     "Reasoning Effort" line on thinking_enabled, which rendered ~token 2
+#     (before tools) — every thinking on/off toggle diverged the prefix hash
+#     at the very start, so vLLM's block-aligned KpoolTailManager cache
+#     scored zero credit and re-prefilled from scratch. Fix makes the
+#     thinking-off prompt a strict extension of the thinking-on prompt.
+#     Comes free with the new image, no config needed.
+#
+#   PR96 "Add numeric spinwait configuration" — vLLM's shm_broadcast reader
+#     spins for a full 1s (sched_yield) after every read before parking on
+#     the zmq poller; on GB10's 20 cores those spinners compete with NCCL
+#     proxy + engine loop threads. GLM53_SPINWAIT_MS=16 was their own frozen
+#     TP=2 sweep result (matches our TP degree, unlike the superseded PR69's
+#     TP=4-only 2ms figure): +0.95% median decode, 85.3% less active
+#     EngineCore CPU. Opt-in (default `stock` = vLLM's original 1s).
+#     Session note (2026-09-02): actually turned this knob on and measured
+#     real CPU-seconds via /proc deltas — decode +0.6-3.1% (matches the
+#     +0.95% claim) but EngineCore/Worker CPU showed ZERO reduction against
+#     the claimed -85.3%. Left enabled (it doesn't hurt and the decode
+#     number is real) but the CPU-reduction claim is a tested negative now,
+#     not an untested "inconclusive" — see VALIDATION.md.
+#
+#   A fifth claim ("fairer scheduling... active generations protected from
+#   costly mixed cold prefill") maps to GLM53_MIXED_PREFILL_CHUNK=skip,
+#   which the v1 recipe already had set — not a new change, just
+#   re-highlighted in the social post. No action needed here.
+#
+# Everything else matches the validated v1 recipe (MTP k=2 — kept as the
+# safe speculator; DFlash2 showed two distinct crash classes in production
+# use today, unrelated to any of these four PRs, and isn't being
+# reintroduced here) so the new variables are isolated, matching this
+# project's established one-variable-at-a-time discipline.
+#
+# Vision/video tower ON, matching v1's parity choice (see the VISION note
+# above — the one crash during multimodal warmup didn't reproduce on a
+# clean retest). Also dialed gpu_memory_utilization 0.87 -> 0.86 after two
+# consecutive startup-time "free memory" failures at 0.87 (see below).
+#
+# Distribution note: this image is LOCAL to the node it was built on
+# (spark-276f / 10.7.0.142), not in a registry. sparkrun's own resource-
+# distribution step should ship it to the other node automatically (same
+# mechanism used for registry images); if that doesn't work, fall back to
+# `docker save | ssh <other-node> docker load`.
+
+recipe_version: "2"
+name: GLM-5.3-Flash-EXL3-v4
+description: vLLM serving GLM-5.3-Flash via EXL3 quantization, v2/v3's validated base plus the LM head running dynamic per-tensor FP8 via a scale-aware Exl3Config.get_quant_method monkeypatch (+8.2% decode throughput, rigorously A/B'd) on 2x DGX Spark, TP=2
+
+model: Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw
+runtime: vllm
+container: glm53-exl3-v2:c190db1
+
+min_nodes: 2
+
+cluster_config:
+  resolved_model_path: /models
+
+executor_config:
+  entrypoint: ""
+  auto_remove: false
+
+env:
+  # --- image / GPU arch (GB10 = SM121) ---
+  TORCH_CUDA_ARCH_LIST: 12.1a
+  FLASHINFER_CUDA_ARCH_LIST: 12.1a
+  FLASHINFER_DISABLE_VERSION_CHECK: "1"
+  # --- GB10 unified-memory hygiene ---
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  # --- long boot tolerance ---
+  VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+  # --- NCCL diagnostics (fabric selection itself is sparkrun-detected) ---
+  NCCL_DEBUG: WARN
+  TORCH_NCCL_ASYNC_ERROR_HANDLING: "1"
+  # --- EXL3-specific (unchanged from v1) ---
+  EXL3_FUSED_MOE: "1"
+  GLM53_SUPPRESS_STOPS_IN_REASONING: "1"
+  GLM53_MIXED_PREFILL_CHUNK: skip
+  # --- NEW in v2: PR77 fat-expert prefill kernel ---
+  # Tier E2 (direct + scatter CUDA kernel). Implies EXL3_FAT_BATCHED=1 and
+  # EXL3_FAT_SORTED=1. Now the shipped default in upstream .env.example.
+  EXL3_FAT_KERNEL: "1"
+  # Row tiles OFF — matches PR77's own benchmark protocol exactly
+  # ("MNBT 2048; fused MoE on; row tiles off").
+  EXL3_MOE_ROW_TILE: "0"
+  # --- NEW in v2: PR86 indexer workspace rightsizing ---
+  GLM53_INDEXER_WORKSPACE: rightsize
+  # --- NEW in v2: PR96 spinwait tuning ---
+  # Their own frozen TP=2 sweep result (matches our TP degree).
+  GLM53_SPINWAIT_MS: "16"
+  # --- NEW in v4: FP8 LM head scale mode ---
+  # "tensor" (default, shipped) or "channel" (tested, no measurable
+  # difference — see recipe header). Kept as a runtime switch so the two
+  # can still be A/B'd without a rebuild if this checkpoint's lm_head.weight
+  # ever changes in a way that makes per-channel matter.
+  GLM53_FP8_LMHEAD_SCALE_MODE: tensor
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  served_model_name: glm-5.3-flash-exl3-v2
+  tensor_parallel: 2
+  model_path: /models/models--Mia-AiLab--GLM-5.3-Flash-EXL3-TR3-4bpw/snapshots/024db9f7e9871e8efdf21538ba55af7442be3cd5
+  quantization: exl3
+  max_model_len: 262144
+  max_num_seqs: 4
+  # Dialed back from 0.87 (2026-09-01): two consecutive v2 boots failed at
+  # 0.87 with "Free memory ... 104.93/105.31 GiB ... less than desired ...
+  # 105.87 GiB" — a razor-thin, real shortfall (not fixed by a fresh
+  # prelaunch_flush.sh between attempts), so this isn't page cache. Chose
+  # 0.86, not this project's usual 0.85 fallback: MiaAI-Lab's own docs cite
+  # 0.86 as their tested fallback for tighter-margin nodes ("GPU_MEM_UTIL=
+  # 0.86 ... fits with margin"), and v1's own earlier failures at 0.85 were
+  # a *different* problem (post-weight-load KV-sizing shortfall, not this
+  # startup free-memory check) — 0.86 splits the difference with informed
+  # backing rather than guessing.
+  gpu_memory_utilization: 0.86
+  kv_cache_dtype: fp8
+  # Raised 2048 -> 7168 (2026-09-02): matches upstream's own current
+  # production value (discovered via the PR80 merge conflict in README.md
+  # — their doc says "E2 keep 2026-09-01", chosen specifically alongside
+  # the fat-expert prefill kernel). Measured on this cluster: +28.4%
+  # prefill at 100K tokens (933->1199 tok/s), +19.5% at 250K (1048->1253
+  # tok/s), zero decode regression on prose OR structured content (25.68
+  # tok/s prose, 31.65 tok/s median / 96.57% MTP-2 accept on a counting-
+  # task structured probe — see VALIDATION.md), full sanity+soak (incl.
+  # concurrent waves) passed. A substantial, real, independently-confirmed
+  # gain. Contrast with the NVFP4 lane, which crashed raising this same
+  # knob to just 3584 — direct, measured confirmation that EXL3's smaller
+  # memory footprint is real headroom, not just theory.
+  max_num_batched_tokens: 7168
+  limit_mm: '{"image":4,"video":1}'
+  default_chat_template_kwargs: '{"enable_thinking": false}'
+  # MTP k=2 — matches v1's safe default. DFlash2 not reintroduced here;
+  # its two crash classes today were unrelated to any of these four PRs.
+  speculative_config: '{"method":"mtp","num_speculative_tokens":2}'
+
+command: |
+  cat > /tmp/glm53_fp8_lmhead_v2_shim.py <<'PYSHIM'
+  # FP8 LM head monkeypatch. See recipe header for full rationale and
+  # VALIDATION.md for the complete investigation (two v2/v3 boot bugs
+  # root-caused: unscaled FP8 cast + uninitialized -3.4e38 weight_scale
+  # sentinel; both fixed by ScaleAwareFp8LinearMethod below).
+  #
+  # Multiprocessing-boundary handling matches every other in-process patch
+  # in this project (spinwait, fp8-lmhead v1/v2): patch at IMPORT TIME
+  # (unconditional, runs in every process that re-imports this file,
+  # spawned or not); only the actual `main()` launch stays behind the
+  # `if __name__ == "__main__"` guard. A patch gated the same way as the
+  # launch call silently never reaches the multiprocessing.spawn-reimported
+  # API-server child that EngineCore/Worker actually fork from.
+  import os
+  import sys
+
+  import torch
+
+  from vllm.model_executor.layers.linear import LinearBase
+  from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+  from vllm.model_executor.layers.quantization.exl3 import Exl3Config
+  from vllm.model_executor.layers.quantization.fp8 import (
+      Fp8Config,
+      Fp8LinearMethod,
+      MarlinFP8ScaledMMLinearKernel,
+      init_fp8_linear_kernel,
+  )
+  from vllm.model_executor.parameter import ModelWeightParameter
+  from vllm.model_executor.utils import replace_parameter
+
+  _SCALE_MODE = os.environ.get("GLM53_FP8_LMHEAD_SCALE_MODE", "tensor")
+  assert _SCALE_MODE in ("tensor", "channel"), _SCALE_MODE
+
+  _fp8_config = Fp8Config(
+      is_checkpoint_fp8_serialized=False,
+      activation_scheme="dynamic",
+      weight_block_size=None,
+  )
+
+
+  class ScaleAwareFp8LinearMethod(Fp8LinearMethod):
+      """Fp8LinearMethod for on-the-fly quantization from a genuinely bf16
+      checkpoint. Upstream's create_weights/process_weights_after_loading
+      assume the checkpoint is ALREADY fp8-serialized (fp8 weight storage
+      from the start + a real `*.weight_scale` tensor on disk); neither
+      holds here. This class fixes both: allocate weight storage in the
+      checkpoint's real dtype so the standard loader does a normal,
+      lossless copy, then compute a REAL scale from the actual loaded
+      weights ourselves before quantizing.
+      """
+
+      def create_weights(
+          self,
+          layer,
+          input_size_per_partition,
+          output_partition_sizes,
+          input_size,
+          output_size,
+          params_dtype,
+          **extra_weight_attrs,
+      ):
+          assert not self.block_quant, "scale-aware path is per-tensor/channel dynamic only"
+          output_size_per_partition = sum(output_partition_sizes)
+          weight_loader = extra_weight_attrs.get("weight_loader")
+          layer.logical_widths = output_partition_sizes
+          layer.input_size_per_partition = input_size_per_partition
+          layer.output_size_per_partition = output_size_per_partition
+          layer.orig_dtype = params_dtype
+          layer.weight_block_size = None
+
+          # params_dtype (bf16), NOT fp8 -- the whole point of this override.
+          weight = ModelWeightParameter(
+              data=torch.empty(
+                  output_size_per_partition, input_size_per_partition,
+                  dtype=params_dtype,
+              ),
+              input_dim=1,
+              output_dim=0,
+              weight_loader=weight_loader,
+          )
+          layer.register_parameter("weight", weight)
+          # Deliberately NOT creating a weight_scale parameter here -- see
+          # process_weights_after_loading, which computes and attaches a
+          # real one once actual weights exist.
+
+          self.fp8_linear = init_fp8_linear_kernel(
+              activation_quant_key=self.activation_quant_key,
+              weight_quant_key=self.weight_quant_key,
+              weight_shape=(output_size_per_partition, input_size_per_partition),
+              input_dtype=self.input_dtype,
+              out_dtype=self.out_dtype,
+              module_name=self.__class__.__name__,
+          )
+          self.use_marlin = isinstance(self.fp8_linear, MarlinFP8ScaledMMLinearKernel)
+
+      def process_weights_after_loading(self, layer) -> None:
+          assert not self.use_marlin, "scale-aware path assumes real SM121 FP8 tensor cores"
+          w = layer.weight.data  # real bf16 weights, correctly loaded by now
+          w32 = w.to(torch.float32)
+
+          if _SCALE_MODE == "channel":
+              # Per output row. w32 is [N, K] here (pre-transpose), so the
+              # scale used to DIVIDE it must be [N, 1] to broadcast per row.
+              scale_div = (w32.abs().amax(dim=1, keepdim=True) / 448.0).clamp(min=1e-12)
+          else:
+              # Per-tensor: a single scalar for the whole weight.
+              scale_div = (w32.abs().amax() / 448.0).clamp(min=1e-12).reshape(1)
+
+          wq = (w32 / scale_div).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+
+          # weight_scale is stored as [N, 1] for channel mode -- NOT [1, N]
+          # -- even after weight is transposed to [K, N] below. Confirmed
+          # from vLLM's own kernel-level padding code, not just the
+          # cutlass_scaled_mm docstring's broadcast description, which
+          # doesn't literally hold for [N,1] against [K,N]: the native
+          # binding applies it as N per-output-column scales directly.
+          scale_store = scale_div
+
+          replace_parameter(layer, "weight", wq.t())
+          layer.weight_scale = torch.nn.Parameter(scale_store.to(torch.float32), requires_grad=False)
+          layer.input_scale = None
+
+          print(
+              f"[glm53-fp8-lmhead-v4] quantized weight scale_mode={_SCALE_MODE} "
+              f"scale_shape={tuple(scale_store.shape)} scale_range=[{scale_store.min().item():.6g}, "
+              f"{scale_store.max().item():.6g}] weight_max_before={w32.abs().max().item():.4f}",
+              file=sys.stderr, flush=True,
+          )
+
+          # Stock kernel-level post-processing from here (16-alignment
+          # padding etc.) -- everything downstream of weight prep is
+          # unmodified vLLM.
+          self.fp8_linear.process_weights_after_loading(layer)
+
+
+  _original_get_quant_method = Exl3Config.get_quant_method
+
+
+  def _patched_get_quant_method(self, layer, prefix):
+      if isinstance(layer, (LinearBase, ParallelLMHead)) and "lm_head" in prefix:
+          print(f"[glm53-fp8-lmhead-v4] routing '{prefix}' ({type(layer).__name__}) "
+                f"through ScaleAwareFp8LinearMethod (dynamic, scale_mode={_SCALE_MODE})",
+                file=sys.stderr, flush=True)
+          return ScaleAwareFp8LinearMethod(_fp8_config)
+      return _original_get_quant_method(self, layer, prefix)
+
+
+  Exl3Config.get_quant_method = _patched_get_quant_method
+  print(f"[glm53-fp8-lmhead-v4] Exl3Config.get_quant_method patched (pid={os.getpid()}, "
+        f"__name__={__name__!r}, scale_mode={_SCALE_MODE!r})", file=sys.stderr, flush=True)
+
+  if __name__ == "__main__":
+      sys.argv[0] = "vllm"
+      from vllm.entrypoints.cli.main import main
+      sys.exit(main())
+  PYSHIM
+  python3 /tmp/glm53_fp8_lmhead_v2_shim.py serve {model_path} \
+      --served-model-name {served_model_name} \
+      --host {host} --port {port} \
+      --trust-remote-code \
+      --tensor-parallel-size {tensor_parallel} \
+      --quantization {quantization} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} \
+      --kv-cache-dtype {kv_cache_dtype} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --speculative-config '{speculative_config}' \
+      --tool-call-parser glm47 --enable-auto-tool-choice \
+      --reasoning-parser glm45 \
+      --enable-prefix-caching \
+      --no-enable-flashinfer-autotune \
+      --skip-mm-profiling \
+      --limit-mm-per-prompt '{limit_mm}' \
+      --chat-template /opt/glm53/chat_template.jinja \
+      --default-chat-template-kwargs '{default_chat_template_kwargs}' \
+      --distributed-executor-backend mp
