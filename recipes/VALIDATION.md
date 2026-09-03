@@ -3086,3 +3086,56 @@ merits and is what actually justifies the change.
 plus `max_num_seqs: 4 -> 16`. Booted clean, `probe_sanity.py` all-pass
 (decode 23.93-28.33 tok/s, no regression), real generation request
 coherent. This is now the live default.
+
+## DFlash2@7168 prompt-length bisection: worse than previously documented, still not promotable
+
+Per plan, attempted to bisect exactly where DFlash2@7168 breaks (dig item
+05; VALIDATION.md's earlier "DFlash2 k=7 re-validated at MNBT=7168" found
+it crashes somewhere in an ~8-11K-token filler-prompt sweep with this
+project's documented silent-kill signature). Necessarily an isolated
+test, not run against production: DFlash2's own KV budget (14.6 GiB with
+the drafter resident) can't coexist with the production job, and
+deliberately probing toward a known crash point isn't something to do
+against live traffic.
+
+Built `probe_dflash2_bisect.py` — sequential (not concurrent) single
+requests at increasing prompt lengths, checking `/health` (not
+`/v1/models`, which `fleet_watchdog.sh`'s own comments note returns 200
+even with a dead `EngineCore` — confirmed accurate) after every request,
+stopping immediately at the first sign of trouble rather than continuing
+to probe a dead engine.
+
+**Crashed on the very first length tried: 4,000 tokens** — well below
+the previously-documented ~8-11K threshold. This boot's own log line:
+`GPU KV cache size: 358,310 tokens, Maximum concurrency for 262,144
+tokens per request: 1.37x` — a razor-thin margin. The crash signature
+matches the documented pattern exactly: `EngineDeadError` raised by the
+API server when it noticed EngineCore's pipe died, but no traceback, no
+CUDA OOM, no assertion from EngineCore itself — a silent kill, not a
+diagnosable application error. Not the K-pool tail bug just fixed in v5
+(that needs ~2.2K *generated* tokens; this test used `max_tokens=20` per
+request specifically to isolate prompt length as the variable, nowhere
+near that threshold) — a distinct failure mode tied to DFlash2's own
+tight KV margin.
+
+**Read as a finding, not a bug in the bisection**: this project has
+repeatedly documented KV margin varying between boots on this cluster
+(the "trapped memory" pattern, `gpu_memory_utilization` shortfalls at
+0.87 that didn't reproduce at 0.86, etc.) — DFlash2's already-thin 1.37x
+margin at full context makes it more exposed to that variance than any
+other lane tested this session. Whether this specific boot's margin was
+unusually bad or the ~8-11K figure from the original test was itself
+already close to the edge of run-to-run variance, the practical
+conclusion is the same either way.
+
+**Verdict: DFlash2@7168 is not promotable, more clearly than before.**
+Restored v6 (stop/flush/relaunch), reverified with a real generation
+request and `probe_sanity.py`. Not attempting a further bisection this
+session — the KV margin itself is the finding; a tighter breakpoint
+number wouldn't change the conclusion, and each attempt costs a boot
+cycle plus recovery risk on a cluster that needs to be stable soon. If
+DFlash2 is revisited, the structured-content win (61.07 tok/s / 94.1%
+accept, real and large) is worth pursuing on its own merits, but it needs
+either a materially larger KV budget (a memory-focused fix, not a
+prompt-length limit) or a smaller `num_speculative_tokens` before it's
+safe to ship — not a documented-and-accepted prompt-length ceiling.
