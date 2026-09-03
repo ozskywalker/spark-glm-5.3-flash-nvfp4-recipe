@@ -3018,3 +3018,71 @@ distinct from the K-pool tail crash just fixed, which would show a CUDA
 illegal-access traceback, not a clean shutdown). Flagged to the user
 before resuming the concurrency sweep, given the pattern is now
 recurring and still uncorrelated with a specific trigger.
+
+## DFlash2 draft checkpoint: fresh revision downloaded, NOT adopted
+
+Per request, ran a fresh `hf download incoai/GLM-5.3-Flash-DFlash2` on
+both nodes (this checkpoint isn't NFS-shared between them — each needed
+its own download; node0 needed `~/.local/bin/hf`, not on the default
+non-interactive SSH `PATH`). Confirmed the Hub's current HEAD
+(`bf582e4e`, last modified 2026-08-31) is genuinely newer than both
+locally-cached revisions, including the one our `-dflash2-7168.yaml`
+recipe pins (`7d74cdd8`) — different blob hash
+(`8931dc52...` -> `b038e1d9...`, real weight change, `config.json`
+byte-identical).
+
+**Not adopted.** The recipe's own header already documents *why* it's
+pinned to `7d74cdd8` and not the newer `dc77ff1c`: Reederey87 A/B-tested
+the Hub's later snapshots and found they "won nothing" (one lost 6% on
+prose). `bf582e4e` is a fourth revision beyond those two, and its own
+README no longer publishes any benchmark numbers at all — replaced with
+"Benchmark numbers for this checkpoint are being re-measured and will be
+published here once final." The checkpoint's own maintainers currently
+stand behind no published number for this exact revision. Swapping our
+vetted pin for it now would repeat the exact mistake this project has
+avoided all session (trusting the newest without checking). Left the pin
+as-is; if DFlash2 bisection work happens, the right test is `bf582e4e`
+vs. the vetted `7d74cdd8` pin, measured here, not assumed from upstream.
+
+## max_num_seqs 4 -> 16: validated under long-context concurrent load, promoted
+
+The original +171.6% throughput win from this bump (forward-pass
+profiling artifact) was measured entirely on short prompts, KV only 41%
+used at c=16 — never validated under real long-context load. Real reason
+to check rather than assume: this hybrid mamba/MLA architecture pads the
+attention block size to match the mamba state page size (own boot logs:
+"Setting attention block size to 3584 tokens..."), so every KV-cache
+group pins at least one such block per running request regardless of
+that request's actual length (general mechanism: vllm-project/vllm#54458
+on other hybrid-model deployments).
+
+Built `probe_longctx_concurrency.py` to measure directly. First run (full
+6-cell sweep against the just-promoted v5, before any max_num_seqs
+change) coincided with an unexplained production shutdown (previous
+section) — after restoring, retried cautiously per the user's choice
+(single light cell, expand only if clean): 20K@c2, 20K@c4, 60K@c4 all
+passed clean with trivial KV usage (0.05-0.18%) and the server stayed
+healthy throughout every one, including a re-run at the exact scale that
+preceded the shutdown — no evidence the sweep itself was the cause.
+
+With confidence restored, booted a `max_num_seqs=16` test variant
+(`-o max_num_seqs=16` override, no new recipe file needed for the test
+itself) and ran the full sweep: 20K/60K tokens x concurrency 4/8/16.
+**36/36 requests succeeded, zero failures, KV-cache usage never exceeded
+0.19%** even at 16 concurrent 60K-token prefills. The hybrid-page-
+alignment mechanism is real (confirmed in our own logs) but nowhere near
+a binding constraint at these realistic long-context scales.
+
+One mechanism note for future tuning: `num_requests_running_max` stayed
+at 1 throughout the sweep — under long-context load, admission is
+actually gated by `max_num_batched_tokens` (7168) serializing prefill,
+not by `max_num_seqs` directly. So this result is a validated **safety**
+finding (raising the ceiling introduces no new risk under long-context
+load) rather than a proven long-context **throughput** win in its own
+right — the original short-prompt throughput win stands on its own
+merits and is what actually justifies the change.
+
+**Promoted as `glm-5.3-flash-exl3-v6-vllm.yaml`** — v5's validated base
+plus `max_num_seqs: 4 -> 16`. Booted clean, `probe_sanity.py` all-pass
+(decode 23.93-28.33 tok/s, no regression), real generation request
+coherent. This is now the live default.
