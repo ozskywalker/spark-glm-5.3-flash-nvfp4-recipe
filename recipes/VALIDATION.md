@@ -3446,3 +3446,133 @@ attempt without a concrete code-level lead to work from. If a future
 crash produces an actual CUDA traceback (unlike this one), that's the
 signal to revisit; watching vllm-project/vllm#54317 for upstream progress
 is the other.
+
+## Does vllm-project/vllm#50729 explain Crash B? Investigated, then acted on: v8
+
+Asked directly rather than assumed: does #50729 ("[Bugfix][Mamba] Fix
+overlapping state copy race") actually fix the root cause, or just
+mitigate/mask it? Read the full PR (not just the title) before answering.
+
+**It's a genuine root-cause fix, not a mask.** The bug: mamba conv-state
+left-shift copies (needed whenever accepted-draft-token counts vary under
+speculative decoding) can have `src_block_id == dest_block_id` with a real
+shift -- source and destination byte ranges overlap *within* the same
+physical block. The old kernel (`_copy_mamba_state_block` in
+`vllm/v1/worker/mamba_utils.py`) copied this with a naive parallel/tiled
+memcpy carrying no memmove-ordering guarantee -- a classic read-after-write
+hazard where one lane can overwrite bytes another lane hasn't read yet.
+The fix detects specifically the hazardous case (same block, nonzero
+shift) and routes it through a provably memmove-safe token-by-token copy
+(disjoint per-token ranges, low-to-high order), while every case that
+cannot have a destructive overlap (distinct blocks, or an exact zero-shift
+self-copy) keeps the original fast vectorized single-CTA path. A second,
+related hunk in the same PR adds an `is_left_overlap` guard +
+`tl.debug_barrier()` to `batch_memcpy_kernel`, a separate memcpy kernel
+with the same hazard shape. This is a scoped, mechanism-level correctness
+fix -- not a broader lock, not a retry-on-failure wrapper, not a "reduce
+concurrency" workaround.
+
+**Then checked something the question didn't ask: is it in OUR
+container?** It is not. Direct diff comparison of both `mamba_utils.py`
+hunks against this exact container's installed file confirmed a
+byte-for-byte match to the PR's own "before" (removed) lines, including a
+comment the PR deletes ("Small per-block bytes (~60-80 KiB) make tiling
+degenerate, so conv runs as a single-CTA memcpy (NUM_TILES=1)"). Given our
+production config uses MTP (speculative decoding), this made #50729 a
+strong, mechanism-plausible explanation for Crash B (2026-09-03,
+decode-phase, `num_computed_tokens=85373`, `num_output_tokens=101`, no
+CUDA traceback captured) and possibly other unexplained instability --
+though, same caveat as Crash B's own writeup above: no traceback exists to
+*prove* this was the trigger. Confirmed absent is a fact; confirmed the
+cause is not.
+
+**Follow-up question, from the user: rebase our fork to pick this up
+(and the general "get in sync with latest vLLM"), instead of another
+one-off monkeypatch.** Investigated what that would actually take before
+doing it:
+
+- This project does not build vLLM from source anywhere in its own
+  pipeline. The production image (`glm53-exl3-v2:c190db1`, from
+  `MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks`) is built `FROM` a
+  pre-built, digest-pinned base image --
+  `vllm/vllm-openai:glm53-flash-arm64-cu130@sha256:905c02933be6021301db2
+  dc284e24e3727467aa3a0f63b41d609885778a07bce` -- published by an
+  automated `vllmbot` CI account, presumably building vLLM's own
+  GLM-5.3-Flash support branch (vllm-project/vllm#53906). MiaAI-Lab's own
+  repo applies ~15 source-patch layers on top of that base at Docker
+  build time (`overlay/patch_*.py`, each with a paired `test_*.py` build
+  gate) but does not touch vLLM's own source tree.
+- Checked Docker Hub directly for that tag: it currently resolves to
+  exactly **one** digest -- the same one already pinned -- last pushed
+  2026-08-26. That postdates #50729's 2026-08-17 merge by 9 days, yet the
+  fix is absent (confirmed above), which means the branch this image is
+  built from is not being kept in continuous sync with vLLM main on any
+  useful cadence. There is no newer base image sitting there to pull.
+- There is also no git-accessible source tree behind this base image for
+  us to `git rebase` in the literal sense -- it's a closed, externally
+  built artifact. "Rebase" as originally framed isn't available as a
+  mechanism here.
+- MiaAI-Lab's own repo (the ~15-patch overlay layer, separate from the
+  base image) is only 8 commits ahead of our `c190db1` pin, all
+  docs/experimental-TP4 -- not a meaningful sync target on its own.
+- Bonus finding while comparing patch mechanisms: MiaAI-Lab's overlay
+  already carries `overlay/patch_kpool_tail_slotmap.py`, targeting the
+  SAME bug class as our own v5 fix (credited to the same original
+  reporter, vcruz305) -- but via a narrower defensive clamp
+  (`block_indices = tl.minimum(block_indices, block_table_stride - 1)`
+  in the paged slot-mapping kernel) rather than v5's root-cause repair
+  (passing `positions=` through `MambaHybridModelState.prepare_attn` so
+  the tail builder computes correct indices to begin with). A clamp
+  silently redirects an out-of-bounds write into slot 0 instead of
+  preventing the out-of-bounds computation in the first place -- it
+  survives without crashing, but trades a loud failure for a quieter
+  corruption risk. **If this project ever consumes MiaAI-Lab's build
+  overlay wholesale instead of our own recipe-level patches, v5's fix
+  must take precedence over theirs, not the reverse.** Their overlay has
+  no equivalent at all for the v7 (vedcsolution kpool-indexer) bug or for
+  #50729 -- both would still need to come from us either way.
+
+**Conclusion: given no accessible upstream source and no newer published
+base image, "sync" in practice means the same thing it already has all
+day -- pull the specific, understood, already-merged-upstream fix forward
+via the same live-monkeypatch technique, not wait on an update that has
+no evidence of arriving.** Applied as v8 (`glm-5.3-flash-exl3-v8-
+vllm.yaml`): all three #50729 hunks (the DS-conv-dim-first token-major
+rewrite, the SD-conv same-block guard, and `batch_memcpy_kernel`'s
+overlap barrier), all `@triton.jit`-decorated so patched via
+`_unsafe_update_src()` (same technique as v7's Triton-kernel hunk).
+Dry-run validated against the live container before writing into the
+recipe: all three anchors matched byte-for-byte (count==1 each), patched
+kernel hashes reset to force recompilation, and both patched sources
+parsed clean.
+
+**Production boot and validation.** Stopped v7, `prelaunch_flush.sh
+--during-load`, launched v8. All four patches (v4 FP8 LM head, v5 K-pool
+tail, v7 K-pool indexer, v8 Mamba race) confirmed applied on every
+process -- head (pid=76, `__main__`) and both TP worker processes
+(pid=164/198, `__mp_main__`) -- via their startup print lines, no
+tracebacks. `/health` came up clean.
+
+- `probe_sanity.py`: all short-context checks passed (chat coherence,
+  streaming, finish-reason, no reasoning-leak). Decode throughput
+  25.5-28.5 tok/s across 3 bench runs -- matches every prior boot's
+  baseline, no regression. `vllm:spec_decode_num_drafts_total` present in
+  `/metrics`, confirming MTP speculative decoding is active -- the
+  subsystem this fix actually touches.
+- `probe_longctx.py --tokens 85000 --max-tokens 300`: deliberately shaped
+  to match Crash B (85,373 computed tokens) -- 84,892-token document,
+  TTFT 70.4s, finish_reason=stop, 4/4 planted retrieval codes correct.
+  Passed clean.
+- `probe_soak.py --rounds 2 --conc 8 --waves 3`: 20/20 sequential + 24/24
+  concurrent requests ok, endpoint alive after soak. No crash, no
+  slowdown.
+
+**Caveat, stated plainly**: the underlying bug is a timing-dependent race
+-- a clean pass here (as with any race-condition fix) narrows risk and
+confirms no regression, it doesn't prove the race can no longer occur or
+that it was in fact the cause of Crash B. The fix itself is sound on its
+own merits regardless (see the root-cause analysis above) -- this
+validation is about confirming safe deployment, not re-litigating whether
+to apply an already-correct upstream fix.
+
+**v8 promoted to default 2026-09-03.**
