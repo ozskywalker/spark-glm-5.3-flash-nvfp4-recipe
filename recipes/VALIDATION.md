@@ -3383,3 +3383,66 @@ repeatedly may still have other undiscovered instances. If another
 silent-kill crash occurs, check first whether it's a recurrence of either
 fixed bug (compare generated-token count and prefill-vs-decode phase
 against the two signatures above) before assuming a third, new bug.
+
+## A THIRD production crash, same day: matches neither fixed bug, matches an unresolved open upstream issue instead (2026-09-03)
+
+Same head-node-only failure (node0 lost its entire process tree, node1
+left an orphaned `Worker_TP1`), same generic `Worker proc VllmWorker-0
+died unexpectedly (exit code: None)` -> `EngineDeadError` -> `cancelled`
+shm_broadcast wrapper. But the scheduler dump rules out both bugs fixed
+today:
+
+```
+scheduled_new_reqs=[]  # not admitting a new request -- not the v7 bug
+scheduled_cached_reqs: num_computed_tokens=[85373], num_output_tokens=[101]
+num_scheduled_tokens=3  # 1 real + 2 MTP draft slots -- an ordinary decode step
+kv_cache_usage=0.069
+```
+
+This is a **decode-phase** crash (v7's bug is prefill-only), on a request
+already 101 tokens into generation (v5's bug needs ~2.2K -- two orders of
+magnitude more) with **85,373 total computed tokens** (prefix-cache-hit
+heavy per the preceding log lines -- a long multi-turn conversation, not
+one giant fresh prompt). Neither fixed signature applies. No CUDA-level
+traceback was captured on the worker side this time either -- purely
+silent, harder to diagnose than a catchable exception.
+
+**Went looking for a match and found one, circumstantially strong but not
+confirmed the way the other two were**: vllm-project/vllm#54317,
+"recurring CUDA illegal memory access on 4xB200, surfacing in three
+unrelated kernels (KDA linear-attention, MHC TileLang, TRT-LLM fused
+MoE)" -- open, unresolved, filed by an operator with far more diagnostic
+reach than we have here (per-crash CUDA tracebacks, `nvidia-smi -q`
+ECC/Xid checks all clean, PDL forced off and retested, a specific
+`cu_seqlens` theory checked and ruled out). Their own summary: "two
+unrelated victims suggests a single upstream corrupter... most likely in
+the linear-attention/state path" -- the KDA/mamba machinery that is 34/45
+of this model's layers, exactly matching our own architecture. Load/state
+-dependent (their box ran **15.5h clean**, then crashed 5 times over 6h at
+wildly inconsistent uptimes: 22min/10min/47min/2h34min/62min) -- not a
+fixed token-count threshold, consistent with three of our own incidents
+each looking superficially similar but having three different concrete
+triggers on inspection.
+
+**Important distinction from the two bugs already fixed today**: those
+had exact code matches (same file, near-identical line numbers, a
+published field-validated patch) confirmed present in our own container
+before patching. This one has no such confirmation -- we don't have a
+CUDA traceback naming a specific kernel the way #54317's reporter does,
+so this is a strong circumstantial lead (matching subsystem, matching
+load-dependent behavior, matching heavy-context/multi-turn conditions),
+not a diagnosed-and-fixed bug. **The reporter of #54317, despite
+significantly more diagnostic access than available here, has not found
+a definitive root cause or fix** -- only a non-fix workaround (routing
+around the TileLang MHC kernel produces garbage output) and a falsified
+theory (PDL trigger-before-store, tested and ruled out). Continuing to
+patch individual instances of this one may not be tractable the way the
+first two were.
+
+Restored via stop/flush/relaunch, reverified (`probe_sanity.py`: decode
+28.47-28.81 tok/s, no regression). **Not further patched today** --
+flagged as an open risk to monitor rather than chased into a third fix
+attempt without a concrete code-level lead to work from. If a future
+crash produces an actual CUDA traceback (unlike this one), that's the
+signal to revisit; watching vllm-project/vllm#54317 for upstream progress
+is the other.
