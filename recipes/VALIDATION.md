@@ -3293,3 +3293,93 @@ capturing the exact prefill-chunk activation memory profile on a
 reproduction at this scale (~18K tokens, large `max_tokens`), not another
 bisection sweep -- the crash floor here is a real prompt shape, not a
 synthetic filler-text edge case.
+
+## Root-caused and fixed: a SECOND, distinct K-pool/indexer crash bug (prefill-triggered)
+
+Investigated why the previous session's K-pool fix didn't prevent this
+crash. First check: **was the v5 patch even active on the crashed boot?**
+Yes -- confirmed directly in that boot's own logs
+(`[glm53-kpool-tail-fix] patched...`), all three processes. So this is
+not a case of the fix failing to apply; it's a genuinely different bug.
+
+**The two bugs' trigger conditions don't overlap.** The v5 fix (K-pool
+*tail* cache, `vcruz305`'s report) needs ~2.2K *generated* tokens --
+`compute_kpool_tail_slot_mapping`'s circular buffer only wraps after
+enough decode steps. This crash happened with **zero tokens generated**,
+still on the first `max_num_batched_tokens=7168` prefill chunk of an
+18,394-token prompt. Different phase of the request lifecycle entirely --
+the v5 fix was never going to catch this.
+
+**Went back to the same GitHub PR thread** (vllm-project/vllm#53906) that
+produced the v5 fix, specifically re-reading a DIFFERENT operator's report
+that had been noted in passing during earlier research but never
+investigated: `vedcsolution`, "kpool `pool_topk` buffers are allocated
+with `torch.empty` — uninitialized pool indices kill EngineCore on long
+prompts". Their trigger profile matches this crash far better: **prefill-
+length-triggered** (their fleet: "first unpadded prefill of ~25K+ tokens
+... decode unaffected"), dies "at a decode/prefill boundary step" --
+exactly the phase our crash was in.
+
+**Root cause**: `sparse_attn_indexer_kpool()`'s top-k pool selection
+allocates its result buffer with `torch.empty` in both the prefill and
+decode code paths. Rows whose logits are fully masked (short sequences
+mixed into a chunked-prefill batch) are never written by the top-k
+kernel, so whatever garbage `torch.empty` returns flows into `pool_ids`
+and from there into the pool-expansion kernel as a "valid" index --
+out-of-bounds gather / silent corruption, symptom depending on where the
+garbage lands. A second surface in the same mechanism: the pool-expansion
+Triton kernel (`_expand_pools_and_append_tail_kernel`) guards `pid >= 0`
+but not `pid == pool_len` (one past the last valid pool), reachable from
+the same garbage/tail arithmetic. The reporter validated both fixes
+together, not in isolation ("long-prompt ladder 28K/114K stable across
+repeated boots" after applying both) -- both fixed here, not just one.
+
+**Confirmed present in this exact container** before patching: both
+`torch.empty` call sites at nearly identical line numbers to the report
+(538/803 vs. their 538/801 -- expected drift from a slightly different
+commit), and the exact same unguarded `tl.where(pid >= 0, ...)` pattern
+in the Triton kernel.
+
+**Two different live-monkeypatch techniques were needed.** The
+`torch.empty`→`torch.full(-1, ...)` fix used the same source-text-surgery
++ `exec` technique as every other patch this session. The Triton kernel
+fix needed something new: rebuilding a fresh `@triton.jit`-decorated
+function from patched source hits `inspect.getsourcelines`, which
+requires resolving a real file on disk -- a synthetic `exec()` compile
+target isn't enough, and even writing the patched source to a real temp
+file and importing it properly still failed, because an unrelated
+tilelang/TVM monkeypatch on `inspect.getfile` (loaded transitively by
+this same codebase, for its own `mhc_*_tilelang_kernel` kernels) breaks
+on the intermediate object. The actual fix: Triton's own `JITFunction`
+exposes `_unsafe_update_src(new_src)` -- an intentional, documented escape
+hatch (its own docstring: "The only method allowed to modify src") that
+mutates the *existing* kernel object's cached source in place and resets
+its hash to force recompilation, with no file resolution involved at all.
+Found and verified via the same dry-run-against-the-live-container
+discipline used throughout this project, not guessed at.
+
+**Validation, deliberately shaped to match the actual crash, not the
+previous bug's test methodology**: a single-request 20,000-token prefill
+(`probe_longctx.py --tokens 20000`, essentially the crashed request's own
+scale) completed clean -- TTFT 17.9s, 4/4 codes retrieved, server alive
+throughout and after. Pushed further for margin: a 40,000-token prefill
+(more than double the crash's trigger) also completed clean (TTFT 33.3s).
+`probe_sanity.py`: **ALL PASSED**, decode 26.04-28.19 tok/s, no
+regression from v6.
+
+**Promoted as `glm-5.3-flash-exl3-v7-vllm.yaml`** — v6's validated base
+plus this fix. This is now the live default. Two independent, previously-
+reported K-pool/sparse-indexer bugs from the same upstream PR thread are
+now both fixed in this deployment; a third possibly-related report
+(`nood-co1`'s indexer prefill-workspace sizing) was already addressed by
+the existing `GLM53_INDEXER_WORKSPACE=rightsize` setting, unrelated to
+either of these two.
+
+**What's still open**: this doesn't prove the silent-NVRM-kill failure
+CLASS is now fully closed -- only that two SPECIFIC, independently-
+diagnosed bugs within it are fixed. The generic "memory pressure at
+whatever pipeline stage it fires" mechanism this project has documented
+repeatedly may still have other undiscovered instances. If another
+silent-kill crash occurs, check first whether it's a recurrence of either
+fixed bug (compare generated-token count and prefill-vs-decode phase
+against the two signatures above) before assuming a third, new bug.
