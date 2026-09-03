@@ -2917,3 +2917,67 @@ tok/s, matching the validated #2 numbers). This is now the live default;
 `glm-5.3-flash-exl3-v2-vllm.yaml` remains on disk as the pre-FP8 baseline
 (and the fallback if anything regresses), same pattern as v1 being kept
 after v2 superseded it.
+
+## Applied the K-pool tail cache fix (vcruz305's report): v5 promoted
+
+While researching *why* attention fp8 is excluded (the prior GitHub
+investigation), found `vcruz305`'s report on the same PR thread
+(vllm-project/vllm#53906): a real, reproducible crash bug in this
+container's hybrid-model support, reproduced on the SAME hardware class
+(DGX Spark GB10, EXL3 pack) and the SAME vLLM commit (`487ecf187`) this
+container runs. Any generation exceeding ~2.2K *generated* tokens crashes
+with a CUDA illegal memory access, or silently corrupts a neighboring
+layer's KV data — independent of `max-model-len`. Confirmed present in
+this exact container before patching: both anchor lines
+(`MambaHybridModelState.prepare_attn`'s missing `positions=` kwarg,
+`compute_kpool_tail_slot_mapping`'s `slot_mapping.clone()`) matched
+byte-for-byte in the installed site-packages.
+
+**Root cause**: every hybrid-architecture forward pass takes
+`MambaHybridModelState.prepare_attn`, which calls `build_attn_metadata(...)`
+without `positions=` (unlike the plain-transformer path in `default.py`,
+which does). The K-pool tail cache's slot-mapping builder needs
+`positions` to compute each request's own circular tail block; without
+it, the tail group falls through to the generic paged mapping, which
+indexes a one-entry block-table row and produces garbage block ids that
+both kpool kernels write through with no bounds check. A second,
+compounding bug: once `positions` are supplied, the tail-mapping function
+used to return `slot_mapping.clone()` every step — a fresh tensor whose
+address CUDA graph capture bakes in, so replay reads a since-freed/reused
+buffer (the actual illegal-access trigger with graphs on).
+
+**Fix, applied as a live monkeypatch** (source-text surgery + `exec` against
+the real installed source, not a file edit — same constraint as every
+other patch this session, uid 1000 container, root-owned site-packages):
+`MambaHybridModelState.prepare_attn` and `compute_kpool_tail_slot_mapping`
+are re-derived from `inspect.getsource()` of the CURRENT installed
+functions with the two buggy blocks replaced (asserting the anchor text
+matches exactly once, so the patch fails loudly rather than silently
+no-op'ing if this vLLM build ever changes), then reassigned onto the
+class/module. Mirrors vcruz305's own published file-edit patch
+(`scripts/patch_kpool_tail_positions.py`) exactly, just applied in-memory.
+
+One real bug caught before booting: the anchor text needed 8-space
+indentation after `textwrap.dedent()`, not the 12-space indentation the
+raw (non-dedented) class-method source shows — `textwrap.dedent()` only
+strips the *common* leading whitespace (4 spaces, the method's own
+class-body indent), it doesn't re-normalize every line to zero. Caught by
+dry-running the exact patch function against the live container before
+writing it into the recipe, not by trusting the transcription.
+
+**Validation**: both patch markers fired at boot
+(`[glm53-fp8-lmhead-v4]` and `[glm53-kpool-tail-fix]`, confirming clean
+coexistence with the v4 FP8 patch — different files/classes, no
+interaction). The critical test: a **4,096-token forced completion**
+(temperature 0, well past the ~2.2K crash threshold, matching the
+reporter's own 4,096/8,192-token validation bar) completed cleanly —
+`finish_reason=length`, `completion_tokens=4096`, coherent technical
+content throughout, no crash, no corruption, server healthy afterward.
+`probe_sanity.py`: **ALL PASSED**, decode 24.17-26.74 tok/s — matching v4's
+numbers, no regression from the fix.
+
+**Promoted as `glm-5.3-flash-exl3-v5-vllm.yaml`** — v4's validated base
+(FP8 LM head) plus this crash fix. This is now the live default. Given
+how directly this bug applies to real usage (any sufficiently long
+generation, not an edge case), this took priority over the throughput
+investigation items still open.
