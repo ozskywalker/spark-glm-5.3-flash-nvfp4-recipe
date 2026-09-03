@@ -3228,3 +3228,68 @@ evidence-backed answers, alongside the FP8 LM head win, the K-pool tail
 crash fix, and the DFlash2@7168 bisection -- six substantive findings
 this session, three shipped to production (v4/v5/v6), three concluded
 negative with hard evidence (attention FP8, per-channel scaling, DFlash2).
+
+## Real production crash under real traffic: head-node worker died mid-prefill on an 18.4K-token request (2026-09-03)
+
+User-reported (`/health` unreachable, containers still "Up" with zero
+server processes inside on the head node) and confirmed independently:
+**this was a genuine organic production request, not a synthetic test.**
+The scheduler's own dump at crash time:
+
+```
+prompt_token_ids_len=18394, max_tokens=32000, num_computed_tokens=7168
+kv_cache_usage=0.044088176352705455
+```
+
+An 18,394-token prompt requesting up to 32,000 output tokens, one
+`max_num_batched_tokens=7168`-sized prefill chunk already completed
+(`num_computed_tokens=7168`), mid-way through chunked prefill when the
+worker died. **KV-cache usage was 4.4%** at the moment of death --
+nowhere near a capacity ceiling, ruling out a simple "ran out of KV
+cache" explanation.
+
+**Signature matches this project's own repeatedly-documented pattern
+exactly**: `Worker proc VllmWorker-0 died unexpectedly (exit code: None)`
+-- no CUDA error, no assertion, no OOM exception, just silence, cascading
+through `EngineDeadError` to a full API-server shutdown. Per this
+project's own "Silent NVRM first-touch kill signature" finding: treat
+this as memory pressure at whatever pipeline stage it fires (here:
+per-iteration prefill activation on a long, real prompt) rather than a
+code bug. Checked immediately after: host memory on the head node was
+healthy (114 GiB free of 121 GiB, GPU idle, 0 running processes) --
+consistent with *transient* pressure during that specific prefill step,
+not a persistent leak.
+
+**Precisely attributed to the head node, confirmed by direct process
+inspection** (not just log timestamps): node0 (10.7.0.87, spark-2dd4) had
+**zero** vLLM/Python processes left inside its container after the crash
+-- the entire server process tree (APIServer, EngineCore, Worker) was
+gone. Node1 (10.7.0.142, spark-276f) still had its `Worker_TP1` process
+running, orphaned -- its rank-0 counterpart was gone forever, so it sat
+spinning uselessly (149 CPU-minutes accumulated) until the recovery
+`sparkrun stop` tore it down. **New operational note**: this deployment
+has no automatic cross-rank cleanup when one rank's engine dies -- the
+surviving rank's worker becomes an orphan that a plain container restart
+on its own node wouldn't catch; the fix is exactly what's already
+standard practice here (`sparkrun stop` tears down both nodes together),
+but it's worth knowing the orphan exists rather than assuming the
+surviving node is idle-and-harmless.
+
+**Why this is more concerning than the DFlash2@7168 bisection finding**:
+that bisection was on an experimental, not-yet-promoted speculator and
+found real instability at prompt lengths as low as 4K tokens. This crash
+is on **v6, the currently shipped MTP-2 production config** -- previously
+soak-tested, sanity-tested, and validated at long context up to 250K
+tokens (synthetic filler text) with zero incidents -- hit by a real user
+request at a comparatively modest 18.4K tokens. This suggests the
+"silent NVRM kill" failure class is not fully closed by the K-pool tail
+fix or the max_num_seqs validation done this session; it can still
+surface under organic traffic shapes those tests didn't happen to cover.
+**Not yet root-caused further** -- restored production immediately
+(stop/flush/relaunch, standard discipline), verified with a real
+generation request and `probe_sanity.py` (decode 25.07-27.05 tok/s, no
+regression). Flagged as an open item: if this recurs, the next step is
+capturing the exact prefill-chunk activation memory profile on a
+reproduction at this scale (~18K tokens, large `max_tokens`), not another
+bisection sweep -- the crash floor here is a real prompt shape, not a
+synthetic filler-text edge case.
