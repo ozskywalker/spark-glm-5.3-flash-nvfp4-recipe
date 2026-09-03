@@ -1,0 +1,61 @@
+
+=== 10_7_0_142__dp0_pp0_tp1_dcp0_ep1_rank1.1788412467786993617.pt.trace.json ===
+kernel events: 130352   profiler steps: 0
+wall span: 9781.3 ms   GPU busy: 4890.3 ms (50.0%)   GPU idle: 4891.0 ms
+
+--- GPU time by kernel family ---
+category              ms  % kernel    count   us/call
+gemm             2167.74      42.6    25538      84.9
+moe_exl3         1964.12      38.6     3788     518.5
+comms             443.36       8.7     4300     103.1
+other             300.56       5.9    14395      20.9
+memory             80.59       1.6    35517       2.3
+elementwise        75.88       1.5    35997       2.1
+attention          17.75       0.3     2284       7.8
+embedding          12.15       0.2     2379       5.1
+mamba_ssm          11.87       0.2     1591       7.5
+norm                9.11       0.2     2881       3.2
+quant               4.24       0.1      824       5.1
+sampling            3.29       0.1      858       3.8
+
+--- top 25 kernels ---
+       ms      %    cnt  us/call  cat          name
+  1942.16   38.2   1892   1026.5  moe_exl3     void exl3_moe_kernel<4, 256>(__half const*, __half*, __half*, __half*, __ha...
+   659.39   13.0   4768    138.3  gemm         void cutlass::Kernel2<cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_16x16_...
+   506.60   10.0   1100    460.5  gemm         void cutlass::Kernel2<cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_...
+   428.65    8.4   4171    102.8  comms        ncclDevKernel_AllReduce_Sum_bf16_RING_LL(ncclDevKernelArgsStorage<4096ul>)
+   242.55    4.8   2024    119.8  gemm         void cutlass::Kernel2<cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_...
+   187.07    3.7   1394    134.2  other        fused_recurrent_gated_delta_rule_fwd_kernel
+   151.94    3.0   3235     47.0  gemm         void cutlass::Kernel2<cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_16x16_...
+   150.35    3.0    108   1392.1  gemm         _ZN7cutlass13device_kernelI19enable_sm120_familyINS_4gemm6kernel13GemmUnive...
+   115.17    2.3   1210     95.2  gemm         nvjet_sm121_tst_mma_64x32x64_8_16x32x64_tmaAB_bz_TNNN
+    43.92    0.9   2420     18.2  gemm         nvjet_sm121_tst_mma_192x16x64_3_32x16x64_tmaAB_splitK_TNNN
+    35.27    0.7    264    133.6  gemm         nvjet_sm121_tst_mma_96x64x64_4_16x64x64_tmaAB_bz_TNNN
+    30.28    0.6     50    605.6  gemm         nvjet_sm121_tst_mma_128x144x64_2_32x72x64_tmaAB_bz_TNNN
+    29.98    0.6     21   1427.7  gemm         _ZN7cutlass13device_kernelI19enable_sm120_familyINS_4gemm6kernel13GemmUnive...
+    28.42    0.6   2000     14.2  gemm         void deep_gemm::sm120_tf32_hc_prenorm_gemm_impl<24u, 16384u, 128u, 32u, 64u...
+    27.71    0.5   2444     11.3  gemm         void cublasLt::splitKreduce_kernel<32, 16, int, float, __nv_bfloat16, float...
+    26.21    0.5   3870      6.8  other        mhc_pre_big_fuse_with_norm_tilelang_kernel
+    23.05    0.5    526     43.8  gemm         void cutlass::Kernel2<cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_...
+    22.18    0.4   1780     12.5  other        mhc_fused_tilelang_kernel
+    21.53    0.4   1892     11.4  moe_exl3     void vllm::moe::single_group_topk::detail::single_group_topk_block_kernel<f...
+    18.94    0.4   4343      4.4  memory       void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel...
+    18.66    0.4    946     19.7  other        void at::native::radixSortKVInPlace<-2, -1, 32, 32, long, long, unsigned in...
+    16.41    0.3    240     68.4  gemm         void gemmSN_NN_kernel<float, 256, 4, 2, 8, 3, 4, false, cublasGemvTensorStr...
+    16.33    0.3    169     96.6  gemm         nvjet_sm121_tst_mma_192x104x64_2_32x104x64_tmaAB_bz_TNNN
+    15.40    0.3   2090      7.4  other        mhc_post_tilelang_kernel
+    15.33    0.3     55    278.8  gemm         void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_128x128...
+
+--- unclassified kernels (top 10 of 47) ---
+   187.07 ms  fused_recurrent_gated_delta_rule_fwd_kernel
+    26.21 ms  mhc_pre_big_fuse_with_norm_tilelang_kernel
+    22.18 ms  mhc_fused_tilelang_kernel
+    18.66 ms  void at::native::radixSortKVInPlace<-2, -1, 32, 32, long, long, unsigned int>(at::cuda::de
+    15.40 ms  mhc_post_tilelang_kernel
+     6.56 ms  chunk_gated_delta_rule_fwd_kernel_h_blockdim64
+     4.08 ms  _scatter_states_kernel
+     3.43 ms  void at::native::bitonicSortKVInPlace<-2, -1, 16, 16, long, long, at::native::LTOp<long, t
+     2.77 ms  chunk_gla_fwd_kernel_o
+     2.48 ms  _kpool_decode_update_batched_kernel
+
+wrote analysis/dig03_dig06_rank1_summary.json

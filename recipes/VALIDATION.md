@@ -3139,3 +3139,92 @@ accept, real and large) is worth pursuing on its own merits, but it needs
 either a materially larger KV budget (a memory-focused fix, not a
 prompt-length limit) or a smaller `num_speculative_tokens` before it's
 safe to ship — not a documented-and-accepted prompt-length ceiling.
+
+## Dig items 03/06 closed: GPU idle at batch=8, cross-node TP asymmetry
+
+Built `glm-5.3-flash-exl3-v6-profiling.yaml` (v6's full patch stack --
+FP8 LM head, K-pool tail fix, max_num_seqs=16 -- plus the torch profiler,
+so the trace reflects the CURRENT shipped config, not the stale v2
+baseline the original profiling session used) and added `--concurrency`
+to `probe_profile_run.py` so a profiled window can contain real
+concurrent uniform-length requests (same prompt, temperature=0, so all N
+streams produce identical output length) instead of only sequential
+single-stream runs.
+
+**A new instance of an already-documented profiler trap.** First attempt
+(concurrency=8, 128 max_tokens, the default `torch_profiler_with_flops`/
+`torch_profiler_use_gzip` profiler config) crashed the server on
+`/stop_profile` itself: `RuntimeError: cancelled` inside
+`shm_broadcast.acquire_read`, cascading to `RuntimeError: Executor
+failed.` and a full engine death. This is the SAME root cause already in
+this file's "Two container facts that cost time" footer note (a long
+prefill trace missing its `shm_broadcast` deadline) -- just triggered by
+trace *volume* from 8 concurrent streams instead of trace *length* from
+a long prefill. Fixed by disabling the expensive profiler options
+(`torch_profiler_with_flops=false`, `torch_profiler_use_gzip=false`) and
+shortening the profiled window (`max_tokens` 128 -> 48); reran clean.
+**Lesson for next time**: keep BOTH prefill length and concurrent-request
+count small when profiling a long-lived server -- either one alone can
+generate enough trace events to miss the deadline.
+
+**Dig 06 (cross-node TP asymmetry): confirmed, independently
+reproduced.** Both ranks issue identical AllReduce call counts (4,171
+each, matching the original finding), but rank1 (10.7.0.142) consistently
+spends more wall-clock time in the collective than rank0 (10.7.0.87):
+443.36ms vs 370.04ms total (103.1 vs 85.7 &micro;s/call) over this
+9.8s window. Since `ncclDevKernel_AllReduce_Sum` blocks until both peers
+arrive, a longer measured duration on one rank means that rank is the one
+*waiting* -- so **rank0 is the systematic straggler**, matching the
+original finding's direction exactly (rank1 waited longer both times).
+Plausible, already-documented explanation: rank0 is the head node,
+carrying the API server and NFS/orchestration duties rank1 doesn't (noted
+elsewhere in this file). Magnitude is small (~73ms / ~0.7% of this
+window's wall time) -- confirmed real, not worth engineering effort to
+fix given the structural explanation and the size of the effect.
+
+**Dig 03 (GPU idle at batch=8): idle time confirmed real, but the
+original hypothesis doesn't survive contact with this session's own
+findings.** GPU busy 49.1% (rank0) / 50.0% (rank1) over the 9.8s
+window -- roughly half idle, consistent with the original ~64% busy
+finding in direction if not exact magnitude (different workload shape,
+profiler instrumentation overhead, and this is a fresh 8-concurrent-
+request batch rather than the original's sustained load). The original
+dig item specifically flagged the spin-wait/IPC path as a plausible
+cause -- but this session directly measured that knob's real effect
+earlier (`/proc`-based CPU accounting, not py-spy wall-time) and found
+**zero EngineCore CPU reduction** from turning it on. That rules out
+spin-wait inefficiency as the mechanism here. More likely: prefill
+dispatch/admission overhead and decode ramp-down at the tail of a short,
+finite concurrent batch (8 requests starting and ending together, unlike
+a sustained production stream) -- structural to how this profiling
+window was constructed, not necessarily present the same way under
+continuous real traffic. Kernel-family breakdown for context: `gemm`
+43% / `moe_exl3` 39% / `comms` 7-9% of GPU-busy time, matching the
+Blackwell-kernel investigation's earlier finding that GEMM+MoE dominate
+decode.
+
+**Production incident during this investigation**: restoring v6 after
+the profiling session hit a `CUDA error: an illegal memory access` during
+NCCL/engine init on the FIRST restore attempt -- a config that has booted
+cleanly many times this session, on a completely clean `stop` +
+`prelaunch_flush.sh` + `sparkrun run` cycle. `nvidia-smi` showed no
+orphaned processes holding the GPU (device memory reporting is N/A by
+design on GB10's unified-memory architecture, not itself a symptom here).
+A second clean stop/flush/relaunch cycle immediately after succeeded with
+no further issue; `probe_sanity.py` all-pass afterward (decode 27.56-
+29.09 tok/s, no regression). Read as residual GPU/CUDA-context state left
+over from the two profiler-triggered `EngineDeadError` crashes earlier in
+this investigation (the "trapped memory" pattern already documented for
+this cluster) rather than a new, independent failure mode -- but flagging
+plainly: **profiling this cluster carries real risk to the next boot, not
+just to the profiling session itself.** Do a clean stop/flush/relaunch
+(not just a retry-in-place) if a profiling boot crashes, and verify the
+following production restore particularly carefully.
+
+**Punch list from the original forward-pass artifact is now fully
+closed**: all four dig items (max_num_seqs sweep, Blackwell-kernel
+investigation, GPU idle at batch=8, cross-node TP asymmetry) have real,
+evidence-backed answers, alongside the FP8 LM head win, the K-pool tail
+crash fix, and the DFlash2@7168 bisection -- six substantive findings
+this session, three shipped to production (v4/v5/v6), three concluded
+negative with hard evidence (attention FP8, per-channel scaling, DFlash2).

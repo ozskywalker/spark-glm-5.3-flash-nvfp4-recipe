@@ -1,0 +1,287 @@
+{
+  "trace": "10_7_0_87__dp0_pp0_tp0_dcp0_ep0_rank0.1788412467765151397.pt.trace.json",
+  "n_kernel_events": 130352,
+  "n_profiler_steps": 0,
+  "wall_span_ms": 9791.733,
+  "gpu_busy_ms": 4803.572,
+  "gpu_busy_pct": 49.06,
+  "gpu_idle_ms": 4988.161,
+  "sum_kernel_ms": 5004.286,
+  "categories": {
+    "gemm": {
+      "ms": 2170.257,
+      "pct_of_kernel_time": 43.37,
+      "count": 25538,
+      "us_per_call": 84.98
+    },
+    "moe_exl3": {
+      "ms": 1952.571,
+      "pct_of_kernel_time": 39.02,
+      "count": 3788,
+      "us_per_call": 515.46
+    },
+    "comms": {
+      "ms": 370.038,
+      "pct_of_kernel_time": 7.39,
+      "count": 4300,
+      "us_per_call": 86.06
+    },
+    "other": {
+      "ms": 299.146,
+      "pct_of_kernel_time": 5.98,
+      "count": 14395,
+      "us_per_call": 20.78
+    },
+    "memory": {
+      "ms": 80.289,
+      "pct_of_kernel_time": 1.6,
+      "count": 35517,
+      "us_per_call": 2.26
+    },
+    "elementwise": {
+      "ms": 75.153,
+      "pct_of_kernel_time": 1.5,
+      "count": 35997,
+      "us_per_call": 2.09
+    },
+    "attention": {
+      "ms": 17.434,
+      "pct_of_kernel_time": 0.35,
+      "count": 2284,
+      "us_per_call": 7.63
+    },
+    "mamba_ssm": {
+      "ms": 11.882,
+      "pct_of_kernel_time": 0.24,
+      "count": 1591,
+      "us_per_call": 7.47
+    },
+    "embedding": {
+      "ms": 11.036,
+      "pct_of_kernel_time": 0.22,
+      "count": 2379,
+      "us_per_call": 4.64
+    },
+    "norm": {
+      "ms": 9.124,
+      "pct_of_kernel_time": 0.18,
+      "count": 2881,
+      "us_per_call": 3.17
+    },
+    "quant": {
+      "ms": 4.091,
+      "pct_of_kernel_time": 0.08,
+      "count": 824,
+      "us_per_call": 4.96
+    },
+    "sampling": {
+      "ms": 3.266,
+      "pct_of_kernel_time": 0.07,
+      "count": 858,
+      "us_per_call": 3.81
+    }
+  },
+  "scopes": {},
+  "top_kernels": [
+    {
+      "name": "void exl3_moe_kernel<4, 256>(__half const*, __half*, __half*, __half*, __half*, float*, unsigned short const**, __half const**, __half const**, unsigned short const**, __half const**, __half const**, unsigned short const**, __half const**, __half const**, long const*, long const*, __half const*, int, int, int, int, int, int, float, int, int, int, int, int*)",
+      "cat": "moe_exl3",
+      "ms": 1930.746,
+      "pct": 38.58,
+      "count": 1892,
+      "us_per_call": 1020.48
+    },
+    {
+      "name": "void cutlass::Kernel2<cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_16x16_128x1_tn_align8>(cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_16x16_128x1_tn_align8::Params)",
+      "cat": "gemm",
+      "ms": 655.819,
+      "pct": 13.11,
+      "count": 4768,
+      "us_per_call": 137.55
+    },
+    {
+      "name": "void cutlass::Kernel2<cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_128x1_tn_align8>(cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_128x1_tn_align8::Params)",
+      "cat": "gemm",
+      "ms": 503.662,
+      "pct": 10.06,
+      "count": 1100,
+      "us_per_call": 457.87
+    },
+    {
+      "name": "ncclDevKernel_AllReduce_Sum_bf16_RING_LL(ncclDevKernelArgsStorage<4096ul>)",
+      "cat": "comms",
+      "ms": 357.608,
+      "pct": 7.15,
+      "count": 4171,
+      "us_per_call": 85.74
+    },
+    {
+      "name": "void cutlass::Kernel2<cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_128x1_tn_align2>(cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_128x1_tn_align2::Params)",
+      "cat": "gemm",
+      "ms": 247.193,
+      "pct": 4.94,
+      "count": 2024,
+      "us_per_call": 122.13
+    },
+    {
+      "name": "fused_recurrent_gated_delta_rule_fwd_kernel",
+      "cat": "other",
+      "ms": 186.495,
+      "pct": 3.73,
+      "count": 1394,
+      "us_per_call": 133.78
+    },
+    {
+      "name": "void cutlass::Kernel2<cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_16x16_128x2_tn_align8>(cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_16x16_128x2_tn_align8::Params)",
+      "cat": "gemm",
+      "ms": 152.259,
+      "pct": 3.04,
+      "count": 3235,
+      "us_per_call": 47.07
+    },
+    {
+      "name": "_ZN7cutlass13device_kernelI19enable_sm120_familyINS_4gemm6kernel13GemmUniversalIN4cute5tupleIJiiiiEEENS2_10collective13CollectiveMmaINS2_31MainloopSm120TmaWarpSpecializedILi9ELi2ENS6_IJNS5_1CILi1EEESC_SC_EEENS2_37KernelTmaWarpSpecializedPingpongSm120ILi2EEEEENS6_IJNSB_ILi16EEENSB_ILi64EEENSB_ILi128EEEEEENS_12float_e4m3_tENS6_IJlSC_lEEESL_SM_NS5_8TiledMMAINS5_8MMA_AtomIJNS5_16SM120_16x8x32_TNISL_SL_fEEEEENS5_6LayoutINS6_IJNSB_ILi2EEEST_SC_EEENS6_IJSC_ST_NSB_ILi0EEEEEEEENS6_IJSH_NSB_ILi32EEESY_EEEEENS5_13SM90_TMA_LOADENS5_14ComposedLayoutINS5_7SwizzleILi3ELi4ELi3EEENS5_18smem_ptr_flag_bitsILi8EEENSS_INS6_IJNSB_ILi8EEESJ_EEENS6_IJSJ_SC_EEEEEEENS5_9Copy_AtomIJNS5_17SM75_U32x4_LDSM_NEhEEENS5_8identityES11_S1B_S1E_S1F_EENS_8epilogue10collective18CollectiveEpilogueINS1H_22Sm90TmaWarpSpecializedILi2ELi2ELi4ELb0ELb1EEEJSK_NS6_IJSH_SY_EEEvSM_NS_10bfloat16_tESM_NS1H_6fusion15Sm90TreeVisitorINS1O_11Sm90ComputeINS_10multipliesES1N_fLNS_15FloatRoundStyleE2EvEEJNS1O_24Sm90ColOrScalarBroadcastILi0ESK_fNS6_IJSC_SV_SV_EEELi4EEENS1P_INS1Q_IS1R_ffLS1S_2EvEEJNS1O_24Sm90RowOrScalarBroadcastILi0ESK_fNS6_IJSV_SC_SV_EEELi4EEENS1O_12Sm90AccFetchEEEEEEES11_NS12_INS13_ILi2ELi4ELi3EEENS15_ILi16EEENSS_INS6_IJS17_SY_EEENS6_IJSY_SC_EEEEEEENS5_17SM75_U32x2_LDSM_NENS5_14SM90_TMA_STOREES29_NS5_17SM90_U32x2_STSM_NENS1C_IJS2C_NS_6half_tEEEEvEEEvvEEEEEvNT_6ParamsE",
+      "cat": "gemm",
+      "ms": 152.138,
+      "pct": 3.04,
+      "count": 108,
+      "us_per_call": 1408.69
+    },
+    {
+      "name": "nvjet_sm121_tst_mma_64x32x64_8_16x32x64_tmaAB_bz_TNNN",
+      "cat": "gemm",
+      "ms": 114.765,
+      "pct": 2.29,
+      "count": 1210,
+      "us_per_call": 94.85
+    },
+    {
+      "name": "nvjet_sm121_tst_mma_192x16x64_3_32x16x64_tmaAB_splitK_TNNN",
+      "cat": "gemm",
+      "ms": 43.341,
+      "pct": 0.87,
+      "count": 2420,
+      "us_per_call": 17.91
+    },
+    {
+      "name": "nvjet_sm121_tst_mma_96x64x64_4_16x64x64_tmaAB_bz_TNNN",
+      "cat": "gemm",
+      "ms": 35.041,
+      "pct": 0.7,
+      "count": 264,
+      "us_per_call": 132.73
+    },
+    {
+      "name": "nvjet_sm121_tst_mma_128x144x64_2_32x72x64_tmaAB_bz_TNNN",
+      "cat": "gemm",
+      "ms": 30.928,
+      "pct": 0.62,
+      "count": 50,
+      "us_per_call": 618.56
+    },
+    {
+      "name": "_ZN7cutlass13device_kernelI19enable_sm120_familyINS_4gemm6kernel13GemmUniversalIN4cute5tupleIJiiiiEEENS2_10collective13CollectiveMmaINS2_31MainloopSm120TmaWarpSpecializedILi7ELi2ENS6_IJNS5_1CILi1EEESC_SC_EEENS2_37KernelTmaWarpSpecializedPingpongSm120ILi2EEEEENS6_IJNSB_ILi32EEENSB_ILi64EEENSB_ILi128EEEEEENS_12float_e4m3_tENS6_IJlSC_lEEESL_SM_NS5_8TiledMMAINS5_8MMA_AtomIJNS5_16SM120_16x8x32_TNISL_SL_fEEEEENS5_6LayoutINS6_IJNSB_ILi2EEEST_SC_EEENS6_IJSC_ST_NSB_ILi0EEEEEEEENS6_IJSH_SH_SH_EEEEENS5_13SM90_TMA_LOADENS5_14ComposedLayoutINS5_7SwizzleILi3ELi4ELi3EEENS5_18smem_ptr_flag_bitsILi8EEENSS_INS6_IJNSB_ILi8EEESJ_EEENS6_IJSJ_SC_EEEEEEENS5_9Copy_AtomIJNS5_17SM75_U32x4_LDSM_NEhEEENS5_8identityES10_S1A_S1D_S1E_EENS_8epilogue10collective18CollectiveEpilogueINS1G_22Sm90TmaWarpSpecializedILi2ELi2ELi4ELb0ELb1EEEJSK_NS6_IJSH_SH_EEEvSM_NS_10bfloat16_tESM_NS1G_6fusion15Sm90TreeVisitorINS1N_11Sm90ComputeINS_10multipliesES1M_fLNS_15FloatRoundStyleE2EvEEJNS1N_24Sm90ColOrScalarBroadcastILi0ESK_fNS6_IJSC_SV_SV_EEELi4EEENS1O_INS1P_IS1Q_ffLS1R_2EvEEJNS1N_24Sm90RowOrScalarBroadcastILi0ESK_fNS6_IJSV_SC_SV_EEELi4EEENS1N_12Sm90AccFetchEEEEEEES10_NS11_INS12_ILi2ELi4ELi3EEENS14_ILi16EEENSS_INS6_IJS16_SH_EEENS6_IJSH_SC_EEEEEEENS5_17SM75_U32x2_LDSM_NENS5_14SM90_TMA_STOREES28_NS5_17SM90_U32x2_STSM_NENS1B_IJS2B_NS_6half_tEEEEvEEEvvEEEEEvNT_6ParamsE",
+      "cat": "gemm",
+      "ms": 30.532,
+      "pct": 0.61,
+      "count": 21,
+      "us_per_call": 1453.88
+    },
+    {
+      "name": "void deep_gemm::sm120_tf32_hc_prenorm_gemm_impl<24u, 16384u, 128u, 32u, 64u, 48u, 4u, 256u, 128u>(unsigned int, CUtensorMap_st, CUtensorMap_st, float*, float*)",
+      "cat": "gemm",
+      "ms": 28.341,
+      "pct": 0.57,
+      "count": 2000,
+      "us_per_call": 14.17
+    },
+    {
+      "name": "void cublasLt::splitKreduce_kernel<32, 16, int, float, __nv_bfloat16, float, __nv_bfloat16, false, float, __nv_bfloat16, __nv_bfloat16, true, false, false, false>(cublasLt::cublasSplitKParams<float>, float const*, __nv_bfloat16 const*, float*, __nv_bfloat16*, float const*, float const*, __nv_bfloat16 const*, float const*, __nv_bfloat16*, void*, long, float*, int*, float*, float*, float const*, float const*, float const*, float const*, float const*)",
+      "cat": "gemm",
+      "ms": 28.215,
+      "pct": 0.56,
+      "count": 2444,
+      "us_per_call": 11.54
+    },
+    {
+      "name": "mhc_pre_big_fuse_with_norm_tilelang_kernel",
+      "cat": "other",
+      "ms": 25.693,
+      "pct": 0.51,
+      "count": 3870,
+      "us_per_call": 6.64
+    },
+    {
+      "name": "void cutlass::Kernel2<cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_64x2_nn_align8>(cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_64x2_nn_align8::Params)",
+      "cat": "gemm",
+      "ms": 23.909,
+      "pct": 0.48,
+      "count": 526,
+      "us_per_call": 45.45
+    },
+    {
+      "name": "mhc_fused_tilelang_kernel",
+      "cat": "other",
+      "ms": 21.867,
+      "pct": 0.44,
+      "count": 1780,
+      "us_per_call": 12.28
+    },
+    {
+      "name": "void vllm::moe::single_group_topk::detail::single_group_topk_block_kernel<float, float, int, (vllm::moe::ScoringFunc)1, 384, 8>(float const*, float*, int*, float const*, long, long, bool, float, bool)",
+      "cat": "moe_exl3",
+      "ms": 21.414,
+      "pct": 0.43,
+      "count": 1892,
+      "us_per_call": 11.32
+    },
+    {
+      "name": "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1}, std::array<char*, 2ul>, 4, TrivialOffsetCalculator<1, unsigned int>, TrivialOffsetCalculator<1, unsigned int>, at::native::memory::LoadWithCast<1>, at::native::memory::StoreWithCast<1> >(int, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1}, std::array<char*, 2ul>, TrivialOffsetCalculator<1, unsigned int>, TrivialOffsetCalculator<1, unsigned int>, at::native::memory::LoadWithCast<1>, at::native::memory::StoreWithCast<1>)",
+      "cat": "memory",
+      "ms": 19.678,
+      "pct": 0.39,
+      "count": 4343,
+      "us_per_call": 4.53
+    },
+    {
+      "name": "void at::native::radixSortKVInPlace<-2, -1, 32, 32, long, long, unsigned int>(at::cuda::detail::TensorInfo<long, unsigned int>, unsigned int, unsigned int, unsigned int, at::cuda::detail::TensorInfo<long, unsigned int>, unsigned int, bool)",
+      "cat": "other",
+      "ms": 18.243,
+      "pct": 0.36,
+      "count": 946,
+      "us_per_call": 19.28
+    },
+    {
+      "name": "void gemmSN_NN_kernel<float, 256, 4, 2, 8, 3, 4, false, cublasGemvTensorStridedBatched<float const>, cublasGemvTensorStridedBatched<float const>, cublasGemvTensorStridedBatched<float> >(cublasGemmSmallNParams<cublasGemvTensorStridedBatched<float const>, cublasGemvTensorStridedBatched<float const>, cublasGemvTensorStridedBatched<float>, float>)",
+      "cat": "gemm",
+      "ms": 16.47,
+      "pct": 0.33,
+      "count": 240,
+      "us_per_call": 68.62
+    },
+    {
+      "name": "nvjet_sm121_tst_mma_192x104x64_2_32x104x64_tmaAB_bz_TNNN",
+      "cat": "gemm",
+      "ms": 16.408,
+      "pct": 0.33,
+      "count": 169,
+      "us_per_call": 97.09
+    },
+    {
+      "name": "void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_128x128_64x3_tn_align8>(cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_128x128_64x3_tn_align8::Params)",
+      "cat": "gemm",
+      "ms": 15.989,
+      "pct": 0.32,
+      "count": 55,
+      "us_per_call": 290.71
+    },
+    {
+      "name": "mhc_post_tilelang_kernel",
+      "cat": "other",
+      "ms": 15.64,
+      "pct": 0.31,
+      "count": 2090,
+      "us_per_call": 7.48
+    }
+  ]
+}

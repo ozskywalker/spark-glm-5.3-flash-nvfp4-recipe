@@ -10,15 +10,23 @@ decode steps and a profiled window that contains the prefill answer different
 questions, so --workload selects the shape and --prefill-only stops generation
 after a single token to isolate prefill.
 
+--concurrency N fires each repeat as N concurrent UNIFORM-length requests
+(same prompt, same max_tokens, all submitted before any waits on a result)
+instead of one at a time -- for dig items that need to see the GPU under real
+concurrent load (e.g. "the 4.7s of GPU idle at batch=8"), not N sequential
+single-stream traces stitched together.
+
 Usage:
   probe_profile_run.py --workload prose|structured|medium|longctx
-                       [--prefill-only] [--max-tokens N] [--base-url URL]
+                       [--prefill-only] [--max-tokens N] [--concurrency N]
+                       [--base-url URL]
 """
 
 import argparse
 import json
 import time
 import urllib.error
+from concurrent.futures import ThreadPoolExecutor
 import urllib.request
 
 WORKLOADS = {
@@ -58,6 +66,8 @@ def main():
     ap.add_argument("--longctx-tokens", type=int, default=100000,
                     help="approximate prompt size for --workload longctx")
     ap.add_argument("--repeat", type=int, default=1)
+    ap.add_argument("--concurrency", type=int, default=1,
+                    help="fire each repeat as N concurrent uniform requests instead of 1")
     args = ap.parse_args()
     base = args.base_url.rstrip("/")
 
@@ -79,20 +89,31 @@ def main():
     except urllib.error.HTTPError as e:
         if e.code == 404:
             raise SystemExit("No /start_profile endpoint — server was not launched with "
-                             "a --profiler-config. Use recipes/glm-5.3-flash-exl3-v2-profiling.yaml.")
+                             "a --profiler-config. Use recipes/glm-5.3-flash-exl3-v6-profiling.yaml.")
         raise
 
-    t0 = time.perf_counter()
-    for i in range(args.repeat):
-        body = post(base, "/v1/chat/completions", {
+    def one_call():
+        return post(base, "/v1/chat/completions", {
             "model": args.model,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": max_tokens, "temperature": 0,
             "chat_template_kwargs": {"enable_thinking": False},
         })
-        u = body.get("usage", {})
-        print(f"  run {i+1}: prompt_tokens={u.get('prompt_tokens')} "
-              f"completion_tokens={u.get('completion_tokens')}")
+
+    t0 = time.perf_counter()
+    for i in range(args.repeat):
+        if args.concurrency > 1:
+            with ThreadPoolExecutor(max_workers=args.concurrency) as ex:
+                bodies = list(ex.map(lambda _: one_call(), range(args.concurrency)))
+            for j, body in enumerate(bodies):
+                u = body.get("usage", {})
+                print(f"  run {i+1}.{j+1}: prompt_tokens={u.get('prompt_tokens')} "
+                      f"completion_tokens={u.get('completion_tokens')}")
+        else:
+            body = one_call()
+            u = body.get("usage", {})
+            print(f"  run {i+1}: prompt_tokens={u.get('prompt_tokens')} "
+                  f"completion_tokens={u.get('completion_tokens')}")
     workload_s = time.perf_counter() - t0
 
     print("stop_profile:", post(base, "/stop_profile", timeout=600))
