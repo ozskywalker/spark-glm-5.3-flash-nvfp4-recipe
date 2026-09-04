@@ -509,7 +509,17 @@ defaults:
   # a *different* problem (post-weight-load KV-sizing shortfall, not this
   # startup free-memory check) — 0.86 splits the difference with informed
   # backing rather than guessing.
-  gpu_memory_utilization: 0.86
+  #
+  # Dropped 0.86 -> 0.84 (2026-09-04): the 6.17.0-1032-nvidia kernel bump
+  # (see VALIDATION.md) shrank the head-node startup free-memory margin
+  # enough that earlyoom killed the head twice in a row at 0.86. Retested
+  # after fully rebooting both nodes a second time (fresh kernel/driver
+  # state, not just a fresh container) to rule out post-reboot settling —
+  # the head node still plateaued at ~1.3% mem-avail / 80.03% swap-free,
+  # 0.03pp from earlyoom's 80.00% kill trigger, i.e. still on the same
+  # knife-edge, just not tipped over yet. Not treating a lucky non-kill as
+  # cleared; 0.84 is the validated safe value on this kernel.
+  gpu_memory_utilization: 0.84
   kv_cache_dtype: fp8
   # Raised 2048 -> 7168 (2026-09-02): matches upstream's own current
   # production value (discovered via the PR80 merge conflict in README.md
@@ -1029,6 +1039,74 @@ command: |
 
 
   _patch_mamba_state_copy_race()
+
+
+  def _fix_glm53_mixed_prefill_env():
+      """GLM53_MIXED_PREFILL_CHUNK does not survive into the EngineCore
+      subprocess under --distributed-executor-backend mp: confirmed via
+      /proc/<pid>/environ that this var (plus GLM53_INDEXER_WORKSPACE and
+      GLM53_SUPPRESS_STOPS_IN_REASONING) is present in this entrypoint
+      process but absent from the spawned EngineCore's actual environment,
+      while GLM53_FP8_LMHEAD_SCALE_MODE/GLM53_SPINWAIT_MS survive the same
+      spawn. Root cause not fully pinned down (ruled out: the mp-backend's
+      CoreEngineProcManager spawns via a bare context.Process() with no
+      explicit env= filtering; Ray's get_env_vars_to_copy allowlist isn't
+      in this backend's path at all) -- so sidestep it instead of chasing
+      it further: this module reliably re-executes at import time in every
+      spawned process (see the mamba-race-fix note above), so capture the
+      value into a file on the FIRST execution (this entrypoint process
+      always has it correct) and have every re-execution -- including a
+      child whose own os.environ is missing the key -- read the file as a
+      fallback. Monkeypatches the scheduler's policy function directly
+      rather than re-deriving cap/skip logic at the call site.
+      """
+      import vllm.v1.core.sched.scheduler as _sched_mod
+
+      state_path = "/tmp/glm53_mixed_prefill_chunk.state"
+      if "GLM53_MIXED_PREFILL_CHUNK" in os.environ:
+          with open(state_path, "w") as f:
+              f.write(os.environ["GLM53_MIXED_PREFILL_CHUNK"])
+
+      def _read_value():
+          if "GLM53_MIXED_PREFILL_CHUNK" in os.environ:
+              return os.environ["GLM53_MIXED_PREFILL_CHUNK"]
+          try:
+              with open(state_path) as f:
+                  return f.read().strip()
+          except OSError:
+              return "skip"
+
+      def _patched_policy(running, current):
+          raw = _read_value().strip().lower()
+          if raw in ("0", "off", "no"):
+              return None
+          if raw in ("skip", "-1"):
+              cap = 0
+          else:
+              try:
+                  cap = int(raw)
+              except ValueError:
+                  cap = 0
+              if cap <= 0:
+                  return None
+          cur_id = getattr(current, "request_id", None)
+          for r in running:
+              if r is current or getattr(r, "request_id", None) == cur_id:
+                  continue
+              if r.num_computed_tokens >= r.num_prompt_tokens:
+                  return cap
+          return None
+
+      _sched_mod._glm53_mixed_prefill_policy = _patched_policy
+      print(
+          f"[glm53-mixed-prefill-env-fix] value={_read_value()!r} pinned "
+          f"into scheduler via {state_path} "
+          f"(pid={os.getpid()}, __name__={__name__!r})",
+          file=sys.stderr, flush=True,
+      )
+
+
+  _fix_glm53_mixed_prefill_env()
 
   if __name__ == "__main__":
       sys.argv[0] = "vllm"

@@ -3636,3 +3636,78 @@ THIRD silent-kill incident in one production day with no available
 code-level fix (Crash B and this one), an automated watchdog for faster
 detection+recovery is worth doing regardless of whether a root cause is
 ever found -- proposed to the user, not yet built.
+
+## A host reboot masquerading as a crash, a real earlyoom regression, and a genuine negative result on GLM53_MIXED_PREFILL_CHUNK=512 (2026-09-04)
+
+The fleet was down when this session started. Checked before touching anything, per the project's own "check logs first" discipline -- and it was NOT a repeat of the TileLang/#54317 pattern above. Both containers exited 137 within 15 seconds of each other on both nodes, and `apt history.log` + `uptime -s` confirmed why: a routine `apt upgrade`/`full-upgrade` installed `linux-image-6.17.0-1032-nvidia` (kernel bump 1031->1032) and rebooted both nodes at ~06:41 local. No `EngineDeadError`, no scheduler dump, no Xid -- just an OS-level SIGKILL from a plain reboot. Confirmed the NVIDIA driver itself was untouched: `nvidia-driver-580-open`/`libnvidia-*-580`/`nvidia-utils-580` have been pinned at **580.173.02 since 2026-08-03** (`dpkg.log.1`), over a month before this incident and unchanged across yesterday's stable 13-hour v8 boot -- the update only rebuilt the kernel-ABI-specific module package (`linux-modules-nvidia-580-open-6.17.0-1032-nvidia`) against the new kernel. Driver-version regression ruled out.
+
+### New failure mode: earlyoom kills the head on a clean, freshly-rebooted node
+
+Relaunching the validated v8 recipe (`gpu_memory_utilization=0.86`, unchanged from the config that had just run stably for 13+ hours) died **twice in a row**, at the identical boot phase, at the identical threshold:
+
+```
+07:05:04  earlyoom: mem avail 2.00%, swap 80.00% -- SIGTERM python3 (VmRSS 4123 MiB)
+07:54:11  earlyoom: mem avail 2.00%, swap 80.00% -- SIGTERM python3 (VmRSS 4314 MiB)
+```
+
+Both times: moments after CUDA graph capture finished and "Application startup complete" logged, on the **head node only** (`10.7.0.87`) -- the local node's memory stayed flat and healthy throughout. On GB10, host RAM and GPU memory are the same unified pool, so this is the same resource class as every NVRM-OOM bug already documented in this file, just caught by the OS watchdog (`earlyoom`, an installed systemd service) instead of the CUDA allocator. This is the project's own "two consecutive unexplained deaths = stop and diagnose" trigger; stopped after the second, rather than crash-looping a third blind retry.
+
+Per the user's preference for smaller steps than the 0.86->0.82 jump used for this exact symptom class earlier in the project (`docs/...` KV/memory-ladder history), tried **0.84** (a 0.02 step) first. Clean boot, 7.9-7.9 GiB head margin at the exact point that had been down to ~2.5 GiB twice -- held for the remainder of the session across three more relaunches. Root cause of the shrunk margin on an otherwise-identical, freshly-rebooted config was not pinned down (candidates: post-reboot host noise from `wazuh-agent`/`rasdaemon`/apt cleanup still settling, or a kernel-level -- not driver-level -- behavior change between 6.17.0-1031 and -1032); the practical fix is what's recorded here. **v8's shipped `gpu_memory_utilization` should be reconsidered at 0.84 rather than 0.86** if this recurs on future reboots.
+
+### A real, previously-undocumented env-propagation bug found while trying to A/B GLM53_MIXED_PREFILL_CHUNK=512
+
+The actual task: measure `GLM53_MIXED_PREFILL_CHUNK=512` (a per-step token cap on cold prefill progress when a peer is decoding) against the shipped `skip` (a hard cap=0 stall) -- read directly from the image's patched `vllm/v1/core/sched/scheduler.py`:
+
+```python
+def _glm53_mixed_prefill_policy(running, current):
+    # None = no extra policy. 0 = skip this prefill this step. N>0 = cap.
+    raw = os.environ.get("GLM53_MIXED_PREFILL_CHUNK", "skip")...
+```
+
+First attempt (`sparkrun run ... -e GLM53_MIXED_PREFILL_CHUNK=512`) produced results statistically identical to the `skip` baseline. Before trusting a null result, checked whether the value actually reached the code that reads it -- this project's own history with `GLM53_SPINWAIT_MS` silently not applying was reason enough to check. Compared `/proc/<pid>/environ` across the process tree on the live container:
+
+| Process | `MIXED_PREFILL_CHUNK` | `INDEXER_WORKSPACE` | `SUPPRESS_STOPS_IN_REASONING` | `FP8_LMHEAD_SCALE_MODE` | `SPINWAIT_MS` |
+|---|---|---|---|---|---|
+| entrypoint (`__main__`) | present (512) | present | present | present | present |
+| **`VLLM::EngineCore`** (`__mp_main__`) | **missing** | **missing** | **missing** | present | present |
+
+Three of five custom `GLM53_*` knobs vanish somewhere between the entrypoint process and the `EngineCore` subprocess spawned by `--distributed-executor-backend mp`; `_glm53_mixed_prefill_policy` silently falls back to its `"skip"` default when the key is absent -- exactly explaining the null result, since the "512" boot was functionally running `skip` the whole time.
+
+Ruled out the obvious suspect: this deployment uses the plain multiprocessing (`mp`) backend, whose `CoreEngineProcManager.__init__` (`vllm/v1/engine/utils.py`) spawns via a bare `context.Process(...)` with no explicit `env=` filtering. Ray's executor path *does* have exactly this kind of mechanism (`get_env_vars_to_copy`, an allowlist keyed on `VLLM_`/`FLASH_ATTENTION_`/`NCCL_`/etc. prefixes plus names formally registered in `vllm.envs.environment_variables` -- nothing `GLM53_`-prefixed would survive it), but that class (`CoreEngineActorManager`) isn't in this backend's path at all. Also ruled out a Rust scheduler reimplementation shadowing the Python one (the image ships `vllm-rs` and a `_rust_tool_parser.abi3.so`, but the latter is scoped to tool-call parsing only; no Rust scheduler component found). **Exact mechanism not pinned down** -- something strips these three specific vars from the parent's `os.environ` between entrypoint start and `EngineCore.start()`, while sparing two others set the identical way in the identical recipe `env:` block. Further diagnosis would mean instrumenting vLLM's own arg-parsing/config-validation path inside the image, not attempted here.
+
+**Fix applied** (`recipes/glm-5.3-flash-exl3-v8-vllm.yaml`, in the shim heredoc): since the shim module provably re-executes at import time in every spawned child (that's the documented mechanism the mamba-race-fix patch already relies on), capture the value into a file on first execution (the entrypoint process always has it correct) and have every re-execution -- including a child whose own `os.environ` is missing the key -- fall back to the file. Monkeypatches `_glm53_mixed_prefill_policy` directly rather than re-deriving the cap/skip logic at each call site. Verified fixed: `[glm53-mixed-prefill-env-fix] value='512' pinned into scheduler` printed in all three processes (entrypoint + both `__mp_main__` children) on the next boot, confirmed against `/proc/<EngineCore-pid>/environ` no longer being the deciding factor.
+
+### The actual A/B: still a clean negative, even with the bug fixed
+
+Reproduced the exact test shape from the PR80/"gate v2" investigation above (prime a cached prefix, start a decode on it, fire an identical-prompt `max_tokens=1` follow-up mid-decode) plus a second scenario this project hadn't tested before -- a brand-new cold prompt arriving while an unrelated generation decodes (`recipes/probes/probe_mixed_prefill_ab.py`, new script, both scenarios include a solo/uncontended control). All runs: v8 recipe, `gpu_memory_utilization=0.84`, MTP k=2.
+
+| Scenario | Metric | `skip` (n=3-4) | `512`, broken env (n=1) | `512`, **fixed** (n=3) |
+|---|---|---:|---:|---:|
+| warm follow-up | solo TTFT | 5.76s | 5.84s | 5.74s |
+| warm follow-up | contended TTFT | **13.03s** | 12.70s | **12.96s** |
+| cold intake | solo latency | 4.01s | 4.03s | 4.01s |
+| cold intake | contended latency | **19.95s** | 22.18s | **20.42s** |
+
+Even with `512` confirmed live in the scheduler, both scenarios show **no measurable improvement** over `skip` -- the spread between configs is smaller than the natural run-to-run noise within a single config (e.g. `skip`'s own cold-intake numbers spanned 18.7-22.1s across three runs). This is not the "gate didn't fire" bug from earlier in this file (that was a real, fixed propagation bug) -- this is the actual scheduling behavior once the knob is provably wired correctly.
+
+**Leading hypothesis, not confirmed**: the same MTP-vs-DFlash2 mismatch already documented for gate v2 above -- "`num_computed_tokens` ... may differ meaningfully between the two speculators ... in a way that defeats the 'remaining uncached prefill' computation specifically under MTP." A flat numeric cap depends on the identical `num_computed_tokens`/`num_prompt_tokens` bookkeeping gate v2's broken warm-bypass depended on; if that bookkeeping doesn't behave as expected under MTP k=2, no value of `GLM53_MIXED_PREFILL_CHUNK` would show an effect here, regardless of env-propagation. Confirming this would need scheduler-level instrumentation, which this project already established is unreliable on this cluster (see the profiling-crash findings earlier in this document) -- not attempted.
+
+**Verdict: do not adopt `GLM53_MIXED_PREFILL_CHUNK=512`.** No benefit observed under this recipe's actual speculator config, measured rigorously (env-propagation confirmed, solo controls included, n=3-4 per arm, low variance). The shipped `skip` default stands. The env-propagation fix itself is kept in the recipe regardless -- it's inert when the var is left at its default, and it correctly unblocks `GLM53_INDEXER_WORKSPACE`/`GLM53_SUPPRESS_STOPS_IN_REASONING` too, which were silently suffering the identical bug.
+
+### Retest after a second, fuller reboot: 0.86 still unsafe, 0.84 confirmed and shipped
+
+At the user's request, both nodes were rebooted a second time and a clean boot of v8 was retried at the still-shipped `gpu_memory_utilization=0.86` -- specifically to test whether the shrunk margin above was a transient artifact of the *first* post-upgrade reboot (page cache/services still settling) that a genuinely fresh kernel/driver state would clear, rather than a real, durable regression. Confirmed both nodes were actually fresh before touching anything (`uptime -s`: ~2 min since boot on both, same driver `580.173.02`, no processes on either GPU) and ran the mandatory `prelaunch_flush.sh --during-load` ritual before launching.
+
+**Result: it did not clear.** The boot itself survived this time -- unlike the two immediate kills documented above -- but only by sitting on the identical knife-edge, not by having a healthy margin:
+
+```
+head node, ~15 min post-boot, plateaued and stable at:
+  mem avail:  ~1.6 GiB (1.3-1.6%)   -- already below earlyoom's 2.00% SIGTERM trigger
+  swap free:  80.03-80.15%           -- 0.03-0.15 points above the 80.00% trigger
+```
+
+Both numbers held steady (not climbing toward danger, but not recovering either) for the ~15 minutes observed, with `/health` returning 200 throughout and the worker node (127.0.0.1) unaffected (5.4 GiB / 4.5% available) -- same head-node-only asymmetry as the original incident. A margin that survives only because swap-free sits a few hundredths of a percentage point clear of a hard trigger is not meaningfully different from the config that already died twice; treating a non-kill here as "cleared" would be trusting noise. Root cause is still not pinned down (same candidates as above -- this doesn't distinguish between them), but the practical question the retest was designed to answer has a clear answer: **freshness of the kernel/driver state does not restore 0.86's margin.**
+
+Stopped that boot, dropped `gpu_memory_utilization` to **0.84** in `recipes/glm-5.3-flash-exl3-v8-vllm.yaml` (no longer just a "reconsider if it recurs" note -- promoted to the shipped value), re-ran the flush ritual, and relaunched. Clean boot, weights loaded in 390s as expected, `Application startup complete` reached normally, and the head-node margin at the same post-startup checkpoint was **~6.7 GiB (5.3-5.4%) available, holding flat** -- roughly 4x the earlyoom trigger and not drifting, a categorically different (and comfortable) result from either 0.86 attempt. `/health` returns 200; worker node margin also healthy (9.9 GiB / 8.2%).
+
+**v8 now ships at `gpu_memory_utilization=0.84`.** Given this project's own two-strikes discipline, that's now two independent post-reboot boots at 0.86 in unsafe territory (one outright killed twice, one surviving only within noise of the same trigger) against one clean, comfortably-margined boot at 0.84 -- enough to promote rather than keep watching.

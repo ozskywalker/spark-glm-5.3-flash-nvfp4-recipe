@@ -6,4 +6,5 @@ __pycache__/
 # Derived summaries live in analysis/ and are committed.
 traces/
 cpu_profiles/
+cpu_profiles_spinwait/
 recipes/probes/__pycache__/
