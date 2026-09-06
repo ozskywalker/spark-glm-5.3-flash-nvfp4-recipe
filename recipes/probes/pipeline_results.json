@@ -2,73 +2,73 @@
   {
     "workload": "short_prose_cold",
     "n": 6,
-    "wall_s_per_req": 4.957,
-    "avg_e2e_s": 4.9515,
+    "wall_s_per_req": 4.642,
+    "avg_e2e_s": 4.6376,
     "avg_queue_s": 1e-05,
-    "avg_prefill_s": 0.2287,
-    "avg_decode_s": 4.654,
-    "avg_inference_s": 4.8828,
-    "avg_ttft_s": 0.2978,
+    "avg_prefill_s": 0.2172,
+    "avg_decode_s": 4.3775,
+    "avg_inference_s": 4.5947,
+    "avg_ttft_s": 0.2603,
     "avg_prompt_tokens": 23.0,
     "avg_gen_tokens": 128.0,
-    "draft_tokens": 614.0,
-    "accepted_tokens": 462.0,
-    "accept_rate": 0.7524,
+    "draft_tokens": 620.0,
+    "accepted_tokens": 460.0,
+    "accept_rate": 0.7419,
     "accept_per_pos": {
-      "0": 286.0,
-      "1": 176.0
+      "0": 283.0,
+      "1": 177.0
     },
     "flops_total": 0.0,
     "read_bytes_total": 0.0,
     "write_bytes_total": 0.0,
-    "decode_tok_s": 27.29
+    "decode_tok_s": 29.01
   },
   {
     "workload": "structured_counting",
     "n": 6,
-    "wall_s_per_req": 6.731,
-    "avg_e2e_s": 6.7256,
+    "wall_s_per_req": 6.33,
+    "avg_e2e_s": 6.3251,
     "avg_queue_s": 1e-05,
-    "avg_prefill_s": 0.2403,
-    "avg_decode_s": 6.413,
-    "avg_inference_s": 6.6533,
-    "avg_ttft_s": 0.3125,
+    "avg_prefill_s": 0.2492,
+    "avg_decode_s": 6.0062,
+    "avg_inference_s": 6.2555,
+    "avg_ttft_s": 0.3189,
     "avg_prompt_tokens": 32.0,
     "avg_gen_tokens": 200.0,
-    "draft_tokens": 818.0,
-    "accepted_tokens": 787.0,
-    "accept_rate": 0.9621,
+    "draft_tokens": 814.0,
+    "accepted_tokens": 791.0,
+    "accept_rate": 0.9717,
     "accept_per_pos": {
-      "0": 409.0,
-      "1": 378.0
+      "0": 406.0,
+      "1": 385.0
     },
     "flops_total": 0.0,
     "read_bytes_total": 0.0,
     "write_bytes_total": 0.0,
-    "decode_tok_s": 31.03
+    "decode_tok_s": 33.13
   },
   {
     "workload": "medium_prompt_summarize",
     "n": 6,
-    "wall_s_per_req": 3.873,
-    "avg_e2e_s": 3.8682,
+    "wall_s_per_req": 2.884,
+    "avg_e2e_s": 2.8794,
     "avg_queue_s": 1e-05,
-    "avg_prefill_s": 1.3502,
-    "avg_decode_s": 2.4302,
-    "avg_inference_s": 3.7805,
-    "avg_ttft_s": 1.4382,
+    "avg_prefill_s": 0.515,
+    "avg_decode_s": 2.2837,
+    "avg_inference_s": 2.7987,
+    "avg_ttft_s": 0.5958,
     "avg_prompt_tokens": 275.0,
-    "avg_gen_tokens": 73.5,
+    "avg_gen_tokens": 73.3,
     "draft_tokens": 314.0,
-    "accepted_tokens": 290.0,
-    "accept_rate": 0.9236,
+    "accepted_tokens": 288.0,
+    "accept_rate": 0.9172,
     "accept_per_pos": {
       "0": 156.0,
-      "1": 134.0
+      "1": 132.0
     },
     "flops_total": 0.0,
     "read_bytes_total": 0.0,
     "write_bytes_total": 0.0,
-    "decode_tok_s": 29.83
+    "decode_tok_s": 31.67
   }
 ]

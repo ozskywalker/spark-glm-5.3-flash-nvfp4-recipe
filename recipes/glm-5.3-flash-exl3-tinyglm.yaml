@@ -1,11 +1,44 @@
-# Recipe: GLM-5.3-Flash EXL3 v8 (TP=2 across 2x DGX Spark, vLLM native multi-node)
+# Recipe: GLM-5.3-Flash EXL3 v9-fatfork (TP=2 across 2x DGX Spark, vLLM native multi-node)
 #
-# *** VALIDATED AND PROMOTED TO DEFAULT 2026-09-03 — full results in
-# VALIDATION.md "Does vllm-project/vllm#50729 explain Crash B? Investigated,
-# then acted on: v8" ***
+# *** CANDIDATE, NOT YET PROMOTED (2026-09-06) — v8 (glm-5.3-flash-exl3-v8-
+# vllm.yaml) remains the production default while this is validated. See
+# recipes/VALIDATION.md for the in-progress record. ***
 #
-# WHAT'S NEW: backports a genuine upstream root-cause fix for a Mamba
-# state-copy race condition under speculative decoding
+# WHAT'S NEW: everything v8 already has (FP8 LM head, K-pool tail fix,
+# indexer workspace rightsizing, mamba race-condition backport, mixed-
+# prefill env-propagation fix, TileLang JIT-cache persistence), PLUS a
+# from-source graft of Enntity/sparkglm's GPU-resident grouped-prefill
+# fat-expert kernel (EXL3_GROUPED_PREFILL_K4). This is the first recipe in
+# this project's history that runs a custom-built image
+# (`glm53-exl3-fatfork:local`, built from recipes/build/glm53-exl3-fatfork/)
+# rather than the stock `glm53-exl3-v2:c190db1` — every prior version was a
+# runtime monkeypatch over that same prebuilt image.
+#
+# The grafted kernel replaces the per-expert, host-driven fat-expert GEMM
+# loop (one `exl3_fat_gemm_kernel` launch per over-128-row expert) with a
+# GPU-resident task planner plus 4 phase-wide launches that cover every fat
+# expert in one pass, regardless of count. Scope is deliberately grouped-
+# prefill only: sparkglm's separate decode-side cooperative kernel
+# (EXL3_DECODE_COOP_K4) is excluded -- their own docs flag it as weaker
+# evidence, and it is cleanly separable in both the CUDA source and the
+# Python dispatch layer. See recipes/build/glm53-exl3-fatfork/Dockerfile and
+# overlay/exl3.py's header comments for the full graft boundary and
+# provenance chain.
+#
+# sparkglm's own measured result (their controlled A/B, bit-exact output,
+# ~33K actual tokens, DFlash2 k=7): TTFT 25.7s->23.5s (-8.8%), effective
+# prefill 1,282->1,405 tok/s (+9.6%). We run MTP-2, not DFlash2 -- this
+# project's own mixed-prefill investigation already found MTP-vs-DFlash2
+# bookkeeping differences change a scheduler-adjacent result's outcome, so
+# their number is a lead to re-measure here, not one we inherit.
+#
+# --- everything below this point retains v8's original header verbatim,
+# since every fix it documents (mamba race, K-pool tail, indexer workspace,
+# mixed-prefill env, FP8 lm_head, TileLang cache) is unchanged in this
+# candidate ---
+#
+# WHAT'S NEW (v8, historical): backports a genuine upstream root-cause fix
+# for a Mamba state-copy race condition under speculative decoding
 # (vllm-project/vllm#50729, merged into vLLM main 2026-08-17) that this
 # project's own base image does NOT yet contain.
 #
@@ -439,12 +472,12 @@
 # `docker save | ssh <other-node> docker load`.
 
 recipe_version: "2"
-name: GLM-5.3-Flash-EXL3-v7
-description: vLLM serving GLM-5.3-Flash via EXL3 quantization, v6's validated base (FP8 LM head, K-pool tail crash fix, max_num_seqs=16) plus a second K-pool/sparse-indexer crash fix (prefill-triggered, torch.empty uninitialized pool_topk buffers)
+name: GLM-5.3-Flash-EXL3-tinyGLM-fatfork
+description: Weightless dispatch-correctness fixture for the v9-fatfork grouped-prefill kernel graft -- NOT a language model, outputs are meaningless. See recipes/scripts/make_tinyglm.py and recipes/VALIDATION.md.
 
-model: Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw
+model: tinyglm/glm-5.3-fatfork-fixture
 runtime: vllm
-container: glm53-exl3-v2:c190db1
+container: glm53-exl3-fatfork:local
 
 min_nodes: 2
 
@@ -518,56 +551,48 @@ env:
   # can still be A/B'd without a rebuild if this checkpoint's lm_head.weight
   # ever changes in a way that makes per-channel matter.
   GLM53_FP8_LMHEAD_SCALE_MODE: tensor
+  # --- NEW in v9-fatfork: sparkglm's grouped-prefill fat-expert kernel ---
+  # Requires this recipe's custom-built `glm53-exl3-fatfork:local` image
+  # (see recipe header) -- the symbol does not exist in the stock
+  # glm53-exl3-v2:c190db1 image. Grouped-prefill only; EXL3_DECODE_COOP_K4
+  # must never be set (see overlay/exl3.py's header comment in the build
+  # tree for why that's safe to leave inert rather than absent).
+  EXL3_GROUPED_PREFILL_K4: "1"
+  # --- tinyGLM only ---
+  # --load-format dummy leaves EXL3's integer trellis/MCG-marker tensors
+  # uninitialized (undefined int16 words + a marker check that fails loudly:
+  # "EXL3 mcg marker is not the MCG int32 ...; packed ABI mismatch" --
+  # verified by hitting this exact error without the flag). sparkglm's
+  # _initialize_tiny_dummy_exl3() (overlay/exl3.py) fills a deterministic,
+  # per-expert-distinct valid trellis pattern when this is set; it is a
+  # no-op otherwise. MUST NEVER be set on a recipe loading a real checkpoint
+  # -- it overwrites routed-expert tensors with synthetic values.
+  SPARKGLM_TINY_DUMMY: "1"
 
 defaults:
   port: 8000
   host: 0.0.0.0
-  served_model_name: glm-5.3-flash-exl3-v2
+  served_model_name: glm-5.3-tinyglm-fatfork
   tensor_parallel: 2
-  model_path: /models/models--Mia-AiLab--GLM-5.3-Flash-EXL3-TR3-4bpw/snapshots/024db9f7e9871e8efdf21538ba55af7442be3cd5
+  # The tinyGLM fixture generated by recipes/scripts/make_tinyglm.py --
+  # 4 layers, 16 experts, 256 vocab, dummy weights. Must exist at this exact
+  # path on every host (copied there manually, not sparkrun-distributed --
+  # this is a local fixture, not an HF download).
+  model_path: /models/tinyglm-fatfork/snapshots/tinyglm-v1-e16-v256-l4
   quantization: exl3
-  max_model_len: 262144
-  max_num_seqs: 16
-  # Dialed back from 0.87 (2026-09-01): two consecutive v2 boots failed at
-  # 0.87 with "Free memory ... 104.93/105.31 GiB ... less than desired ...
-  # 105.87 GiB" — a razor-thin, real shortfall (not fixed by a fresh
-  # prelaunch_flush.sh between attempts), so this isn't page cache. Chose
-  # 0.86, not this project's usual 0.85 fallback: MiaAI-Lab's own docs cite
-  # 0.86 as their tested fallback for tighter-margin nodes ("GPU_MEM_UTIL=
-  # 0.86 ... fits with margin"), and v1's own earlier failures at 0.85 were
-  # a *different* problem (post-weight-load KV-sizing shortfall, not this
-  # startup free-memory check) — 0.86 splits the difference with informed
-  # backing rather than guessing.
-  #
-  # Dropped 0.86 -> 0.84 (2026-09-04): the 6.17.0-1032-nvidia kernel bump
-  # (see VALIDATION.md) shrank the head-node startup free-memory margin
-  # enough that earlyoom killed the head twice in a row at 0.86. Retested
-  # after fully rebooting both nodes a second time (fresh kernel/driver
-  # state, not just a fresh container) to rule out post-reboot settling —
-  # the head node still plateaued at ~1.3% mem-avail / 80.03% swap-free,
-  # 0.03pp from earlyoom's 80.00% kill trigger, i.e. still on the same
-  # knife-edge, just not tipped over yet. Not treating a lucky non-kill as
-  # cleared; 0.84 is the validated safe value on this kernel.
+  # >= index_topk (2048) per make_tinyglm.py's own validation; small enough
+  # for fast iteration, unlike the real recipe's 262144.
+  max_model_len: 8192
+  max_num_seqs: 4
+  # No memory-margin concern at this scale (4 layers, 16 experts, dummy
+  # weights) -- inherited from v9-fatfork for consistency, not re-tuned.
   gpu_memory_utilization: 0.84
   kv_cache_dtype: fp8
-  # Raised 2048 -> 7168 (2026-09-02): matches upstream's own current
-  # production value (discovered via the PR80 merge conflict in README.md
-  # — their doc says "E2 keep 2026-09-01", chosen specifically alongside
-  # the fat-expert prefill kernel). Measured on this cluster: +28.4%
-  # prefill at 100K tokens (933->1199 tok/s), +19.5% at 250K (1048->1253
-  # tok/s), zero decode regression on prose OR structured content (25.68
-  # tok/s prose, 31.65 tok/s median / 96.57% MTP-2 accept on a counting-
-  # task structured probe — see VALIDATION.md), full sanity+soak (incl.
-  # concurrent waves) passed. A substantial, real, independently-confirmed
-  # gain. Contrast with the NVFP4 lane, which crashed raising this same
-  # knob to just 3584 — direct, measured confirmation that EXL3's smaller
-  # memory footprint is real headroom, not just theory.
-  max_num_batched_tokens: 7168
+  # Reduced from v9-fatfork's 7168 -- this fixture doesn't need production
+  # batching headroom, and sparkglm's own note ("never 8192, indexer smem")
+  # still applies to the same kernel here.
+  max_num_batched_tokens: 2048
   limit_mm: '{"image":4,"video":1}'
-  default_chat_template_kwargs: '{"enable_thinking": false}'
-  # MTP k=2 — matches v1's safe default. DFlash2 not reintroduced here;
-  # its two crash classes today were unrelated to any of these four PRs.
-  speculative_config: '{"method":"mtp","num_speculative_tokens":2}'
 
 command: |
   cat > /tmp/glm53_v8_shim.py <<'PYSHIM'
@@ -1142,9 +1167,17 @@ command: |
       from vllm.entrypoints.cli.main import main
       sys.exit(main())
   PYSHIM
+  # tinyGLM: no speculative decoding (num_nextn_predict_layers=0, no MTP
+  # draft weights in the fixture) -- everything else, including vision,
+  # matches v9-fatfork so the same dispatch code runs. Vision is kept
+  # (make_tinyglm.py's own header explains why omitting it doesn't work for
+  # this architecture); --chat-template/--default-chat-template-kwargs are
+  # dropped in favor of the fixture's own minimal tokenizer_config.json
+  # chat_template, which doesn't reference enable_thinking.
   python3 /tmp/glm53_v8_shim.py serve {model_path} \
       --served-model-name {served_model_name} \
       --host {host} --port {port} \
+      --load-format dummy \
       --trust-remote-code \
       --tensor-parallel-size {tensor_parallel} \
       --quantization {quantization} \
@@ -1153,13 +1186,10 @@ command: |
       --max-num-seqs {max_num_seqs} \
       --kv-cache-dtype {kv_cache_dtype} \
       --max-num-batched-tokens {max_num_batched_tokens} \
-      --speculative-config '{speculative_config}' \
       --tool-call-parser glm47 --enable-auto-tool-choice \
       --reasoning-parser glm45 \
-      --enable-prefix-caching \
-      --no-enable-flashinfer-autotune \
       --skip-mm-profiling \
       --limit-mm-per-prompt '{limit_mm}' \
-      --chat-template /opt/glm53/chat_template.jinja \
-      --default-chat-template-kwargs '{default_chat_template_kwargs}' \
+      --enable-prefix-caching \
+      --no-enable-flashinfer-autotune \
       --distributed-executor-backend mp

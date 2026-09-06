@@ -1,11 +1,46 @@
-# Recipe: GLM-5.3-Flash EXL3 v8 (TP=2 across 2x DGX Spark, vLLM native multi-node)
+# Recipe: GLM-5.3-Flash EXL3 v9-fatfork (TP=2 across 2x DGX Spark, vLLM native multi-node)
 #
-# *** VALIDATED AND PROMOTED TO DEFAULT 2026-09-03 — full results in
-# VALIDATION.md "Does vllm-project/vllm#50729 explain Crash B? Investigated,
-# then acted on: v8" ***
+# *** VALIDATED AND PROMOTED TO DEFAULT 2026-09-06 — full results in
+# VALIDATION.md "Adopting sparkglm's grouped-prefill fat-expert kernel +
+# a tinyGLM fixture" and its "Follow-ups" section (KV-capacity isolation,
+# gpu_memory_utilization ceiling). v8 (glm-5.3-flash-exl3-v8-vllm.yaml) is
+# retained as the last known-good fallback if this needs to be rolled back. ***
 #
-# WHAT'S NEW: backports a genuine upstream root-cause fix for a Mamba
-# state-copy race condition under speculative decoding
+# WHAT'S NEW: everything v8 already has (FP8 LM head, K-pool tail fix,
+# indexer workspace rightsizing, mamba race-condition backport, mixed-
+# prefill env-propagation fix, TileLang JIT-cache persistence), PLUS a
+# from-source graft of Enntity/sparkglm's GPU-resident grouped-prefill
+# fat-expert kernel (EXL3_GROUPED_PREFILL_K4). This is the first recipe in
+# this project's history that runs a custom-built image
+# (`glm53-exl3-fatfork:local`, built from recipes/build/glm53-exl3-fatfork/)
+# rather than the stock `glm53-exl3-v2:c190db1` — every prior version was a
+# runtime monkeypatch over that same prebuilt image.
+#
+# The grafted kernel replaces the per-expert, host-driven fat-expert GEMM
+# loop (one `exl3_fat_gemm_kernel` launch per over-128-row expert) with a
+# GPU-resident task planner plus 4 phase-wide launches that cover every fat
+# expert in one pass, regardless of count. Scope is deliberately grouped-
+# prefill only: sparkglm's separate decode-side cooperative kernel
+# (EXL3_DECODE_COOP_K4) is excluded -- their own docs flag it as weaker
+# evidence, and it is cleanly separable in both the CUDA source and the
+# Python dispatch layer. See recipes/build/glm53-exl3-fatfork/Dockerfile and
+# overlay/exl3.py's header comments for the full graft boundary and
+# provenance chain.
+#
+# sparkglm's own measured result (their controlled A/B, bit-exact output,
+# ~33K actual tokens, DFlash2 k=7): TTFT 25.7s->23.5s (-8.8%), effective
+# prefill 1,282->1,405 tok/s (+9.6%). We run MTP-2, not DFlash2 -- this
+# project's own mixed-prefill investigation already found MTP-vs-DFlash2
+# bookkeeping differences change a scheduler-adjacent result's outcome, so
+# their number is a lead to re-measure here, not one we inherit.
+#
+# --- everything below this point retains v8's original header verbatim,
+# since every fix it documents (mamba race, K-pool tail, indexer workspace,
+# mixed-prefill env, FP8 lm_head, TileLang cache) is unchanged in this
+# candidate ---
+#
+# WHAT'S NEW (v8, historical): backports a genuine upstream root-cause fix
+# for a Mamba state-copy race condition under speculative decoding
 # (vllm-project/vllm#50729, merged into vLLM main 2026-08-17) that this
 # project's own base image does NOT yet contain.
 #
@@ -439,12 +474,12 @@
 # `docker save | ssh <other-node> docker load`.
 
 recipe_version: "2"
-name: GLM-5.3-Flash-EXL3-v7
-description: vLLM serving GLM-5.3-Flash via EXL3 quantization, v6's validated base (FP8 LM head, K-pool tail crash fix, max_num_seqs=16) plus a second K-pool/sparse-indexer crash fix (prefill-triggered, torch.empty uninitialized pool_topk buffers)
+name: GLM-5.3-Flash-EXL3-v9-fatfork
+description: Production default (promoted 2026-09-06) -- v8's full validated patch stack plus a from-source graft of Enntity/sparkglm's GPU-resident grouped-prefill fat-expert kernel (EXL3_GROUPED_PREFILL_K4), +24% effective prefill at 16K-34K tokens under this fleet's MTP-2 config. See recipes/VALIDATION.md.
 
 model: Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw
 runtime: vllm
-container: glm53-exl3-v2:c190db1
+container: glm53-exl3-fatfork:local
 
 min_nodes: 2
 
@@ -518,6 +553,13 @@ env:
   # can still be A/B'd without a rebuild if this checkpoint's lm_head.weight
   # ever changes in a way that makes per-channel matter.
   GLM53_FP8_LMHEAD_SCALE_MODE: tensor
+  # --- NEW in v9-fatfork: sparkglm's grouped-prefill fat-expert kernel ---
+  # Requires this recipe's custom-built `glm53-exl3-fatfork:local` image
+  # (see recipe header) -- the symbol does not exist in the stock
+  # glm53-exl3-v2:c190db1 image. Grouped-prefill only; EXL3_DECODE_COOP_K4
+  # must never be set (see overlay/exl3.py's header comment in the build
+  # tree for why that's safe to leave inert rather than absent).
+  EXL3_GROUPED_PREFILL_K4: "1"
 
 defaults:
   port: 8000
