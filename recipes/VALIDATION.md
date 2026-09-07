@@ -3824,3 +3824,64 @@ Tested whether v9-fatfork's healthier idle margin at 0.84 (~5.3-5.6%, vs v8's po
 ## Verdict: promote
 
 A real, reproducible, larger-than-sparkglm's-own +24.0% effective prefill win at ~16.3K-34K tokens, on this fleet's actual MTP-2 config, with zero measured decode regression, clean correctness/concurrency/soak results, a precisely-isolated ~8.5% KV-capacity cost (small, not the ~40-45% first estimated), and a memory margin that holds at the same `gpu_memory_utilization=0.84` this fleet already runs. **v9-fatfork promoted to production**, replacing v8. `gpu_memory_utilization` stays at 0.84 -- raising it is a fleet-wide question for a future session, not something this promotion should wait on or attempt.
+
+## Upstream check: MiaAI-Lab's own MNBT/max_num_seqs guidance changed -- re-tested, staying at 7168 (2026-09-06)
+
+Routine upstream check (MiaAI-Lab main, `c190db1` -> `3021f24`; Enntity/sparkglm; the specific vLLM issues this project tracks) turned up nothing code-level new from either recipe repo since our pins -- sparkglm has zero new commits, MiaAI-Lab's only changes are a TP4 lane (not applicable, this cluster is 2-node/TP2), GitHub issue-template meta, and one doc update worth checking: their `.env.example` comment for `MAX_NUM_BATCHED_TOKENS` now reads *"Current maintainer default at MAX_NUM_SEQS=4: 7168. On an independent MAX_NUM_SEQS=16 geometry, 2048 gave the best measured throughput/KV balance. Re-run 2048 vs 7168 before changing."*
+
+This lands squarely on a gap in our own validation history: the original MNBT 2048->7168 test (+28.4%/+19.5% prefill, "max_num_batched_tokens 2048 -> 7168" above) was run **before** `max_num_seqs` was promoted 4->16 the next day -- the two changes were never tested together until now, and upstream is independently reporting the opposite conclusion at exactly this project's current concurrency setting.
+
+**Re-tested directly** (`-o max_num_batched_tokens=2048` override on the shipped v9-fatfork recipe, `max_num_seqs=16` and the grouped-prefill kernel both held constant, same cache-unique-prompt methodology as the grouped-prefill A/B above):
+
+| Metric | MNBT 7168 (shipped) | MNBT 2048 | Change |
+|---|---:|---:|---:|
+| Prefill @16.3K | ~1,510 tok/s | 1,295-1,298 tok/s (steady-state, n=3 of 4) | **-14%** |
+| Prefill @33.7K | ~1,524 tok/s | 1,290.6-1,293.8 tok/s (n=3) | **-15%** |
+| Consumed memory (weights+non-torch) | 89.66-89.75 GiB | 83.84 GiB | -5.8 GiB |
+| Peak activation | 5.7-5.81 GiB | 2.49 GiB | -3.2 GiB |
+| KV cache in use | 6.75-9.25 GiB | **15.89 GiB** | +1.7-2.4x |
+
+**The tradeoff is real in both directions, not a free lunch.** Smaller MNBT genuinely shrinks the activation buffer (scales with the batching window, as expected) and appears to also shrink the grouped-prefill kernel's own scratch allocation (the 5.8 GiB drop in "consumed" memory is too large to be activation alone) -- together roughly doubling usable KV capacity. But raw prefill throughput drops ~14-15% at both tested scales, consistently -- this is upstream's own "independent geometry" finding, reproduced here, not contradicted.
+
+**Verdict: keep 7168.** This project's own concurrency validation (`max_num_seqs` 4->16 section above) already showed KV was not the binding constraint at this fleet's tested load -- 41% peak utilization at 16 concurrent requests, zero preemptions. Trading away 14-15% of the prefill win this session was specifically built to get, in exchange for KV headroom this fleet isn't currently using, is the wrong trade *for this deployment* -- though evidently the right one for whatever workload produced upstream's "independent geometry" number. Re-check this if a future workload actually starts pressuring KV capacity (many concurrent long-context sessions, a `max_num_seqs` increase past 16, or a `gpu_memory_utilization` reduction) -- the 2048 config is now measured and ready to reconsider, not rejected outright.
+
+## First real-world production window on v9-fatfork: 657 requests, zero failures, and a live re-run of the exact crash-4 trigger (2026-09-06)
+
+Everything up to this point validated v9-fatfork with synthetic probes -- correctness suites, controlled A/Bs, concurrency sweeps, a soak. This is the first entry built from **actual user-driven production traffic**: ~15 hours of continuous uptime on the shipped config (`gpu_memory_utilization=0.84`, `max_num_batched_tokens=7168`), no restarts, no synthetic load generators.
+
+**Aggregate metrics, read directly from `/metrics`:**
+
+| Metric | Value |
+|---|---:|
+| Requests completed | 657 |
+| `finished_reason=stop` | 657 (100%) |
+| `finished_reason` = length / abort / error / repetition | 0 / 0 / 0 / 0 |
+| Preemptions | 0 |
+| Total prompt tokens | 66,704,984 |
+| Prefix-cache hit rate | **93.4%** (62,354,432 / 66,745,593 queries) |
+| New (cold) prompt tokens actually computed | ~4,354,136 |
+| Total generation tokens | 118,853 |
+| Avg TTFT | 14.04 s |
+| Avg E2E latency | 20.62 s |
+| Avg prefill time / avg decode time per request | 5.20 s / 6.58 s |
+| Effective new-token prefill rate (cold tokens / summed prefill time) | ~1,275 tok/s |
+| MTP-2 draft acceptance | 76.4% (71,711 / 93,842) |
+
+**Zero failures of any kind.** No aborts, no errors, no preemptions, no truncated (`length`) completions -- every one of 657 requests ran to a natural stop. `dmesg` and the head node's `earlyoom` log show nothing across the entire window -- no NVRM entries, no OOM kills. Head-node memory margin held throughout (currently 3.12% available, never approached the 2% earlyoom trigger), though swap-free crept down slightly over the session (79.9% -> 77.9%) -- the same slow erosion pattern already flagged in the `gpu_memory_utilization` follow-ups above, now observed under real rather than synthetic load, still nowhere near concerning.
+
+**The workload shape**: average ~101,500 prompt tokens per request against only ~181 output tokens, with a 93.4% cache-hit rate -- this is sustained, incrementally-growing-context usage (a long session or agentic loop keeping a large working context resident across many turns), not a stream of independent one-off prompts. The effective new-token prefill rate (~1,275 tok/s) sits a bit below the isolated solo-benchmark number (~1,510-1,524 tok/s) as expected -- real traffic carries scheduling contention and mixed request shapes an isolated A/B doesn't.
+
+**The finding that actually matters**: at 12:28 PM EDT, `mhc_pre_big_fuse_with_norm_tilelang` -- the exact TileLang kernel whose first-ever JIT compile preceded the fourth production crash (see "A FOURTH production crash" above) by 20 seconds -- compiled live, under real traffic, for the first time on this boot:
+
+```
+16:28:46 UTC  WARNING jit_monitor: TileLang JIT compilation during inference:
+              mhc_pre_big_fuse_with_norm_tilelang. This causes a latency spike...
+16:28:46 UTC  TileLang begins to compile kernel `mhc_pre_big_fuse_with_norm_tilelang`
+16:28:51 UTC  TileLang completes to compile kernel `mhc_pre_big_fuse_with_norm_tilelang`
+```
+
+**The server did not crash.** It was still healthy, serving cleanly, 3+ hours later at the time of this check. This is the first real-world test of v9's two relevant fixes acting together against the actual trigger condition that killed a prior boot -- the backported Mamba state-copy race fix (`#50729`, present since v8) and the TileLang JIT-cache persistence fix (this session, Sep 5). Worth being precise about what this does and doesn't show: v8 already had the race fix alone and still crashed 18 minutes after this exact kernel shape's live compile, so the race fix by itself was evidently insufficient for us; this is the first time the *combination* has actually been exercised against the trigger, and it held. Not proof of causation -- this project's own standard for that bar, per every other crash entry above -- but a real, specific, positive data point, not a vague "it's been fine so far."
+
+Confirmed the newly-compiled kernel is now sitting in the host-persisted TileLang cache (kernel directory count: 8 -> 14 since the last check), so a future container recreate will load it from cache rather than risk a live recompile again. Two other novel shapes also JIT-compiled live without incident in the same window -- `BuildPrefillChunkMetadataKernel.kernel` (~11:17 AM) and `_kpool_softmax_rotate_write_cache_kernel`/`_kpool_tail_seed_kernel` (~12:52 PM) -- neither preceded by any prior crash signature, but now also cached for next time regardless.
+
+**Verdict: the longest and first real-traffic validation window for v9-fatfork is clean.** No promotion decision changes here -- v9-fatfork was already production -- but this is the first evidence point from real usage rather than synthetic testing, and it happens to include a direct, favorable re-run of the one open question (does this project's crash-4 fix combination actually hold) that synthetic testing couldn't have manufactured on its own.
