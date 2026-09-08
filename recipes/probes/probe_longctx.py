@@ -117,12 +117,19 @@ def main():
     ap.add_argument("--tokens", type=int, default=250000, help="target prompt tokens")
     ap.add_argument("--max-tokens", type=int, default=200)
     ap.add_argument("--timeout", type=int, default=7200, help="request timeout seconds")
+    ap.add_argument("--seed", type=int, default=None,
+                     help="document RNG seed; default is a fresh random seed each run "
+                          "(prompt content is otherwise byte-identical across runs at the "
+                          "same --tokens, which silently hits a warm prefix cache on repeat "
+                          "invocations and invalidates cold-prefill timing -- pass a fixed "
+                          "value only when byte-identical content across runs is intentional)")
     args = ap.parse_args()
     base = args.base_url.rstrip("/")
 
-    print(f"building ~{args.tokens}-token document (tokenized via /v1/tokenize)...", flush=True)
+    seed = args.seed if args.seed is not None else random.SystemRandom().randrange(2**31)
+    print(f"building ~{args.tokens}-token document (seed={seed}, tokenized via /v1/tokenize)...", flush=True)
     t0 = time.perf_counter()
-    text, n_tok = build_document(args.tokens, base, args.model)
+    text, n_tok = build_document(args.tokens, base, args.model, seed=seed)
     text, codes = plant_codes(text)
     print(f"document ready: ~{n_tok} tokens before markers, {len(text)} chars, "
           f"{time.perf_counter() - t0:.0f}s build time", flush=True)
