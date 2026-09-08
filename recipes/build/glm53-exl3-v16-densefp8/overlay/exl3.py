@@ -2167,7 +2167,7 @@ class Exl3Config(QuantizationConfig):
         if isinstance(layer, LinearBase):
             group = _glm53_dense_fp8_group(prefix)  # [glm53-dense-fp8]
             if group is not None:
-                return Glm53DenseFp8Method(group)
+                return Glm53DenseFp8Method(group, prefix)
             return UnquantizedLinearMethod()
         return None
 
@@ -2255,9 +2255,10 @@ def _glm53_dense_fp8_group(prefix: str, groups: set[str] | None = None, layer_ty
 class Glm53DenseFp8Method(UnquantizedLinearMethod):
     """BF16 weight at load time; per-output-channel FP8 e4m3 + Marlin at apply."""
 
-    def __init__(self, group: str) -> None:
+    def __init__(self, group: str, prefix: str = "") -> None:
         super().__init__()
         self.group = group
+        self.prefix = prefix
         self.ready = False
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -2282,6 +2283,11 @@ class Glm53DenseFp8Method(UnquantizedLinearMethod):
         prepare_fp8_layer_for_marlin(layer, size_k_first=False)
         layer.glm53_fp8_n, layer.glm53_fp8_k = n, k
         self.ready = True
+        print(
+            f"[glm53-dense-fp8] quantized group={self.group} prefix={self.prefix!r} "
+            f"shape=({n},{k}) scale_range=[{scales.min().item():.6g}, {scales.max().item():.6g}]",
+            flush=True,
+        )
 
     def apply(self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
         if not self.ready:
