@@ -1,0 +1,26 @@
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 13.0.2
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+torch 2.13.0+cu130 cuda available True
+device NVIDIA GB10 capability (12, 1)
+import P8NativeTPMoE: OK
+P8NativeTPMoE construction: OK
+KERNEL CALL: OK (JIT compiled and executed)
+output shape (1, 4096) dtype torch.bfloat16
+isnan any: True
+isinf any: False
+mean nan std nan
+max abs nan
+PROBE COMPLETE: SUCCESS

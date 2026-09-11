@@ -1,0 +1,42 @@
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 13.0.2
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+torch 2.13.0+cu130 cuda available True
+device NVIDIA GB10 capability (12, 1)
+import P8NativeTPMoE: FAILED
+Traceback (most recent call last):
+  File "/workspace/run_probe.py", line 22, in <module>
+    from b12x.moe._shared.trellismx.p8_native_kernel import P8NativeTPMoE
+  File "/workspace/vendor/b12x/moe/_shared/trellismx/p8_native_kernel.py", line 33, in <module>
+    from b12x.moe.fused_moe._impl import (
+  File "/workspace/vendor/b12x/moe/fused_moe/_impl.py", line 91, in <module>
+    from b12x.policy import (
+  File "/workspace/vendor/b12x/policy/__init__.py", line 64, in <module>
+    _embedded_profiles = importlib.import_module("._profiles", __name__)
+                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/importlib/__init__.py", line 90, in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/vendor/b12x/policy/_profiles/__init__.py", line 41, in <module>
+    _load_embedded_profiles()
+  File "/workspace/vendor/b12x/policy/_profiles/__init__.py", line 18, in _load_embedded_profiles
+    payload = json.loads(gzip.decompress(resource.read_bytes()))
+                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/gzip.py", line 627, in decompress
+    if _read_gzip_header(fp) is None:
+       ^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/gzip.py", line 456, in _read_gzip_header
+    raise BadGzipFile('Not a gzipped file (%r)' % magic)
+gzip.BadGzipFile: Not a gzipped file (b've')

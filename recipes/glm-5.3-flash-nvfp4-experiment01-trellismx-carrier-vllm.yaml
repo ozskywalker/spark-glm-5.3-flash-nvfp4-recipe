@@ -1,0 +1,216 @@
+# EXPERIMENT 01 -- see experiment/01-trellismx-mxfp8/HYPOTHESIS.md for full context.
+#
+# Recipe: GLM-5.3-Flash NVFP4, "TrellisMX carrier" checkpoint (TP=2, 2x DGX Spark)
+#
+# This is Track A of an investigation into whether
+# https://huggingface.co/brandonmusic/GLM-5.3-Flash-TrellisMX-MXFP8 can run on
+# this fleet. That model is NOT a standalone checkpoint -- it's 177 GB of
+# "168 TP4 routed-expert sidecars" (trellis-coded MXFP8) that overlay onto a
+# separately-hosted carrier, local-inference-lab/GLM-5.3-Flash-NVFP4. The
+# sidecar overlay itself is CONFIRMED BLOCKED on this hardware, straight from
+# its own shipped source (`runtime/vllm/vllm/model_executor/layers/
+# quantization/trellismx.py`): an unconditional `raise` on `tp_size != 4` (we
+# have 2 GPUs, and the 168 sidecar files have no resharding metadata -- they
+# are hard-baked to exactly 4 ranks) and a second unconditional `raise` on
+# `torch.cuda.get_device_capability(device) != (12, 0)` -- an EXACT match
+# against SM120; our GB10 reports SM121a / (12, 1). Not downloaded (177 GB,
+# zero chance of executing here as shipped). See HYPOTHESIS.md for the full
+# evidence trail and a separate, bounded side-investigation (Track B) into
+# whether the underlying kernel is silicon-portable in principle.
+#
+# What THIS recipe actually tests: the carrier alone, which is a real,
+# novel-to-us, standalone NVFP4 checkpoint independent of the blocked overlay.
+# Two genuinely open questions this answers: (1) fit & performance -- TTFT,
+# prefill, decode, concurrency at 128K-256K context on our TP2 fleet, measured
+# against the current production baseline (v19-indexercompat, EXL3 4bpw); (2)
+# a real correctness risk -- the carrier is ModelOpt-format NVFP4
+# (`ModelOptNvFp4FusedMoE`, confirmed from trellismx.py's own import), the
+# SAME format class as LibertAIDAI/GLM-5.3-Flash-NVFP4, which this project
+# already found has a documented, reproducible token-corruption bug (see
+# recipes/glm-5.3-flash-nvfp4-vllm.yaml's header -- that's why production
+# runs RedHatAI's compressed-tensors conversion instead). This is a different
+# publisher's ModelOpt build, not the same weights, but the same format class
+# that's already known to be risky for this exact model family -- worth
+# checking directly with this project's existing CJK/emoji reproduction
+# methodology before trusting any other result from this boot.
+#
+# BOOT FINDINGS, 2026-09-10 (fixed before the first successful boot):
+#   1. --moe-backend marlin (inherited from the production template) crashed
+#      MTP model init: "moe_backend='marlin' is not supported for unquantized
+#      MoE. Expected one of ['triton','batched_triton','flashinfer_trtllm',
+#      'flashinfer_cutlass','aiter']." This checkpoint's MTP block's MoE
+#      layer is unquantized (unlike production's RedHatAI/LibertAIDAI
+#      checkpoints, where marlin works globally) while the main routed
+#      experts are still ModelOpt NVFP4 -- one global --moe-backend can't
+#      serve both. Fixed by dropping the flag entirely and letting vLLM's
+#      backend oracle pick per layer.
+#   2. --load-format instanttensor (also inherited from the template) hit
+#      earlyoom TWICE in a row, each time ~85-90% through loading, even with
+#      a fresh prelaunch_flush.sh immediately before each attempt. Checked
+#      `free -h` live during both: "used" RAM (not buff/cache) climbed to
+#      121Gi/121Gi -- this is NOT the page-cache-fragmentation problem the
+#      flush ritual targets, it's InstantTensor's direct-I/O loader staging
+#      close to the full checkpoint (the boot log's own progress line reads
+#      ".../184G" per rank) into a pinned host buffer that this node's
+#      ~121GB total RAM cannot hold, independent of any cache/fragmentation
+#      state. This is a real, structural finding, not a fluke -- reproduced
+#      identically on both attempts. Switched to vLLM's default loader
+#      (flag dropped) as the fix; this will very likely mean a much slower
+#      cold load than production's instanttensor-accelerated boots (see
+#      recipes/glm-5.3-flash-nvfp4-vllm.yaml's own note: ~10min default vs.
+#      40-100s instanttensor) -- a real, worth-recording cost of this
+#      checkpoint's larger size relative to production's, not a recipe bug.
+#
+# Adapted from recipes/glm-5.3-flash-nvfp4-vllm.yaml (the "vanilla" NVFP4
+# template this project already has proven working on this exact fleet, same
+# vllm-glm53-flash:sm121-v9 community image, same glm5_next architecture
+# family, same TP2/GB10 topology) -- deliberately minimal-diff from that known
+# -good baseline so any regression is attributable to the checkpoint, not to
+# a recipe change. Values inherited unmodified unless commented otherwise.
+#
+# Weights: NOT pre-placed as of recipe authorship -- this is the download
+# target of this experiment (~199 GB carrier, local-inference-lab namespace,
+# pinned revision 520de24eabf507659eaef7c70f14fd584527facc per the TrellisMX
+# README's own carrier pin). Must be replicated identically to BOTH nodes
+# before boot (this fleet's /models is per-node local disk, not shared -- confirmed
+# by comparing `df -h /models` output on each host, which differs).
+#
+# GB10 pre-launch ritual still applies: scripts/prelaunch_flush.sh before every boot.
+
+recipe_version: "2"
+name: GLM-5.3-Flash-NVFP4-Experiment01-TrellisMXCarrier
+description: "EXPERIMENT 01 (Track A): vLLM serving local-inference-lab/GLM-5.3-Flash-NVFP4 (TrellisMX's carrier checkpoint, without the blocked routed-expert overlay) on 2x DGX Spark, TP=2"
+
+model: local-inference-lab/GLM-5.3-Flash-NVFP4
+runtime: vllm
+container: radixark/vllm-glm53-flash:sm121-v9
+
+min_nodes: 2
+
+cluster_config:
+  resolved_model_path: /models
+
+executor_config:
+  entrypoint: ""
+  auto_remove: false
+
+env:
+  TORCH_CUDA_ARCH_LIST: 12.1a
+  FLASHINFER_CUDA_ARCH_LIST: 12.1a
+  FLASHINFER_DISABLE_VERSION_CHECK: "1"
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  # Added after attempt 9's earlyoom kill (2026-09-10): this recipe was
+  # adapted from recipes/glm-5.3-flash-nvfp4-vllm.yaml, which never got the
+  # TILELANG_CACHE_DIR fix that landed in the exl3-v8+ lineage (see
+  # tilelang_cache_persistence_fix memory / recipes/glm-5.3-flash-exl3-v19-
+  # indexercompat-vllm.yaml's own env comment). Without it, TILELANG_CACHE_DIR
+  # falls back to the container-ephemeral ~/.tilelang/cache (HOME=/tmp), so
+  # every boot pays a full first-ever JIT compile of this image's fused-norm
+  # kernels under memory pressure. Attempt 9's earlyoom kill landed within 7
+  # seconds of `mhc_pre_big_fuse_with_norm_tilelang` finishing its JIT
+  # compile -- the exact kernel already implicated in a prior production
+  # earlyoom crash on this same image. Same fix, same reasoning.
+  TILELANG_CACHE_DIR: /cache/runtime/tilelang
+  VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+  NCCL_DEBUG: WARN
+  TORCH_NCCL_ASYNC_ERROR_HANDLING: "1"
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  served_model_name: glm-5.3-flash-exp01-trellismx-carrier
+  tensor_parallel: 2
+  # Fill in the real snapshot hash after download completes -- HF cache
+  # layout is models--<org>--<name>/snapshots/<revision>. Pinned revision
+  # per the TrellisMX README's carrier reference.
+  model_path: /models/models--local-inference-lab--GLM-5.3-Flash-NVFP4/snapshots/520de24eabf507659eaef7c70f14fd584527facc
+  # UNVERIFIED for this checkpoint -- reusing our known-good template's fixed
+  # chat template as a starting point since the production NVFP4 checkpoints'
+  # own shipped template has a documented enable_thinking bug. probe_sanity.py's
+  # "no reasoning leak" / finish_reason checks will catch it if this carrier
+  # needs something different; swap to the checkpoint's own template.jinja
+  # (if present, check the downloaded snapshot) only if this one misbehaves.
+  chat_template: /models/glm53-flash-chat_template_mm.jinja
+  # --- capacity: user's stated target is 192-256K working range, 128K floor.
+  # Starting at the template's proven 262144 ceiling; drop to confirm the
+  # 128K floor separately if full-range capacity doesn't fit this
+  # checkpoint's actual memory profile (unknown until first boot's profiler
+  # output -- this is a different publisher's conversion, sizes may differ
+  # slightly from the template's RedHatAI numbers even at the same
+  # architecture).
+  max_model_len: 262144
+  max_num_seqs: 6
+  # Dropped 0.85 -> 0.84 after attempt 9's earlyoom kill (2026-09-10):
+  # 0.85 is the value inherited from the stale nvfp4-vllm.yaml template,
+  # never got the fleet-wide 0.84 cap that followed the kernel-1032
+  # earlyoom regression (see gmu_086_earlyoom_regression memory). Current
+  # production (exl3-v19-indexercompat) ships 0.84.
+  gpu_memory_utilization: 0.84
+  kv_cache_memory: 3221225472
+  block_size: 2304
+  # NOT forced to marlin (unlike the production NVFP4 template this was
+  # adapted from) -- first boot attempt crashed with "moe_backend='marlin'
+  # is not supported for unquantized MoE. Expected one of ['triton',
+  # 'batched_triton', 'flashinfer_trtllm', 'flashinfer_cutlass', 'aiter']."
+  # Root cause: this checkpoint's MTP block's MoE layer is unquantized
+  # (unlike the production RedHatAI/LibertAIDAI checkpoints, where marlin
+  # works fine globally) -- the main routed experts are still ModelOpt
+  # NVFP4, but a single global --moe-backend can't serve both a quantized
+  # and an unquantized MoE layer at once. Left unset here so vLLM's own
+  # backend oracle picks the right one per layer, which is what the error
+  # message's own framing implies is the intended path for exactly this
+  # mixed-quantization case. (--moe-backend flag dropped from the command
+  # below entirely, not just left blank, since an empty value isn't a real
+  # vLLM CLI option.)
+  kv_cache_dtype: fp8_e4m3
+  # Dropped 2048 -> 512 after attempt 10's earlyoom kill (2026-09-10):
+  # attempts 9 and 10 both crashed inside vLLM's own KV-cache memory-
+  # profiling dummy run (_initialize_kv_caches -> determine_available_memory,
+  # confirmed from the container-log traceback), which sizes its probe batch
+  # off max_num_batched_tokens. gpu_memory_utilization is already at the
+  # fleet-wide 0.84 floor (see this file's own note above) and that alone
+  # wasn't enough margin for this checkpoint's 89.1 GiB resident footprint --
+  # shrinking the profiling batch itself is the more targeted lever. Revisit
+  # upward once a clean boot confirms this was the actual lever, since 512
+  # will cap steady-state prefill throughput below production's tuning.
+  max_num_batched_tokens: 512
+  # DROPPED (not just left unset -- removed from the command below too).
+  # Third boot bug: with speculative_config set, MTP/EAGLE draft-model
+  # loading crashed with `KeyError:
+  # 'model.layers.45.mtp_block.mlp.experts.routed_experts.w2_weight_scale'`
+  # -- vLLM's stock loader built the MTP block's expert layer as unquantized
+  # (matching the moe_backend finding above) but the checkpoint's weight
+  # names for that layer still assume a quantized (scaled) target, a
+  # name/architecture mismatch. Likely explanation: TrellisMX's own
+  # `trellismx.py` explicitly special-cases layer 45's MTP block to defer to
+  # the carrier's own quant handling for that one layer (see
+  # HYPOTHESIS.md) -- plausibly TrellisMX's runtime overlay also ships a
+  # patched `modelopt.py` (confirmed present in the HF repo's
+  # `runtime/vllm/vllm/model_executor/layers/quantization/modelopt.py`,
+  # 95KB) that handles this correctly, which stock vLLM here doesn't have.
+  # Pragmatic call: drop speculative decoding to get a working baseline for
+  # the primary fit/performance/accuracy question rather than keep chasing
+  # MTP compatibility -- this means decode throughput numbers from this
+  # recipe are NOT directly comparable to the MTP-4 production baseline;
+  # noted wherever those numbers are reported.
+  # speculative_config: '{"method":"mtp","num_speculative_tokens":4}'
+  default_chat_template_kwargs: '{"enable_thinking": false}'
+
+command: |
+  vllm serve {model_path} \
+      --served-model-name {served_model_name} \
+      --host {host} --port {port} \
+      --trust-remote-code \
+      --tensor-parallel-size {tensor_parallel} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} --block-size {block_size} \
+      --kv-cache-dtype {kv_cache_dtype} --kv-cache-memory {kv_cache_memory} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --tool-call-parser glm47 --enable-auto-tool-choice \
+      --reasoning-parser glm45 \
+      --chat-template {chat_template} \
+      --default-chat-template-kwargs '{default_chat_template_kwargs}' \
+      --distributed-executor-backend mp \
+      --enable-mfu-metrics --kv-cache-metrics --cudagraph-metrics \
+      --enable-logging-iteration-details

@@ -1,0 +1,80 @@
+=== Repo-wide search: no Triton anywhere in the TrellisMX-shipped trellismx/*.py or the fetched kernels/*.py ===
+(zero matches)
+
+=== Repo-wide search: cutlass/cute usage (CUTLASS Python DSL, not Triton) ===
+kernels/trellis_materialize.py
+trellismx.py
+kernels/w4a8_trellis_decode.py
+trellismx/p8_native_kernel.py
+
+=== The ONLY device-capability check in the entire fetched surface -- lives in the vLLM adapter, NOT in P8NativeTPMoE itself ===
+trellismx.py:98:        if device.type != "cuda" or torch.cuda.get_device_capability(device) != (12, 0):
+
+=== SM90/Hopper-specific hardcoding found in a SIBLING file (trellis_materialize.py, the K2/K3 'uniform rate' BF16-dequant materializer) ===
+19:import cutlass.utils.hopper_helpers as sm90_utils
+22:from cutlass.cute.nvgpu import cpasync, warpgroup
+168:        output_atom = warpgroup.make_smem_layout_atom(
+169:            sm90_utils.get_smem_layout_atom(
+
+=== SM120-specific (Blackwell consumer) helpers ALSO present in the b12x _lib, i.e. the authors do write arch-specific code when they need to ===
+151:    """Check ``tile_k`` satisfies ``sm120_make_smem_layout_sfa/sfb`` divisibility for MX-FP6.
+164:            f"for sm120 SF smem (mma_nsf={mma_nsf})"
+522:def sm120_make_smem_layout_sfa(
+607:def sm120_make_smem_layout_sfb(
+
+=== The actual MMA instruction used by p8_h128_fc1.py -- the kernel P8NativeTPMoE's decode/M1 (small-M) path dispatches to for K4, our tested rate ===
+3885:def mxfp8_mma_m16n8k32_f32_e4m3(
+3949:        mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0
+3974:def mxfp8_mma_m16n8k32_f32_e2m1(
+3997:        mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e2m1.f32.ue8m0
+
+=== Confirms this MMA op is a Blackwell block-scaled family instruction (mxf8f6f4), not Hopper WGMMA -- separate from the hopper_helpers usage above ===
+def mxfp8_mma_m16n8k32_f32_e4m3(
+    d0: Float32,
+    d1: Float32,
+    d2: Float32,
+    d3: Float32,
+    a0: Uint32,
+    a1: Uint32,
+    a2: Uint32,
+    a3: Uint32,
+    b0: Uint32,
+    b1: Uint32,
+    sfa: Uint32,
+    sfb: Uint32,
+    bid_a: int = 0,
+    tid_a: int = 0,
+    bid_b: int = 0,
+def mxfp8_mma_m16n8k32_f32_e2m1(
+    d0: Float32,
+    d1: Float32,
+    d2: Float32,
+    d3: Float32,
+    a0: Uint32,
+    a1: Uint32,
+    a2: Uint32,
+    a3: Uint32,
+    b0: Uint32,
+    b1: Uint32,
+    sfa: Uint32,
+    sfb: Uint32,
+    bid_a: int = 0,
+    tid_a: int = 0,
+    bid_b: int = 0,
+    tid_b: int = 0,
+    *,
+    loc=None,
+    ip=None,
+) -> Tuple[Float32, Float32, Float32, Float32]:
+    """SM120 block-scaled QMMA with E4M3 A and E2M1 B containers."""
+    asm = f"""
+        mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e2m1.f32.ue8m0
+        {{$0, $1, $2, $3}},
+        {{$4, $5, $6, $7}},
+        {{$8, $9}},
+
+=== Corroborating environmental evidence: b12x is ALREADY installed in our own production vLLM image, self-described as targeting SM120/SM121, and ships a tuning profile named specifically for GB10 ===
+(from: docker run --rm eugr/spark-vllm-b12x:latest pip show b12x; and b12x/__init__.py docstring; and policy/_profiles/data/ directory listing)
+b12x version 1.2.6 installed in eugr/spark-vllm-b12x:latest (our own production image)
+b12x/__init__.py docstring: "b12x -- consumer-Blackwell (SM120/SM121) kernels."
+Embedded tuning profile files shipped with that installed b12x: nvidia.gb10.48sm.json.gz, nvidia.rtx.pro.6000.blackwell.json.gz, nvidia.rtx.pro.6000.blackwell.max-q.json.gz
