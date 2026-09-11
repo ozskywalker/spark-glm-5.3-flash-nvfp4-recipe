@@ -204,24 +204,6 @@ issues found. Boot flakiness (CUDA-graph-capture crash, ~2/5 attempts this
 session) is also not new to this candidate -- recover via the standard
 stop+flush+retry remedy, matching prior documented occurrences.
 
-## Amendment 2026-09-11: dense-FP8 folded in, on by default
-
-After the promotion above, per the user's explicit direction: ported
-v16-densefp8's `overlay/exl3.py` dispatch logic (`Glm53DenseFp8Method`,
-`_glm53_dense_fp8_group()`) plus `overlay/patch_dense_fp8.py` onto this
-build (see the top-of-Dockerfile amendment header). Re-measured against
-this exact image, not the stale v15-combined baseline the original A/B
-used: decode +14-17%, prefill @64K -15.6% -- consistent with the original
-(+12%/-14.7%), confirming no kernel work since (E3, GB10 router-GEMM,
-FlashKDA, MoE-gate-dedup) shifted the tradeoff. Ran the coherence/accuracy
-check this project's rules required and the original v16-densefp8 work
-never completed (6 prompts incl. CJK, temp=0, on vs off) -- clean, no
-garbling, no wrong answers. `glm-5.3-flash-exl3-v20-upstreamsync-vllm.yaml`
-now ships `GLM53_DENSE_FP8=dense,kda` by default; a new sibling recipe
-`glm-5.3-flash-exl3-v20-upstreamsync-maxprefill-vllm.yaml` keeps it off,
-same image. Full record: `recipes/VALIDATION.md`, "Dense-FP8 promoted to
-default, maxprefill sibling added".
-
 ## Item 4 (vLLM #54929) -- assessed, NOT vendored, real reasons found
 
 Feasibility check completed 2026-09-11. **Verdict: not advisable to vendor

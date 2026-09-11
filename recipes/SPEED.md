@@ -10,20 +10,45 @@ any row: `recipes/VALIDATION.md` (current version) or
 
 **Latest first.**
 
-## Current production: v20-upstreamsync (2026-09-11)
+## Current production: v20-upstreamsync, two recipes sharing one image (2026-09-11)
 
-| Metric | Value |
-|---|---|
-| Decode | 28.17-29.99 tok/s (n=6, 2 boots) |
-| TTFT @16K | 9.6-11.9s (v20 and control-A/B v19 runs, same range) |
-| Prefill @16K (derived) | ~1,340-1,660 tok/s |
+Same `glm53-exl3-v20-upstreamsync:local` image, toggled by one env var
+(`GLM53_DENSE_FP8`). **Default recipe ships it on** — this fleet's prefill
+throughput has grown enough since v1 (~860-900 → ~1,500-1,700+ tok/s, see
+the version history below) that trading some of it for a real decode win
+is the right call now, given the ~85/15 heavy/short traffic split and
+growing agentic use. A sibling recipe keeps it off for workloads that are
+consistently prefill-dominated.
 
-No throughput change expected or found — this candidate is correctness/
-plumbing fixes only (chat template, shard-count scoping, an opt-in
-scheduler flag left off, a build-host guard). Matches v19-indexercompat
-within noise. See `VALIDATION.md` for the earlyoom-during-longctx
-investigation (confirmed ambient/fleet-wide via a direct A/B against v19,
-not a v20 regression).
+| Metric | **Default** (`...-vllm.yaml`, dense-FP8 **on**) | **maxprefill sibling** (dense-FP8 off) |
+|---|---|---|
+| Decode | 31.54-36.76 tok/s (final-recipe confirmation) / 32.59-34.15 tok/s (A/B) | 27.96-29.99 tok/s (n=9, 3 boots) |
+| Prefill @16K | ~1,437 tok/s (TTFT 11.1s) | ~1,375 tok/s (TTFT 11.6s) |
+| Prefill @64K | ~1,512 tok/s (TTFT 42.3s) | ~1,791 tok/s (TTFT 35.7s) |
+
+Decode gain **+14-17%**, prefill cost @64K **-15.6%** — essentially
+unchanged from the original v16-densefp8 A/B (+12% / -14.7%@64K), measured
+9 days later against v15-combined; kernel work since (E3, GB10
+router-GEMM, FlashKDA, MoE-gate-dedup) didn't shift the tradeoff in either
+direction. Coherence/accuracy check (6 prompts incl. a CJK translation,
+temp=0, on vs. off) came back clean — no garbling, no wrong answers, only
+ordinary paraphrase-level drift. Still PROVISIONAL per upstream's own
+commit message (no full KLD panel run). Full record: `VALIDATION.md`,
+"Dense-FP8 promoted to default, maxprefill sibling added".
+
+The `v19-indexercompat` baseline numbers below (routine-upstream-sync
+fixes only, no throughput change expected) still apply as the pre-existing
+platform both v20 recipes build on:
+
+**Decode kernel composition re-measured 2026-09-11 (batch=1, CUDA graphs
+on)**: gemm 53.0%/52.6%, moe_exl3 34.1%/32.8%, comms 5.0%/6.6%, attention
+0.5%/0.5%, mamba_ssm 0.3%/0.3% (rank0/rank1) — essentially unchanged from
+the 2026-09-02 trace (gemm 52.5%/49.8%, moe 32.8%/31.3%). The single
+largest kernel is still the undersized-tile Ampere WMMA GEMM
+(`cutlass_80_wmma...16x16`, 36.2-36.3% of GPU time) — the custom-kernel
+opportunity that trace identified is confirmed still live. Full detail,
+plus the still-missing piece for any future revisit (a fresh real-traffic
+workload sample — the one this project has is from 2026-09-06): `VALIDATION.md`.
 
 ## EXL3 version history
 

@@ -663,11 +663,11 @@
 
 recipe_version: "2"
 name: GLM-5.3-Flash-EXL3-v20-upstreamsync
-description: "Production (v20-upstreamsync). Routine upstream-check fixes on top of v19-indexercompat (chat template None-content leak, count_shards snapshot-scoping, long-prefill-threshold opt-in plumbing off, build-host memory guard) PLUS GLM53_DENSE_FP8=dense,kda on by default (2026-09-11 amendment) -- +14-17% decode, -15.6% prefill@64K, re-measured against this image and coherence-checked clean. For prefill-dominated workloads, use the sibling glm-5.3-flash-exl3-v20-upstreamsync-maxprefill-vllm.yaml instead (same image, dense-fp8 off). See recipes/VALIDATION.md."
+description: Routine upstream-check candidate on top of v19-indexercompat (current production) -- chat template None-content leak fix, count_shards snapshot-scoping fix, long-prefill-threshold opt-in plumbing (off by default), build-host memory guard. vLLM #54929 assessed and not vendored (see NOTES.md). Docker build and tinyGLM gate both passed. This recipe is the real-checkpoint validation step. See recipes/build/glm53-exl3-v20-upstreamsync/NOTES.md.
 
 model: Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw
 runtime: vllm
-container: glm53-exl3-v20-upstreamsync:local
+container: glm53-exl3-v20-densefp8-ab:local
 
 min_nodes: 2
 
@@ -763,26 +763,12 @@ env:
   # v13-moegemm gate-dedup patch (built from v12-combined, one variable at
   # a time) -- combine only after each is individually validated.
   GLM53_FLASHKDA_PREFILL: "1"
-  # DEFAULT ON (2026-09-11): MiaAI-Lab's FP8 weight-only (Marlin) dense-
-  # projections path (GLM53_DENSE_FP8, ported from v16-densefp8, originally
-  # commit eb0da1d -- see recipes/build/glm53-exl3-v20-upstreamsync/
-  # Dockerfile and NOTES.md for the port). Re-measured against this exact
-  # image, not the stale v15-combined baseline the original A/B used:
-  # decode +14-17%, prefill @64K -15.6% -- the tradeoff holds, unmoved by
-  # any kernel work since (E3, GB10 router-GEMM, FlashKDA, MoE-gate-dedup).
-  # Given the real prefill throughput gained since v1 (~860-900 -> ~1,500-
-  # 1,700+ tok/s) and this fleet's ~85/15 heavy/short traffic split plus
-  # growing agentic use, the decode win is worth the prefill give-back here.
-  # Coherence/accuracy side-by-side (6 representative prompts incl. a CJK
-  # translation, the project's known corruption-risk case) confirmed clean
-  # -- no garbling, no wrong answers, only the expected paraphrase-level
-  # drift any precision change causes under greedy decoding. Still
-  # PROVISIONAL per upstream's own commit message ("changes target
-  # numerics"), not a full KLD panel. For prefill-dominated workloads that
-  # want the old tradeoff back, use the maxprefill sibling recipe instead:
-  # glm-5.3-flash-exl3-v20-upstreamsync-maxprefill-vllm.yaml (same image,
-  # this one variable unset). See recipes/VALIDATION.md, "Dense-FP8
-  # promoted to default, maxprefill sibling added".
+  # SCRATCH A/B MEASUREMENT, NOT A PROMOTION CANDIDATE: re-running the
+  # v16-densefp8 tradeoff (originally measured against the stale
+  # v15-combined baseline) against the current v20-upstreamsync baseline
+  # instead, since E3/GB10-router-gemm/FlashKDA/MoE-gate-dedup all landed
+  # since that original A/B. Matches v16's own "dense,kda" test config
+  # exactly. See recipes/VALIDATION.md.
   GLM53_DENSE_FP8: "dense,kda"
 
 defaults:

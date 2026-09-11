@@ -1,22 +1,5 @@
 # GLM-5.3-Flash NoPE sparse MLA on SM121 (NVIDIA GB10 / DGX Spark).
 #
-# *** v20-upstreamsync amendment, 2026-09-11 (same version, added after the
-# initial promotion below): folded in MiaAI-Lab's FP8 weight-only (Marlin)
-# dense-projections path (GLM53_DENSE_FP8, ported from v16-densefp8's
-# overlay/exl3.py, originally commit eb0da1d). Re-measured against this
-# exact image rather than trusting the stale v15-combined-era A/B: decode
-# +14-17%, prefill @64K -15.6% -- the tradeoff holds, unmoved by any kernel
-# work since (E3, GB10 router-GEMM, FlashKDA, MoE-gate-dedup). Given the
-# real prefill throughput gained since v1 (~860-900 -> ~1,500-1,700+ tok/s)
-# and this fleet's ~85/15 heavy/short traffic split plus growing agentic
-# use, decided the decode win is worth the prefill give-back. Two sibling
-# recipes share this one image: glm-5.3-flash-exl3-v20-upstreamsync-vllm.yaml
-# (GLM53_DENSE_FP8=dense,kda, the default) and
-# glm-5.3-flash-exl3-v20-upstreamsync-maxprefill-vllm.yaml (unset). See
-# NOTES.md and recipes/VALIDATION.md for the full record, including the
-# coherence/accuracy check this project's own rules required before
-# shipping this on by default.
-#
 # *** v20-upstreamsync, 2026-09-11: seeded from recipes/build/glm53-exl3-
 # v19-indexercompat (current production) unchanged, PLUS four items folded
 # in from a routine upstream-check triage (MiaAI-Lab main 9c0794b..1caea9a,
@@ -649,24 +632,14 @@ RUN python3 /opt/glm53/patch_moe_gate_dedup.py
 # fix + one fewer kernel launch per MoE layer. Zero anchor drift from
 # upstream's own diff context. See patch_gb10_router_gemm.py and NOTES.md.
 RUN python3 /opt/glm53/patch_gb10_router_gemm.py
-# 2026-09-11: MiaAI-Lab's FP8 weight-only (Marlin) dense-projections path
-# (originally commit eb0da1d), ported from v16-densefp8's overlay/exl3.py.
-# Gated behind GLM53_DENSE_FP8 (default "off" -- inert -- unless a recipe
-# sets it). Re-measured against this exact image (not the stale
-# v15-combined baseline v16-densefp8 was A/B'd against): decode +14-17%,
-# prefill @64K -15.6%, both consistent with the original A/B's +12%/-14.7%
-# -- confirmed the tradeoff still holds on the current kernel stack (E3,
-# GB10 router-GEMM, FlashKDA, MoE-gate-dedup all postdate the original
-# test). PROVISIONAL per upstream's own commit message ("changes target
-# numerics"); a coherence/accuracy side-by-side (not just throughput) is
-# required before shipping this on by default -- see recipes/VALIDATION.md
-# for that check. Two sibling recipes share this one image:
-# glm-5.3-flash-exl3-v20-upstreamsync-vllm.yaml (GLM53_DENSE_FP8=dense,kda,
-# the default -- this fleet's ~85/15 heavy/short traffic split and growing
-# agentic use justify trading some of the prefill headroom built up since
-# v1 for a real decode win) and
-# glm-5.3-flash-exl3-v20-upstreamsync-maxprefill-vllm.yaml (unset, for
-# workloads that want maximum prefill throughput instead).
+# SCRATCH A/B BUILD, NOT A PROMOTION CANDIDATE: MiaAI-Lab's FP8 weight-only
+# (Marlin) dense-projections patch, ported from v16-densefp8 (originally
+# eb0da1d) onto the current v20-upstreamsync baseline instead of the stale
+# v15-combined baseline it was last A/B'd against. Gated behind
+# GLM53_DENSE_FP8 (default "off", zero behavior change unless set). Built
+# solely to re-measure the prefill/decode tradeoff against today's kernel
+# stack (E3, GB10 router-GEMM, FlashKDA, MoE-gate-dedup all postdate the
+# original v16 A/B). See recipes/VALIDATION.md.
 RUN python3 /opt/glm53/patch_dense_fp8.py
 
 RUN EXL3_SELFCHECK_GPU=0 python3 /opt/glm53/test_exl3_overlay.py \
