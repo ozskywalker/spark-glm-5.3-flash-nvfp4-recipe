@@ -612,6 +612,8 @@ COPY overlay/patch_oom_observer.py /opt/glm53/patch_oom_observer.py
 COPY overlay/patch_flashkda.py /opt/glm53/patch_flashkda.py
 COPY overlay/patch_moe_gate_dedup.py /opt/glm53/patch_moe_gate_dedup.py
 COPY overlay/patch_gb10_router_gemm.py /opt/glm53/patch_gb10_router_gemm.py
+COPY overlay/patch_cudagraph_align.py /opt/glm53/patch_cudagraph_align.py
+COPY tests/test_cudagraph_align.py /opt/glm53/test_cudagraph_align.py
 COPY overlay/patch_dense_fp8.py /opt/glm53/patch_dense_fp8.py
 RUN python3 /opt/glm53/patch_model_overrides.py
 RUN python3 /opt/glm53/patch_dflash2.py
@@ -649,6 +651,17 @@ RUN python3 /opt/glm53/patch_moe_gate_dedup.py
 # fix + one fewer kernel launch per MoE layer. Zero anchor drift from
 # upstream's own diff context. See patch_gb10_router_gemm.py and NOTES.md.
 RUN python3 /opt/glm53/patch_gb10_router_gemm.py
+# 2026-09-12: broaden spec-decode cudagraph capture-size alignment
+# (adjust_cudagraph_sizes_for_spec_decode) from decode_mode()==FULL-only to
+# any non-NONE cudagraph mode. Mined from AEON-7/vllm-ultimate-dgx-spark
+# (independent GB10 vLLM build, no EXL3/GLM overlap otherwise -- see
+# VALIDATION.md). Real, confirmed gap in this image's own vLLM
+# (config/compilation.py, verified against g487ecf187 directly) -- but NOT
+# confirmed as the cause of any specific incident on this fleet so far; a
+# no-op when decode mode already resolves to FULL (this fleet's normal
+# case), a hardening for whenever it doesn't. See patch_cudagraph_align.py
+# and NOTES.md.
+RUN python3 /opt/glm53/patch_cudagraph_align.py
 # 2026-09-11: MiaAI-Lab's FP8 weight-only (Marlin) dense-projections path
 # (originally commit eb0da1d), ported from v16-densefp8's overlay/exl3.py.
 # Gated behind GLM53_DENSE_FP8 (default "off" -- inert -- unless a recipe
@@ -677,7 +690,8 @@ RUN EXL3_SELFCHECK_GPU=0 python3 /opt/glm53/test_exl3_overlay.py \
     && python3 /opt/glm53/test_kpool_tail_slotmap.py \
     && python3 /opt/glm53/test_spinwait_patch.py \
     && python3 /opt/glm53/test_indexer_workspace.py \
-    && python3 /opt/glm53/test_ablit.py
+    && python3 /opt/glm53/test_ablit.py \
+    && python3 /opt/glm53/test_cudagraph_align.py
 
 # Baked by start.sh --build-arg so a git pull that changes overlay/Dockerfile
 # misses this label and rebuilds once. Keep last so stamp-only rebuilds are cheap.

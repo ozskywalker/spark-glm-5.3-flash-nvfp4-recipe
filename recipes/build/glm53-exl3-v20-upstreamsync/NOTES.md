@@ -268,3 +268,35 @@ someone validates the Triton kernels against a NoPE/zero-padded,
 `index_kpool>1` checkpoint like ours. The underlying operational problem
 (#51921, recurring shm-broadcast stall) remains open and unfixed -- still
 worth tracking, just not via this PR today.
+
+## Amendment 2026-09-12: cudagraph_align hardening (patch_cudagraph_align.py)
+
+Mined from AEON-7/vllm-ultimate-dgx-spark (see `recipes/VALIDATION.md`,
+"AEON-7 initial triage"): `vllm/config/compilation.py`'s
+`resolve_cudagraph_mode_and_sizes` only rounds `cudagraph_capture_sizes` to
+multiples of `uniform_decode_query_len` (1 + num_speculative_tokens, = 3 for
+this fleet's MTP-2) when `cudagraph_mode.decode_mode() == CUDAGraphMode.FULL`.
+Every other decode mode silently skips the rounding, which the dispatcher's
+own `_create_padded_batch_descriptor` then asserts on
+(`assert num_tokens_padded % uniform_decode_query_len == 0`) for any uniform
+decode batch. AEON-7's own patch text didn't apply byte-for-byte against
+this image's vLLM commit (g487ecf187 adds a `not use_v2_model_runner` clause
+their version predates), so `overlay/patch_cudagraph_align.py` here is a
+from-scratch port matching our actual anchor, broadening the condition from
+`decode_mode() == FULL` to `!= NONE`. Verified via `test_cudagraph_align.py`
+(host fixture + a real extracted `compilation.py` from this exact image) and
+via a full docker build (all existing self-checks + the new one pass).
+
+**Important scope note**: this does NOT explain the 2026-09-12 23:41 UTC
+production incident that prompted the investigation (`Worker proc
+VllmWorker-0 died unexpectedly`, no traceback, exit code None). That crash
+happened on a 5,832-token scheduled batch for a single request already at
+179,200 computed tokens -- far above `max_cudagraph_capture_size=96`, so it
+ran eager, never touching a captured graph. This patch is a confirmed,
+independently-justified hardening (our own boot log shows
+`cudagraph_mode=FULL_AND_PIECEWISE` resolves at boot, so the original
+FULL-only gate is very likely already satisfied in normal operation -- this
+change is a no-op in that case and only matters if some future config or
+backend-support path ever leaves decode mode at PIECEWISE), not a fix for
+that specific incident. See `recipes/VALIDATION.md` for the live
+investigation into what actually caused it.

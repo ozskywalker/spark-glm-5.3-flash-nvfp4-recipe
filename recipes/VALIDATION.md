@@ -28,6 +28,46 @@ found, fixed, or ruled out.
   record; memory is the current-status layer on top of it. If they disagree,
   trust a fresh `sparkrun status` / `git log` over either.
 
+## Tracked upstream/sibling repos
+
+Checked periodically ("routine upstream check") for anything applicable to
+this fork. Add new repos here when the user names one, rather than letting
+the rotation live only in memory/session context.
+
+- **MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks** — the actual upstream this
+  fork is built from (pinned, currently `c190db1`-lineage, drifted since).
+  Source of the base image, most of the `overlay/patch_*.py` mechanisms,
+  and the majority of upstream PRs this project backports. Checked to
+  `main` @ `1caea9a` (2026-09-11) and again to `HEAD` as of 2026-09-13 --
+  quiet round, see "Routine upstream check, 2026-09-13" below.
+- **Enntity/sparkglm** — sibling project, same checkpoint family, same GB10
+  hardware. Source of the grouped-prefill fat-expert kernel (v9-fatfork)
+  and the TileLang JIT-cache-persistence fix. Moved its `main` branch to an
+  NVFP4-focused research preview; EXL3-relevant work now lives on its
+  `exl3` branch specifically — check that branch, not `main`. That branch
+  has itself shifted toward a research/experiments structure (qualification
+  protocols, rejected-candidate writeups) rather than shipped features as
+  of 2026-09-13 -- checked `exl3` @ `a8aaa229..HEAD`, see below.
+- **mmastrac/mentat** — a Ray-replacement control-plane project. Tracked
+  but not applicable to this fork (uses vLLM's `mp` executor, not Ray) —
+  see the mentat-track-closed history if this is ever reconsidered.
+- **mmastrac/glm-5.3-flash-4x-gx10** — a 4-node/TP4 GLM-5.3-Flash
+  deployment. Source of the OOM-observer diagnostic mechanism
+  (`TORCH_MEM_FRACTION` + CUDA-allocator observer).
+- **tonyd2wild/GLM-5.3-Flash-NVFP4-DFlash2-2x-DGX-Spark** — surfaced the
+  ModelOpt-format NVFP4 token-corruption bug (vLLM #54150) that's part of
+  why this fork's NVFP4 lane uses a compressed-tensors checkpoint instead.
+- **AEON-7/vllm-ultimate-dgx-spark** — added 2026-09-12. Independent (not a
+  fork of MiaAI-Lab/sparkglm/etc.) from-source vLLM build for GB10/sm_121a,
+  currently tracking vLLM v0.29.0, very active (pushed same-day as this
+  check, real external contributors, 141 stars). Targets NVFP4/ModelOpt/
+  compressed-tensors models (Gemma-4, Qwen3.6/3.8) with DFlash/DSpark spec
+  decode -- **no EXL3, no GLM-5.3-Flash** as a first-class target, so
+  nothing transfers at the quantization-scheme level. AEON's own patches
+  are MIT-licensed (clean to port from). First check surfaced real,
+  actionable leads on this fleet's two worst unsolved operational problems:
+  see "AEON-7 initial triage" below.
+
 ## Where to look for common problems
 
 This fleet (2x NVIDIA DGX Spark GB10, unified host/GPU memory, TP=2) has a
@@ -68,6 +108,25 @@ Check these first before assuming a new bug:
   not raw `%MemAvailable`), below PyTorch's own allocator layer — see
   `validation-archive/v15-combined.md` and the fragmentation pre-flight
   check already wired into `prelaunch_flush.sh`.
+- **`docker ps` shows both containers "Up" but the server is unreachable
+  and hasn't logged anything in minutes.** Don't trust container uptime as
+  a proxy for the service being alive — check `/health` and the actual log
+  tail first. A real incident (2026-09-11/12): the head's API server got an
+  external SIGTERM (not a crash — no traceback, no CUDA error, no
+  earlyoom, no dmesg event preceding it; looked like a `docker stop`/
+  `sparkrun stop` that only reached one host) and shut down cleanly, but
+  the *worker* rank never got the same signal — its process stayed alive,
+  stuck in a broken NCCL/TCPStore retry loop against a head that no longer
+  existed, logging a "Broken pipe" error roughly once a second and
+  actively burning CPU (74 minutes of CPU time accumulated) for the
+  **entire ~25 hours** until someone checked. `docker exec ... ps aux`
+  showed the truth immediately: the head container had nothing left but a
+  shell and `sleep infinity`; the worker still had a live but wedged
+  `vllm serve --headless` process. Same underlying lesson as the #51921
+  entry above (vLLM v1 can't recover a half-dead engine) plus a new one: a
+  **partial** stop (one rank only) is worse than no stop at all, since it
+  leaves the surviving rank spinning indefinitely rather than exiting.
+  Standard remedy: `sparkrun stop` (stops both), flush, relaunch.
 - **A boot-time "weights already present" false positive**, or a shard/
   snapshot count that doesn't match reality. `start.sh`'s `count_shards()`
   and `count_dflash_shard()` scope to the active (`refs/main`) snapshot
@@ -294,3 +353,281 @@ traffic surfaces a quality regression this spot-check didn't catch.
 
 `v19-indexercompat` remains available as a same-family rollback target if
 either v20 recipe needs to be backed out; it predates this change entirely.
+
+## AEON-7/vllm-ultimate-dgx-spark initial triage (2026-09-12)
+
+Added to the tracked-repo rotation at the user's request; first pass
+found real, specific leads on two of this fleet's worst unsolved
+operational problems. Investigation-only so far -- nothing below has been
+tested against this fleet yet.
+
+**Most actionable: `patches/patch_cudagraph_align.py` (their main tree).**
+Fixes a real vLLM gap -- spec-decode capture-size alignment (rounding
+capture sizes to multiples of `1+num_speculative_tokens`) is gated to
+`cudagraph_mode==FULL` only in stock vLLM, silently skipped under
+`PIECEWISE` (upstream vLLM #28015/#28207/#29091, fixed by #29102/#23679
+upstream but not yet in whatever base we're on). Their own characterization
+of the resulting symptom -- `cudaErrorIllegalAddress` mid-decode on
+partial-acceptance steps under PIECEWISE -- matches this fleet's own
+recurring, never-root-caused `torch.AcceleratorError: CUDA error: an
+illegal memory access was encountered` during CUDA-graph capture *exactly*
+in class, though not yet confirmed to be the same mechanism. This fleet
+runs MTP-2 (num_speculative_tokens=2, so partial acceptance is a real,
+frequent runtime state) under PIECEWISE-capable graphs. **Worth a direct
+test**: check whether our installed vLLM already has #29102/#23679, and
+if not, whether backporting closes the gap. This is the single most
+promising lead this project has had on this crash class since it was
+first observed.
+
+**Second lead, same repo, DeepSeek-V4-Flash GB10 branch
+(`deepseek-v4-gb10`, commit `5e2420e5e0c8d5034aa728965b04f1b11eb55adf`,
+open PR, external contributor `gilby`).** DeepSeek-V4-Flash is
+architecturally the closest model in that whole repo to GLM-5.3-Flash
+(sparse-MLA hybrid MoE). Three findings:
+- Documented root cause for a *different* NCCL failure class on 2-node
+  GB10 TP2 (`c10::DistBackendError`, not our `#51921` shm_broadcast stall,
+  but the same "NCCL + CUDA graphs on multi-node GB10" failure family):
+  full decode-graph replay desyncs NCCL between ranks. Fix: force
+  `--compilation-config '{"cudagraph_mode":"PIECEWISE"}'` -- collectives
+  must stay uncaptured on this fabric. We already don't force FULL
+  unconditionally, but worth confirming our actual capture mode.
+  Corroborated: a version-pin landmine (`tilelang==0.1.12` silently aborts
+  with a duplicate type-attr registration on their sparse-MLA decode path;
+  pin `0.1.11`) -- worth checking our own pinned TileLang version against
+  this if any TileLang-related instability recurs.
+- `overlay-deepseek-v4-gb10/vllm/model_executor/layers/sparse_attn_indexer.py`
+  (~lines 337-370) patches the same `sparse_attn_indexer.py` file family
+  our own `glm5_next` sparse-indexer touches, for a `cooperative_topk`
+  landmine: GB10/sm12x has **no thread-block-cluster launch support**
+  (`cooperative_topk` fails "invalid argument"), must fall back to
+  `persistent_topk`. Hardware-general fact worth confirming we already
+  handle correctly (our own K-pool/indexer patches suggest we do, but
+  cross-check against this exact anchor).
+- Cites DeepGEMM's `nv_dev` fork (`deepseek-ai/DeepGEMM#324`, commit
+  `a6b593d`) as shipping genuine native SM120 kernels (vendored DeepGEMM in
+  most trees is sm90/sm100-only) -- the closest thing found anywhere to
+  real Blackwell-native GEMM work, directly relevant to this project's own
+  still-unaddressed decode-time Ampere-fallback GEMM bottleneck
+  (`cutlass_80_wmma_tensorop_bf16_s161616gemm...16x16`, ~36% of decode GPU
+  time, identified 2026-09-02, confirmed unchanged 2026-09-11). Worth a
+  look before considering any from-scratch custom kernel effort.
+
+**Third lead, worth an A/B, not yet a fix**: their documented "dual-Spark
+TP=2 over RoCE" stability recipe (`capture_error_mode="thread_local"` at
+all `torch.cuda.graph` sites, `fuse_allreduce_rms:false`,
+`--disable-custom-all-reduce`, `VLLM_ALLREDUCE_USE_FLASHINFER=0` --
+they found v0.29's FlashInfer-all-reduce-on-by-default causes garbled
+output, not a hang, on RoCE Sparks specifically). Different symptom than
+our shm_broadcast stall, but the closest available "someone else
+stabilized dual-GB10-TP2-CUDA-graphs" playbook found anywhere.
+
+**Fourth, worth tracking**: their issue #9 (closed) on GB10 unified-memory
+pressure closely parallels this project's own MemFree/MemAvailable-gap and
+silent-kill investigation tracks -- two real mechanisms found (`--kv-
+cache-memory-bytes` skips vLLM's own UMA/cudagraph memory-profiling clamp
+via an early-return path; Docker cgroup memory limits don't police
+`cudaMalloc` on GB10's unified pool, so container RSS looks compliant
+right up until the driver fails to service an allocation). Does **not**
+mention host memory fragmentation (`nr_free_pages_blocks`) specifically --
+that finding still appears to be unique to this project.
+
+**Not applicable**: no EXL3/exllamav3/trellis quantization anywhere in the
+repo (nothing transfers at the quant-scheme level); no GLM-5.3-Flash as a
+target model; no mention of `earlyoom` specifically.
+
+## cudagraph_align hardening ported; 2026-09-12 23:41 UTC incident root-caused
+
+Following up on the AEON-7 triage above: the user asked to pursue the
+`patch_cudagraph_align.py` lead specifically because production had just
+crashed (a ~3-hour uptime run, after a period of heavy agentic traffic).
+Two separate pieces of work came out of this.
+
+**1. cudagraph_align ported and shipped.** Read this image's own
+`vllm/config/compilation.py` (commit `g487ecf187`) directly and confirmed
+the gap AEON-7 described is real here too:
+`resolve_cudagraph_mode_and_sizes` only rounds `cudagraph_capture_sizes` to
+multiples of `uniform_decode_query_len` (3, for this fleet's MTP-2) when
+`cudagraph_mode.decode_mode() == CUDAGraphMode.FULL`; every other decode
+mode silently skips it, and `cudagraph_dispatcher.py`'s
+`_create_padded_batch_descriptor` then asserts
+`num_tokens_padded % uniform_decode_query_len == 0` for any uniform decode
+batch. AEON-7's own patch text didn't apply byte-for-byte (this image adds
+a `not use_v2_model_runner` clause their version predates), so
+`recipes/build/glm53-exl3-v20-upstreamsync/overlay/patch_cudagraph_align.py`
+is a from-scratch port matching our actual anchor, broadening the
+condition from `decode_mode() == FULL` to `!= NONE`. New
+`tests/test_cudagraph_align.py` covers both an unpatched and
+already-patched source (host fixture + a real extracted `compilation.py`
+from this image); full docker rebuild passed all self-checks including the
+new one. Shipped directly into `glm53-exl3-v20-upstreamsync:local` (no new
+version number -- same build tree, patch added). See
+`recipes/build/glm53-exl3-v20-upstreamsync/NOTES.md`, "Amendment
+2026-09-12: cudagraph_align hardening" for full detail. **This is a
+confirmed-real, independently-justified gap closure, not a fix verified
+against a reproduction** -- our own boot log shows
+`cudagraph_mode=FULL_AND_PIECEWISE` resolving normally, so the FULL-only
+gate is very likely already satisfied in normal operation; this change is
+a no-op today and a hardening against any future config/backend-support
+path that leaves decode mode at PIECEWISE.
+
+**2. The actual 2026-09-12 23:41 UTC incident -- root-caused, and it is
+NOT the cudagraph_align gap.** The user supplied the actual crash log
+(`Worker proc VllmWorker-0 died unexpectedly (exit code: None)`, no
+traceback of its own, followed by the downstream `shm_broadcast`
+"cancelled" error and `EngineDeadError`). The dying step's
+`dump_input.py` output showed `num_scheduled_tokens=5832` for a single
+request already at `num_computed_tokens=179200` -- a large one-shot
+continuation chunk for a ~180K-token-deep request, not a small MTP-2
+decode step. That's far above this config's `max_cudagraph_capture_size=96`,
+so the step ran eager -- ruling out cudagraph capture/replay
+(and therefore cudagraph_align) as the mechanism for this specific crash.
+
+Host-level investigation (dmesg + `journalctl -u earlyoom`, both nodes,
+which the user's own earlier `sparkrun stop` at 19:43 had left no other
+trace of -- containers were already destroyed) found the real cause:
+
+- **Both hosts hit severe, simultaneous host memory exhaustion** starting
+  ~19:40:45 EDT: this host (node_1/rank1) pinned at **3600 MiB avail out of
+  124610 (2.89%)** continuously for 29+ seconds; the head (node_0/rank0,
+  10.7.0.87) dropped to **2508 MiB (2.01%)** at the same time.
+- **19:40:51.14 EDT**, head node: earlyoom crossed its SIGTERM threshold
+  and sent SIGTERM to `1712017 uid 1000 "VLLM::Worker_TP"` (badness 984,
+  VmRSS 2320 MiB).
+- **19:41:01.22 EDT** (10s later): earlyoom logged **`kill failed: Timer
+  expired`** -- the SIGTERM did not take effect within earlyoom's wait
+  window. Plausible explanation: the worker was mid-flight on the large
+  5832-token batch, blocked in CUDA/NCCL work and unable to act on the
+  signal promptly.
+- **19:41:06-09 EDT**: memory on both hosts suddenly recovered to
+  86-92% avail -- consistent with the worker actually dying/releasing its
+  memory around then, matching the `23:41:06 UTC` (=19:41:06 EDT) `Worker
+  proc ... died unexpectedly` timestamp in the user's log almost to the
+  second.
+- This host (node_1/rank1) never logged its own SIGTERM/SIGKILL line in
+  this window despite being equally starved (2.89% avail) -- it just sat
+  at the low-memory warning level without earlyoom escalating to a kill
+  here; the head's kill (successful or not) was enough to end the episode
+  for both ranks (TP=2 -- losing either rank kills the whole engine).
+
+**This extends, rather than replaces, the project's existing "earlyoom
+root-cause correction" finding** ([[earlyoom_root_cause_correction]]):
+previously documented as "check earlyoom first, it's usually the silent
+killer." New wrinkle, not previously seen: **earlyoom's own kill attempt
+can itself fail/time out** against an unresponsive GPU/NCCL-blocked
+target, which likely explains why some past "silent kill" incidents were
+hard to pin to a specific earlyoom action from timestamps alone -- the
+SIGTERM fires, doesn't land immediately, and the process dies later for
+reasons that then look uncorrelated unless you specifically check for a
+"kill failed" line.
+
+**New data point for the standing host-memory-pressure track**
+([[host_fragmentation_xid31_reboot_risk]], the 240K-context fragmentation
+finding): this episode happened at ~185K total tokens (179200 computed +
+5832 scheduled), well under the ~240K neighborhood previously implicated.
+The common factor isn't a fixed context-length threshold -- it's **a
+single large one-shot continuation/recompute batch** (5832 tokens in one
+step, vs. MTP-2's normal 1-3-token decode steps) for a request already
+deep in a long context. Worth checking whether the scheduler's chunking
+policy (`patch_scheduler_decode_floor.py`'s mixed-prefill-decode policy)
+can be made to cap continuation-chunk size for already-long-context
+requests specifically, rather than only floor-ing decode-side batching --
+not yet investigated further; flagging for a future session.
+
+**Not yet done**: identifying what specifically was consuming host RAM in
+that window (vLLM's own host-side buffers scaling with the 5832-token
+batch vs. something fragmentation-related vs. an unrelated host process);
+no host-side memory profiler was attached at the time and the containers
+are gone. Production was relaunched on the patched image
+(`glm53-exl3-v20-upstreamsync:local`, now carrying `patch_cudagraph_align.py`)
+after this investigation; see the top of this file for the current state.
+
+## Routine upstream check, 2026-09-13 -- quiet round, nothing folded in
+
+MiaAI-Lab main `1caea9a..HEAD` (32 commits, 6 PRs), Enntity/sparkglm `exl3`
+branch `a8aaa229..HEAD` (15 commits), plus pulse checks on the other three
+tracked repos and vLLM itself. Honest result: **nothing directly
+actionable for this fork's production recipe this round** -- every
+substantive item is either launcher plumbing this fork bypasses (sparkrun
+runs `vllm serve` directly, not MiaAI-Lab's `start.sh`), a DFlash-specific
+feature this fork doesn't ship (MTP-2 stays the production speculator),
+or a correctness fix already present in our own vLLM base. Detail:
+
+**MiaAI-Lab, by PR:**
+- **#130** (merged): opt-in per-KV-cache-group prefix-cache retention +
+  safe replay for DFlash's sliding-window drafter cache. DFlash-only
+  (`GLM53_APC_RETENTION_INTERVAL_SWA` requires `SPEC_METHOD=dflash`) --
+  not applicable, we run MTP-2.
+- **#169** (merged): computes the CUDA-graph capture-size list for
+  DFlash's "adaptive-k" verification-length feature from
+  `GLM53_ADAPTIVE_K_SET`/`DFLASH_TOKENS`/`MAX_NUM_SEQS` instead of a fixed
+  list. Same *class* of bug this fork just spent a session on
+  (cudagraph capture sizes not accounting for variable spec-decode token
+  counts -- see the cudagraph_align entry above) but the feature itself
+  (DFlash adaptive-k) is DFlash-only -- not applicable. Worth noting as
+  corroboration that this bug class is real and recurring industry-wide,
+  not specific to us or to MTP.
+- **#172** (merged): launcher's RoCE GID preflight only checked the first
+  HCA on a dual-rail (`HEAD_CX7_IB=dev1,dev2`) kit, silently skipping
+  validation on the second -- an unpopulated GID there kills that rank
+  ~60s into a run. Fix + new test. Their own measurement: **dual-rail NCCL
+  all-reduce hit 20.9 GB/s peak busbw vs. 12.8 GB/s single-rail** on their
+  2x GB10 kit. The preflight fix itself is start.sh-only, not applicable
+  (sparkrun handles our own networking setup, abstracted behind
+  `transfer_interface: cx7` in `~/.config/sparkrun/clusters/default.yaml`)
+  -- but that ~63% bandwidth number is worth checking against our own
+  setup: **not yet verified whether sparkrun is using both RoCE rails on
+  our CX7 cards or just one.** Flagging for a future session -- if we're
+  single-rail today, this could be a real, free TP=2 communication
+  bandwidth win.
+- **#175** (merged): makes `start.sh`'s hardcoded
+  `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` overridable (for
+  derived images with a KV connector that can't tolerate expandable
+  segments). Not applicable as a fix -- we already set this directly in
+  our own recipe YAML, unconditionally, bypassing `start.sh` entirely.
+  Confirms our existing setting matches upstream's own recommended
+  default.
+- **#136, #173, #176** (merged): benchmark-script bearer auth, launcher
+  Jinja2-interpreter discovery, a docs typo. Tooling/docs only, no
+  runtime-behavior relevance.
+
+**Enntity/sparkglm (`exl3` branch)**: this branch has shifted into a
+heavier "research/experiments" structure (qualification protocols,
+rejected-candidate writeups) rather than shipped features. Two things
+worth recording:
+- **`research/experiments/exl3-direct-epilogue`**: a candidate
+  micro-optimization to the fat-expert grouped-MoE kernel's epilogue
+  (keep the transformed row in its owning warp, skip a shared-memory
+  round-trip). **Rejected by their own performance screen** -- compiled
+  and passed correctness, but was slower than the reference. Nothing to
+  port; recorded for completeness (same rigor this project applies to its
+  own rejected experiments).
+- **`research/experiments/exl3-e3/UPDATE_REVIEW.md`** flagged **vLLM PR
+  #55234** as "especially easy to backport incorrectly" (MLA cache-group
+  capability handling for non-causal draft paths, plus a `MambaSpec.merge`
+  assertion-preservation fix under `python -O`). Checked directly against
+  our own vendored vLLM (`g487ecf187`,
+  `vllm/v1/kv_cache_interface.py:487-488`): **already present** (the `any()`
+  aggregation the fix restores is exactly what our source has). Nothing to
+  do. Their update review also independently confirms two things this
+  project already concluded on its own: their reported E3-vs-E2 speedup
+  "is not transferable" since SparkGLM (and this fork) already has grouped
+  M64 prefill + cooperative K4 decode, and "replacing DFlash2 with MTP"
+  is flagged as its own separate hypothesis requiring independent
+  measurement, not something to blend silently -- same conclusion this
+  fork reached independently months ago.
+
+**Pulse-checked, no new relevant activity**: mmastrac/glm-5.3-flash-4x-gx10
+(last push 2026-09-07, before this round's window), tonyd2wild/GLM-5.3-
+Flash-NVFP4-DFlash2-2x-DGX-Spark (2026-09-02), AEON-7/vllm-ultimate-dgx-
+spark (2026-09-12, before yesterday's full triage -- nothing since).
+mmastrac/mentat had a burst of activity (a 0.10.0 release) but it's all
+within its existing Ray-replacement scope -- track stays closed, see
+[[mentat_track_closed]].
+
+**vLLM upstream**: still v0.29.0 (published 2026-09-09), no new release
+since the backport-candidates round closed 2026-09-10. Nothing new to
+triage there.
+
+**Net**: a genuinely quiet round. One follow-up flagged (verify RoCE
+dual-rail usage in our own sparkrun cluster config) but nothing shipped or
+changed in this fork as a result of this check.
