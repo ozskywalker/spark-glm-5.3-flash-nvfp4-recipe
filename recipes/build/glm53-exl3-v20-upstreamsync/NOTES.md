@@ -300,3 +300,58 @@ change is a no-op in that case and only matters if some future config or
 backend-support path ever leaves decode mode at PIECEWISE), not a fix for
 that specific incident. See `recipes/VALIDATION.md` for the live
 investigation into what actually caused it.
+
+## Amendment 2026-09-15: two backports from a routine upstream-check round
+
+Both mined from MiaAI-Lab main (`f906ee990..HEAD`, ~93 commits across two
+consecutive rounds). Full round detail, including everything assessed and
+NOT adopted, lives in `recipes/VALIDATION.md`.
+
+**`patch_default_max_new_tokens.py`** (PR #51): decode-hygiene default for
+requests that omit `max_tokens`. Gated behind `DEFAULT_MAX_NEW_TOKENS`
+(unset/empty = stock behavior; this fleet ships `"65536"` in both the
+default and maxprefill recipes' `env:` blocks). All three anchors
+(`entrypoints/serve/utils/api_utils.py`'s `get_max_tokens()`,
+`entrypoints/openai/completion/serving.py`'s call site,
+`entrypoints/openai/completion/protocol.py`'s before-validator) verified
+byte-for-byte against this image's own vLLM before being written -- zero
+reconciliation needed. Ported near-verbatim (upstream's implementation was
+already well-built: idempotent, validates `DEFAULT_MAX_NEW_TOKENS` and
+compiles every target before writing any of the three files); only the
+`ROOT` path was changed to be env-overridable
+(`GLM53_VLLM_ROOT`), matching this project's own patch-testability
+convention. Verified via `test_default_max_new_tokens.py` (real extracted
+source, idempotency, `--status`, and invalid-input fail-closed checks) and
+a full docker rebuild.
+
+**`prelaunch_flush.sh`'s new `check_memory_available()`** (PR #39): a
+pre-boot check, run on both hosts right after the existing drop_caches +
+fragmentation steps, comparing `/proc/meminfo`'s `MemAvailable` against
+`gpu_memory_utilization x MemTotal + headroom` (default 2 GiB). Catches a
+host process holding memory -- not a container, which the existing
+container-count check would miss -- BEFORE paying for the image pull and
+weight load, rather than dying mid-bring-up with a hard-to-read `ValueError:
+Free memory on device ... less than desired` deep in a worker log. FATAL by
+default (`GLM53_PREFLIGHT_SKIP_MEMORY_CHECK=1` to override), unlike the
+advisory-only fragmentation check next to it -- this failure mode is a
+guaranteed deterministic hard-stop, not a probabilistic risk, so failing
+fast is strictly better here. Deliberately reads `MemAvailable`, not
+`MemFree`, for the same reason the fragmentation check does. Verified via
+`bash -n` and a standalone arithmetic check against real host numbers; not
+yet exercised against a live host (would require running
+`prelaunch_flush.sh` against production, which was not done this round to
+avoid disturbing live traffic -- first real exercise will be whenever this
+fleet's next boot happens).
+
+**Also assessed this round, not adopted**: PR #170 (long-prefill warmup
+ladder extension), PR #94 (`GLM53_KV_CAPACITY_LOG`, informational-only),
+PR #70 (`spec-accept-gate.sh` diagnostic + UVM-livelock runbook), PR #41
+(`spark_doctor.sh` ops tooling) -- all genuinely low-risk and plausibly
+worth adopting, just not done this round; PR #186/#187 (fair-v5
+mixed-prefill scheduler, now MiaAI-Lab's own TP=2 default) -- explicitly
+flagged as needing a deliberate A/B before adopting, not a drive-by
+backport; the `thinking_token_budget` sampler bug flagged via a separate
+mmastrac/4x-gx10 dig -- checked directly against our vendored vLLM and
+confirmed NOT applicable, since it lives in vLLM's V2 model runner's
+sampler and this fleet resolves to the V1 runner (structurally different
+code, no shared bug). See `recipes/VALIDATION.md` for the full list.

@@ -15,6 +15,23 @@
 #      threshold below is based on two data points, not a validated
 #      statistical floor. See recipes/VALIDATION.md and the
 #      host_fragmentation_xid31_reboot_risk memory note.
+#   4. check host MemAvailable against what gpu_memory_utilization is about
+#      to request, BEFORE the image pull/weight load/sync -- ported from
+#      MiaAI-Lab PR #39 (2026-09-15 upstream-check round). On GB10 the GPU
+#      shares the unified memory pool with the host; a host process holding
+#      memory (not a container -- distinct from any container-level check)
+#      leaves less than gpu_memory_utilization x MemTotal free, and the
+#      worker then dies MID-BRING-UP with a `ValueError: Free memory on
+#      device ... less than desired` deep in a hard-to-read worker log,
+#      after already paying for the image pull and weight load. This is
+#      FATAL by default (override via GLM53_PREFLIGHT_SKIP_MEMORY_CHECK=1)
+#      -- unlike the fragmentation check above, this failure mode is a
+#      guaranteed, deterministic hard-stop, not a probabilistic risk, so
+#      failing fast before the expensive part of boot is strictly better
+#      than failing loud mid-bring-up. Deliberately reads MemAvailable, not
+#      MemFree, for the same reason the fragmentation check does -- a large
+#      weight rsync fills reclaimable page cache and would false-fail on
+#      MemFree.
 #
 # Usage:
 #   prelaunch_flush.sh <host1,host2,...> [--during-load]
@@ -27,6 +44,14 @@ set -euo pipefail
 # settled boot's own compile event) — deliberately conservative so it only
 # fires on a genuinely depleted node, not routine variance.
 FRAG_WARN_THRESHOLD="${FRAG_WARN_THRESHOLD:-2000}"
+
+# This fork's shipped gpu_memory_utilization (v20-upstreamsync, both dense-FP8
+# and maxprefill sibling recipes) -- override if launching a recipe with a
+# different value. Headroom matches MiaAI-Lab's own default; both are
+# overridable independently.
+GLM53_PREFLIGHT_GMU="${GLM53_PREFLIGHT_GMU:-0.84}"
+GLM53_PREFLIGHT_MEMORY_HEADROOM_KIB="${GLM53_PREFLIGHT_MEMORY_HEADROOM_KIB:-2097152}"
+GLM53_PREFLIGHT_SKIP_MEMORY_CHECK="${GLM53_PREFLIGHT_SKIP_MEMORY_CHECK:-0}"
 
 HOSTS="${1:?usage: prelaunch_flush.sh <host1,host2,...> [--during-load]}"
 MODE="${2:-}"
@@ -61,6 +86,32 @@ check_fragmentation() {
   fi
 }
 
+check_memory_available() {
+  local host="$1"
+  local meminfo mem_total_kib mem_avail_kib threshold_kib
+  meminfo="$(ssh -o BatchMode=yes "$host" 'grep -E "^MemTotal:|^MemAvailable:" /proc/meminfo' 2>/dev/null || echo "")"
+  mem_total_kib="$(echo "$meminfo" | awk '/^MemTotal:/ {print $2}')"
+  mem_avail_kib="$(echo "$meminfo" | awk '/^MemAvailable:/ {print $2}')"
+  if [ -z "$mem_total_kib" ] || [ -z "$mem_avail_kib" ]; then
+    echo "  memory preflight: could not read /proc/meminfo — skipping"
+    return 0
+  fi
+  # Integer KiB arithmetic throughout; GMU is e.g. 0.84 so scale by 100 first.
+  threshold_kib=$(( mem_total_kib * $(printf '%.0f' "$(echo "$GLM53_PREFLIGHT_GMU * 100" | bc)") / 100 + GLM53_PREFLIGHT_MEMORY_HEADROOM_KIB ))
+  if [ "$mem_avail_kib" -ge "$threshold_kib" ]; then
+    echo "  memory preflight: ${mem_avail_kib} KiB available >= ${threshold_kib} KiB needed (gmu=${GLM53_PREFLIGHT_GMU} + $((GLM53_PREFLIGHT_MEMORY_HEADROOM_KIB / 1048576)) GiB headroom), OK"
+    return 0
+  fi
+  echo "  MEMORY PREFLIGHT FAILED on $host: only ${mem_avail_kib} KiB (MemAvailable) free," >&2
+  echo "    but gpu_memory_utilization=${GLM53_PREFLIGHT_GMU} on a ${mem_total_kib} KiB host needs" >&2
+  echo "    ${threshold_kib} KiB free (incl. $((GLM53_PREFLIGHT_MEMORY_HEADROOM_KIB / 1048576)) GiB headroom)." >&2
+  echo "    A host process is holding memory a container-level check won't see. Booting now would" >&2
+  echo "    pay for the image pull + weight load, then die mid-bring-up with a hard-to-read" >&2
+  echo "    'Free memory on device ... less than desired' worker error instead. Free memory on" >&2
+  echo "    $host first, or set GLM53_PREFLIGHT_SKIP_MEMORY_CHECK=1 to proceed anyway." >&2
+  return 1
+}
+
 IFS=',' read -ra HOST_LIST <<< "$HOSTS"
 for host in "${HOST_LIST[@]}"; do
   echo "== $host =="
@@ -69,6 +120,9 @@ for host in "${HOST_LIST[@]}"; do
   ssh -o BatchMode=yes "$host" \
     'sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null || { echo "FLUSH FAILED" >&2; exit 1; }; echo flushed'
   check_fragmentation "$host"
+  if [ "$GLM53_PREFLIGHT_SKIP_MEMORY_CHECK" != "1" ]; then
+    check_memory_available "$host"
+  fi
   if [ "$MODE" = "--during-load" ]; then
     scp -q -o BatchMode=yes "$SCRIPT_DIR/cache_flusher_remote.sh" "$host":/tmp/glm53_cache_flusher.sh
     # stop any stale flusher via pidfile (pkill -f would match this very

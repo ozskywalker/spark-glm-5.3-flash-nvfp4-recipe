@@ -38,8 +38,12 @@ the rotation live only in memory/session context.
   fork is built from (pinned, currently `c190db1`-lineage, drifted since).
   Source of the base image, most of the `overlay/patch_*.py` mechanisms,
   and the majority of upstream PRs this project backports. Checked to
-  `main` @ `1caea9a` (2026-09-11) and again to `HEAD` as of 2026-09-13 --
-  quiet round, see "Routine upstream check, 2026-09-13" below.
+  `main` @ `1caea9a` (2026-09-11), `HEAD` as of 2026-09-13 (quiet),
+  `HEAD` again as of 2026-09-14 (`f906ee990..d8ad18311` -- a vision-
+  encoder host-OOM fix, assessed not urgent, see "TP=4 vs. 2x TP=2
+  assessment... 2026-09-14" below), and `HEAD` again as of 2026-09-15
+  (`d8ad18311..HEAD`, 91 commits/~15 PRs -- two shipped, see "Routine
+  upstream check, 2026-09-15" below).
 - **Enntity/sparkglm** — sibling project, same checkpoint family, same GB10
   hardware. Source of the grouped-prefill fat-expert kernel (v9-fatfork)
   and the TileLang JIT-cache-persistence fix. Moved its `main` branch to an
@@ -53,7 +57,12 @@ the rotation live only in memory/session context.
   see the mentat-track-closed history if this is ever reconsidered.
 - **mmastrac/glm-5.3-flash-4x-gx10** — a 4-node/TP4 GLM-5.3-Flash
   deployment. Source of the OOM-observer diagnostic mechanism
-  (`TORCH_MEM_FRACTION` + CUDA-allocator observer).
+  (`TORCH_MEM_FRACTION` + CUDA-allocator observer). Deep-dived 2026-09-14
+  for its TP=4-specific experience (RoCE fabric fault modes, GID
+  instability, no multi-replica comparison) -- see "TP=4 vs. 2x TP=2
+  assessment... 2026-09-14" below. Three secondary backport candidates
+  flagged, not yet investigated: a spin-wait CPU patch, a GPU_MEM_UTIL
+  ceiling data point, a `thinking_token_budget` bug report.
 - **tonyd2wild/GLM-5.3-Flash-NVFP4-DFlash2-2x-DGX-Spark** — surfaced the
   ModelOpt-format NVFP4 token-corruption bug (vLLM #54150) that's part of
   why this fork's NVFP4 lane uses a compressed-tensors checkpoint instead.
@@ -631,3 +640,209 @@ triage there.
 **Net**: a genuinely quiet round. One follow-up flagged (verify RoCE
 dual-rail usage in our own sparkrun cluster config) but nothing shipped or
 changed in this fork as a result of this check.
+
+## TP=4 vs. 2x TP=2 assessment, and routine upstream check, 2026-09-14
+
+Prompted by the user contemplating scaling from 2 to 3 or 4 DGX Sparks.
+Conversational recommendation for both cases: don't extend the TP group
+(TP=3 hits an odd-sharding-degree risk class this project has never
+validated at any TP degree; TP=4 doesn't have that specific risk but
+multiplies this fleet's single most-proven fragility, the RoCE/NCCL
+fabric, across twice the physical link count). Prefer independent
+replicas -- a 3rd node as its own TP=1 lane for the ~15% short-traffic
+slice, or 2x TP=2 pairs instead of one TP=4 group -- both reuse the
+entire already-validated TP=2 stack with zero new sharding risk and, more
+importantly given this project's own incident history, halve blast
+radius instead of concentrating it.
+
+**mmastrac/glm-5.3-flash-4x-gx10 deep-dive (fanned out to a subagent,
+production untouched throughout)**: confirms the TP=4 concern directly.
+Their repo is genuine flat TP=4 across 4 separate physical GB10 boxes
+over RoCE (not PP, not DP -- some unused PP plumbing exists in the repo
+but isn't what's actually invoked). Their own troubleshooting docs
+describe a RoCE fabric fault mode independent of anything we've hit:
+NCCL all-reduce silently crawling to ~12 Gb/s (vs. 196 Gb/s healthy)
+after a cable hot-plug, with **zero error-counter signal** -- `ib_write_bw`
+reads fine, only a Ring-vs-Tree NCCL microbenchmark catches it -- and
+requiring a full power-off (not a reboot) to clear. Their own words: "the
+existing 4x recipes each solve a different subset and none of them
+mention the fabric fault, which is the one that costs half your prefill
+throughput while every metric reads healthy." Second independent fragility
+axis: the RoCE GID index is per-node-*and-per-boot*, not a stable value --
+they derive it dynamically every boot rather than trust a pinned config,
+since a stale pin silently breaks TP init. A useful, independently-derived
+data point: their own note that per-token all-reduce payload (~720KB) is
+"a fraction of a millisecond against a 45ms token -- weigh it only at
+TP>2," and that dual-rail RoCE "bought nothing" for them at TP=2 --
+direct confirmation the fabric-dependency cost is roughly free at TP=2
+and non-trivial past it. GLM-5.3-Flash's NoPE sparse MLA (compressed
+latent KV, not per-head) means the "replicate KV heads when TP exceeds
+head count" bug class other models hit doesn't apply here regardless of
+TP degree. They never evaluated or discuss a multi-replica alternative
+anywhere in the repo -- so no counter-evidence to our thesis, only more
+confirmation of the exposure. **Not adopted as a topology**; recorded as
+the deciding evidence for staying off TP=4.
+
+Secondary backport candidates surfaced by the same dig, not yet acted on:
+a spin-wait tuning patch (`busy_loop_s` 1.0->0.002s cut their vLLM CPU
+185%->109% and *raised* decode throughput on GB10 by exploiting the
+unified CPU/GPU power budget -- this project already has its own
+spinwait patch, `patch_spinwait.py`, worth comparing constants);
+`GPU_MEM_UTIL=0.90` silently wedges their box hours later while passing
+every startup check, same shape as this project's own 0.85/0.86 GMU
+regressions -- worth comparing their observed ceiling against our 0.84
+one; a report that `thinking_token_budget` is silently ignored at
+temp 0/1 -- worth checking against our own build. None investigated
+further this round.
+
+**Rest of the tracked-repo rotation** (all fanned out in parallel,
+production untouched):
+- **MiaAI-Lab main**, `f906ee990..HEAD` (2 commits, one PR, #183):
+  "fix(vision): cap per-image tokens so a chat video cannot OOM the
+  host." Real incident on their side 2026-09-14: an 11.9MB chat video
+  decomposed into ~33 full-res images, `SKIP_MM_PROFILING=1` (mandatory
+  on their UMA kit) meant nothing was ever reserved for the vision tower,
+  prompt hit 236,544 vision-encode tokens, host OOM-killed the worker.
+  Fix: `LIMIT_MM` image cap 100->48, new `MM_IMAGE_TOKENS`/`--mm-
+  processor-kwargs max_image_tokens` knob, new `MM_PROCESSOR_CACHE_GB`
+  (vLLM defaults to reserving 4 GiB host RAM for processed media --
+  real cost on UMA regardless of per-prompt limits). **Assessed: not
+  urgent for us.** Our own `limit_mm: {"image":4,"video":1}` is already
+  far tighter than even their patched 48-image cap, so we're not exposed
+  to their crash scenario. We do NOT explicitly set `--mm-processor-
+  cache-gb` or `max_image_tokens`, so we're on vLLM's stock 4 GiB/8000
+  defaults -- a real but currently-inert standing host-memory cost, worth
+  revisiting alongside the broader host-memory-pressure track
+  ([[cudagraph_align_shipped_earlyoom_timeout_found]]) rather than
+  urgently now.
+- **Enntity/sparkglm `exl3`**: still `2da6a1c31`, confirmed no drift/
+  force-push. Quiet.
+- **tonyd2wild**: still last-pushed 2026-09-02. Quiet.
+- **AEON-7/vllm-ultimate-dgx-spark**: still last-pushed 2026-09-12,
+  no new commits/issues/PRs touching CUDA-graph capture, attention
+  kernels, Blackwell/SM12x, or RoCE/NCCL. Quiet.
+- **vLLM upstream**: still v0.29.0, no new release -- no full backport-
+  candidates round warranted. Two things worth tracking: **PR #54929**
+  ("Portable Triton sparse-MLA fallback for SM12x") explicitly claims
+  `Fixes #51921 (on SM12x)` -- our long-standing open shm_broadcast-stall
+  issue. Root cause per the PR: DSA models (DeepSeek-V3.2, GLM-5.2/5.3)
+  have no working native sparse-attention kernel on SM12x, the native
+  extension livelocks under sustained load (GPUs pin 100% until the NCCL
+  watchdog kills the server -- matches our own stall signature), and this
+  PR binds a portable Triton fallback (derived from #49026, already
+  validated on sm_121/GB10) instead. **Still open, has merge conflicts as
+  of 2026-09-14** -- not yet mergeable, nothing to backport yet, but this
+  is the most promising #51921 lead found to date; recheck next round.
+  Separately, **PR #55737** ("Use FlashKDA for KDA chunked prefill")
+  merged 2026-09-14 upstream -- the same approach this fork's own
+  `v15-combined` already shipped; not new work for us, just confirms
+  upstream converging on what we already have. Worth a quick diff-check
+  next backport round, not urgent.
+
+**Net**: the TP=4 question is answered (don't); nothing else this round
+needs immediate action. Two things to revisit next time someone's in
+here: PR #54929's merge-conflict status (the #51921 fix candidate), and
+whether the mm-processor-cache-gb/max-image-tokens defaults are worth
+pinning explicitly given the standing host-memory-pressure track.
+
+## Routine upstream check, 2026-09-15 -- two backports shipped
+
+Second fan-out round (6 parallel agents again, production untouched
+throughout). MiaAI-Lab main had genuinely moved this time
+(`d8ad18311..HEAD`, 91 commits, ~15 real PRs) -- the rest of the rotation
+was quiet (sparkglm exl3 still `2da6a1c31`, tonyd2wild still silent since
+09-02, AEON-7 still silent since 09-12 -- its 09-13 `pushed_at` bump
+turned out to be a `WatchEvent`/star, not a push, confirmed by checking
+every branch's actual commit history).
+
+**vLLM PR #54929 re-checked** (the #51921 stall fix candidate): still not
+safe to pull. `mergeable: MERGEABLE` (conflict-free this hour, after the
+author merged `main` in again just ~2h before this check) but
+`mergeStateStatus: BLOCKED`, `reviewDecision: REVIEW_REQUIRED`, and
+`pre-run-check` CI is currently failing. Zero maintainer review despite
+the author pinging the relevant code owners on 2026-09-04. Scope has also
+grown since first seen (a second commit added a "7.4x decode attention"
+split-K path, unvalidated by anyone but the author). A week of
+conflict/rebase churn, not a stable target. Recheck again in a few days.
+
+**Two items shipped this round** (both in `recipes/build/glm53-exl3-
+v20-upstreamsync/`, see NOTES.md's "Amendment 2026-09-15" for full
+technical detail):
+- **`patch_default_max_new_tokens.py`** (MiaAI-Lab PR #51): omitted-`max_tokens`
+  decode-hygiene default. `DEFAULT_MAX_NEW_TOKENS=65536` now set in both
+  the default and maxprefill recipes' `env:` blocks. Without this, a
+  client that never sets `max_tokens` gets vLLM's own fallback of
+  `max_model_len - prompt_len` -- up to our full 262144-token ceiling on
+  a short prompt -- large enough for one such client to decode until it
+  preempts every other session via KV pressure. Explicit client
+  `max_tokens` is completely unaffected. All three patch anchors matched
+  our vLLM byte-for-byte; ported near-verbatim from an already
+  well-built, tested upstream implementation.
+- **`prelaunch_flush.sh`'s `check_memory_available()`** (MiaAI-Lab PR
+  #39): pre-boot check comparing host `MemAvailable` against
+  `gpu_memory_utilization x MemTotal + headroom` on both nodes, run right
+  after the existing drop_caches + fragmentation steps. Catches a
+  host-memory hold (not a container -- distinct from any existing
+  container-level check) BEFORE the image pull and weight load, instead
+  of dying mid-bring-up with a `ValueError: Free memory on device ...
+  less than desired` deep in a worker log. FATAL by default
+  (`GLM53_PREFLIGHT_SKIP_MEMORY_CHECK=1` to override) -- deliberately
+  different policy from the fragmentation check next to it, which stays
+  advisory-only, because this failure mode is a guaranteed deterministic
+  hard-stop rather than a probabilistic risk. Directly relevant to this
+  project's own MemFree/MemAvailable-gap and earlyoom tracks. Verified
+  via `bash -n` and a standalone arithmetic check against real host
+  numbers; not yet exercised on a live boot (would require running it
+  against a host with production traffic, not done this round).
+
+**`thinking_token_budget` bug (flagged via the mmastrac/4x-gx10 dig,
+2026-09-14) -- checked and confirmed NOT applicable.** The bug lives in
+vLLM's V2 model runner's sampler
+(`vllm/v1/worker/gpu/sample/sampler.py`'s `_requires_logits_processing()`
+gate, which never checks thinking-budget state, silently skipping budget
+enforcement whenever temperature is 0 or 1.0 and no other sampling knob
+is active). Read our own vendored vLLM directly: GLM-5.3-Flash+EXL3
+resolves to the V1 model runner (established during the cudagraph_align
+work), and V1's own sampler (`vllm/v1/sample/sampler.py`) has a
+structurally different implementation -- `apply_logits_processors`
+applies thinking-budget logic unconditionally whenever there are tracked
+requests, with no temperature-based short-circuit gate at all. The buggy
+code technically exists in our installed vLLM package (both V1 and V2
+ship unconditionally) but is dead code for our runtime config. Confirmed
+by reading the actual code, not assumed from the upstream report.
+
+**Also assessed, not adopted this round** (all from the MiaAI-Lab range):
+PR #170 (long-prefill boot-warmup ladder extension to 3584/7168/14336/
+65536-token rungs -- we're prefill-heavy, plausibly worth it, just not
+done yet), PR #94 (`GLM53_KV_CAPACITY_LOG`, informational-only logging
+clarifying the boot "GPU KV cache size" line for hybrid MLA+mamba+drafter
+models), PR #70 (`spec-accept-gate.sh` -- a diagnostic script checking
+for vLLM #53030, CUDA graphs pinning per-position spec-decode acceptance
+at exactly 1.00; useful given we run MTP-2, but tooling not a serving-path
+change), PR #41 (`spark_doctor.sh`, ops diagnostic tooling). PR #186/#187
+(fair-v5 mixed-prefill scheduler, now MiaAI-Lab's own TP=2 default,
+measured real TTFT/throughput tradeoffs on their kit) is explicitly
+**not** a drive-by candidate -- a real scheduling-behavior change on our
+exact topology, needs its own deliberate A/B before ever being
+considered, not bundled into a routine-check round. Not applicable at
+all: PR #31/#37 (bench convenience endpoint), PR #75 (EXL3 SM121 kernel
+lab, dev-only/no GPU tested), any TP=3/TP=4-specific commits (we run
+TP=2 only), PR #129 (docs-only), PR #189 (cosmetic).
+
+**mmastrac/glm-5.3-flash-4x-gx10 secondary candidates, resolved**: the
+spin-wait patch (`busy_loop_s` 1.0->0.002, same lever as this fork's own
+`patch_spinwait.py`, +5.5% decode / 20C cooler on their kit) is worth a
+constant-diff check against our own value -- not yet done. The
+`GPU_MEM_UTIL=0.90` wedge report is informative but not actionable as a
+config change (their shipped ceiling is 0.88, higher than our 0.84; their
+failure mode -- total unresponsive wedge, no SSH, OOM killer can't even
+intervene on UMA -- is corroborating evidence for this project's own GMU
+root-cause understanding, not a new lever). The `thinking_token_budget`
+item is covered above.
+
+**Net**: a real, productive round -- two backports shipped (memory
+preflight + max-tokens hygiene), one flagged bug ruled out with actual
+code verification rather than assumption, several more items identified
+and deliberately deferred rather than rushed. Production was never
+touched; the image was rebuilt under the same tag (`glm53-exl3-
+v20-upstreamsync:local`) but not relaunched.

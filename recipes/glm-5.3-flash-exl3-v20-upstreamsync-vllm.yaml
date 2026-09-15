@@ -784,6 +784,17 @@ env:
   # this one variable unset). See recipes/VALIDATION.md, "Dense-FP8
   # promoted to default, maxprefill sibling added".
   GLM53_DENSE_FP8: "dense,kda"
+  # 2026-09-15 upstream-check round: decode hygiene, backported from
+  # MiaAI-Lab PR #51 (overlay/patch_default_max_new_tokens.py). Without a
+  # server-side default, a request that omits max_tokens gets vLLM's own
+  # fallback of max_model_len - prompt_len -- up to our full 262144-token
+  # ceiling on a short prompt, large enough for one such client to decode
+  # until it preempts every other session via KV pressure. This bounds
+  # ONLY omitted requests; an explicit client max_tokens always wins, and
+  # this is a generous ceiling, not a real output-length cap for any
+  # legitimate completion. See recipes/VALIDATION.md, "TP=4 vs. 2x TP=2
+  # assessment... 2026-09-14" / the 2026-09-15 follow-up entry.
+  DEFAULT_MAX_NEW_TOKENS: "65536"
 
 defaults:
   port: 8000

@@ -784,6 +784,9 @@ env:
   # the "dense,kda" on-by-default config and the full measurement record.
   # This variant is for prefill-dominated workloads: +15% prefill @64K vs.
   # the default, at the cost of -14-17% decode.
+  # Decode-hygiene default -- orthogonal to the dense-FP8 tradeoff, kept in
+  # sync with the default recipe. See that file's own comment for detail.
+  DEFAULT_MAX_NEW_TOKENS: "65536"
 
 defaults:
   port: 8000

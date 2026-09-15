@@ -614,6 +614,8 @@ COPY overlay/patch_moe_gate_dedup.py /opt/glm53/patch_moe_gate_dedup.py
 COPY overlay/patch_gb10_router_gemm.py /opt/glm53/patch_gb10_router_gemm.py
 COPY overlay/patch_cudagraph_align.py /opt/glm53/patch_cudagraph_align.py
 COPY tests/test_cudagraph_align.py /opt/glm53/test_cudagraph_align.py
+COPY overlay/patch_default_max_new_tokens.py /opt/glm53/patch_default_max_new_tokens.py
+COPY tests/test_default_max_new_tokens.py /opt/glm53/test_default_max_new_tokens.py
 COPY overlay/patch_dense_fp8.py /opt/glm53/patch_dense_fp8.py
 RUN python3 /opt/glm53/patch_model_overrides.py
 RUN python3 /opt/glm53/patch_dflash2.py
@@ -662,6 +664,12 @@ RUN python3 /opt/glm53/patch_gb10_router_gemm.py
 # case), a hardening for whenever it doesn't. See patch_cudagraph_align.py
 # and NOTES.md.
 RUN python3 /opt/glm53/patch_cudagraph_align.py
+# 2026-09-15: omitted-only output-token default (decode hygiene), gated at
+# runtime behind DEFAULT_MAX_NEW_TOKENS (unset/empty = stock behavior, inert
+# by default). Backport of MiaAI-Lab PR #51 -- see patch_default_max_new_tokens.py
+# and NOTES.md. All three anchors verified byte-for-byte against this
+# image's own vLLM before being written, zero reconciliation needed.
+RUN python3 /opt/glm53/patch_default_max_new_tokens.py
 # 2026-09-11: MiaAI-Lab's FP8 weight-only (Marlin) dense-projections path
 # (originally commit eb0da1d), ported from v16-densefp8's overlay/exl3.py.
 # Gated behind GLM53_DENSE_FP8 (default "off" -- inert -- unless a recipe
@@ -691,7 +699,8 @@ RUN EXL3_SELFCHECK_GPU=0 python3 /opt/glm53/test_exl3_overlay.py \
     && python3 /opt/glm53/test_spinwait_patch.py \
     && python3 /opt/glm53/test_indexer_workspace.py \
     && python3 /opt/glm53/test_ablit.py \
-    && python3 /opt/glm53/test_cudagraph_align.py
+    && python3 /opt/glm53/test_cudagraph_align.py \
+    && python3 /opt/glm53/test_default_max_new_tokens.py
 
 # Baked by start.sh --build-arg so a git pull that changes overlay/Dockerfile
 # misses this label and rebuilds once. Keep last so stamp-only rebuilds are cheap.
