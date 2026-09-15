@@ -76,6 +76,15 @@ the rotation live only in memory/session context.
   are MIT-licensed (clean to port from). First check surfaced real,
   actionable leads on this fleet's two worst unsolved operational problems:
   see "AEON-7 initial triage" below.
+- **cbertucci33/vllm-v29-glm53flash-exl3-dgx** — added 2026-09-15. Same
+  target as this fork almost exactly: GLM-5.3-Flash EXL3 on 2x DGX Spark
+  TP=2, vLLM 0.29.0 base. Single-author, documented as a 23-step
+  integration history rather than an ongoing project (2 commits since
+  2026-09-12, may go quiet). Companion HF assets: target checkpoint
+  `cbert33/GLM-5.3-Flash-Uncensored-EXL3-DGX-Sliced` (an abliterated/
+  uncensored variant, **not** stock GLM-5.3-Flash) and a published DFlash2
+  drafter `local-inference-lab/GLM-5.3-Flash-DFlash2-MXFP8` trained against
+  that specific target. See "cbertucci33 triage" below.
 
 ## Where to look for common problems
 
@@ -846,3 +855,112 @@ code verification rather than assumption, several more items identified
 and deliberately deferred rather than rushed. Production was never
 touched; the image was rebuilt under the same tag (`glm53-exl3-
 v20-upstreamsync:local`) but not relaunched.
+
+## cbertucci33/vllm-v29-glm53flash-exl3-dgx triage (2026-09-15)
+
+User-directed look at a single-author repo targeting the same hardware/
+model combination as this fork almost exactly. Read-only research: repo
+tree via `gh api`, README, and a direct file-existence diff against
+`vllm-project/vllm@v0.29.0` to separate genuinely custom work from stock
+vLLM. No production access needed or used.
+
+**First-pass mistake, corrected by the user**: initially read the
+DFlash2 drafter as unpublished (the README says "model weights are
+published separately" without a link). The user supplied the actual HF
+links -- both the target (`cbert33/GLM-5.3-Flash-Uncensored-EXL3-DGX-
+Sliced`) and the drafter (`local-inference-lab/GLM-5.3-Flash-DFlash2-
+MXFP8`) are public. The material point survives anyway: the target is an
+**abliterated/uncensored** checkpoint, not stock GLM-5.3-Flash, and the
+drafter was trained against that specific target's activations. Spec-
+decode drafters are distilled against one target's output distribution --
+there's no reason to assume this drafter's acceptance rate transfers to
+our stock (non-abliterated) GLM-5.3-Flash EXL3 checkpoint, and abliteration
+is known to shift a model's logit distribution in exactly the ways that
+matter for draft-token acceptance. Unverified either direction; flagging
+the mismatch rather than assuming it's fine or assuming it's broken.
+
+**What's stock vLLM 0.29.0, not their invention** (confirmed via
+`gh api repos/vllm-project/vllm/contents/<path>?ref=v0.29.0`, checking for
+a 404): DFlash2 (`vllm/v1/spec_decode/dflash.py`), B12X
+(`vllm/model_executor/layers/fused_moe/b12x.py`), and the TopK CUDA
+kernel family (`csrc/libtorch_stable/persistent_topk.cuh`) all resolve
+in stock v0.29.0. Their README's step-by-step framing implies these are
+their own additions; they aren't -- this ecosystem's PRs land upstream
+fast. `vllm/models/glm5next/` (their path) is genuinely absent from
+v0.29.0 (only `vllm/models/{common,deepseek_v32,deepseek_v4,dots3_note,
+hy_v4,inkling,kimi_k3,minimax_m3,qwen4_exp}` exist at that tag) -- so
+their GLM-5.3-Flash model support (imported from vLLM PR #53906 per
+their README) is a real backport of not-yet-released upstream work, same
+category of thing this fork's own overlay patches do.
+
+**What's genuinely custom to them, in priority order**:
+1. **Sparkinfer** (`github.com/gittensor-ai-lab/sparkinfer`, real
+   separately-maintained project, corroborated by multiple unrelated
+   repos in this ecosystem citing it) -- a native EXL3 Trellis execution
+   engine used *instead of* stock ExLlamaV3 for the actual quantized
+   matmul path. The single most architecturally distinct choice in the
+   repo. We (`overlay/exl3.py`) run stock ExLlamaV3 directly, same as
+   most EXL3-on-vLLM efforts. Real potential upside if Sparkinfer's
+   kernels are faster on GB10 specifically, but unproven against our
+   workload and a nontrivial integration cost (own CUTLASS DSL pin, a
+   custom ARM64 build with x86 AVX units stripped). Research lead, not a
+   backport candidate yet.
+2. **A GB10-safe exact TopK kernel for MoE expert routing**
+   (non-cooperative streaming-radix path, needed because the cooperative
+   path exceeds the shared-memory limit on devices with <128 KiB per
+   block -- GB10 is such a device). This **independently corroborates**
+   a hardware constraint already in this file (see "AEON-7/vllm-ultimate-
+   dgx-spark initial triage", the `cooperative_topk`->`persistent_topk`
+   fallback needed on GB10/sm12x for the sparse-indexer's TopK) but for a
+   **different call site** -- theirs is the MoE router's TopK
+   (`vllm/model_executor/layers/fused_moe/router/*.py`), ours was only
+   confirmed for the sparse-indexer's TopK
+   (`sparse_attn_indexer.py`). That item was left as "worth confirming we
+   already handle correctly" and never closed out. Two independent forks
+   now hitting the same GB10 limit from different code paths raises the
+   priority on actually checking our own MoE router TopK path, not just
+   assuming the indexer fix covers it. **Not yet checked.**
+3. **A lossless EXL3 checkpoint pre-slicer**
+   (`tools/slice_exl3_checkpoint.py`) -- splits routed-expert tensors
+   per-TP-rank offline, verifies bit-for-bit reconstruction, before
+   deploy. Relevant to this project's own boot-time host-memory-pressure
+   track (`memfree_memavailable_gap`, the new `check_memory_available()`
+   preflight) -- pre-sliced per-rank checkpoints could lower the
+   per-node peak memory during weight load, which is exactly the phase
+   the new preflight check guards. **Not yet evaluated against our own
+   checkpoint format/loader.**
+4. Their own EXL3 quantization layer (`vllm/model_executor/layers/
+   quantization/exl3.py`, confirmed absent from stock vLLM) -- same
+   category as our own `overlay/exl3.py`, expected to exist independently
+   in any EXL3-on-vLLM effort since vLLM doesn't ship EXL3 natively.
+
+**Their claimed performance, treated skeptically**: 24.5 tok/s weighted
+decode, +13.3% over a "previous runtime, same hardware" baseline of 21.62
+tok/s, from a 197-request live sample with DFlash2 (7 proposals). Two
+reasons not to read this as "DFlash2 beats MTP-2": (1) it's unclear what
+the 21.62 tok/s baseline actually was -- no spec decode, MTP-2, or
+something else isn't stated; (2) their own "improved" 24.5 tok/s sits
+inside the range this fleet is *already* measuring for stock MTP-2 on the
+same hardware class (p50 26.7 tok/s, p95 20.5 tok/s decode-only,
+`request_time_per_output_token_seconds` over the last 3h as of this
+check -- see the mcp-grafana probe from the same session). More likely
+their baseline was weaker than what we already run, not evidence DFlash2
+itself is faster.
+
+**Net, and what's queued for the next routine round** (production
+untouched this session; these are research-only next steps against our
+own build tree, not against a live host):
+- Check our MoE router's TopK path for the same GB10 shared-mem-limit
+  exposure as items 2 above -- cheap, do this first.
+- Evaluate `tools/slice_exl3_checkpoint.py` against our own checkpoint
+  layout for the boot-memory-pressure angle.
+- Sparkinfer stays a flagged research lead (real, active, corroborated
+  project) -- not actionable without a dedicated eval, given the native
+  dependency cost.
+- DFlash2/their published drafter: not adoptable as-is (trained against
+  an abliterated target we don't run); would need our own DFlash2
+  drafter trained against stock GLM-5.3-Flash to be a fair comparison at
+  all, which is out of scope for a routine check.
+- Added `cbertucci33/vllm-v29-glm53flash-exl3-dgx` to the tracked-repo
+  rotation above, flagged as likely low-activity (single-author,
+  integration-history framing, may not get further commits).
