@@ -1412,3 +1412,82 @@ plausible-but-unquantified for us specifically. Not enabled this
 session -- this touches core NCCL fabric behavior and should get a
 deliberate test (and the GID-preflight dual-rail check ported first),
 not a drive-by flip in production.
+
+## InstantTensor checkpoint loader validation (2026-09-16)
+
+Follow-up to the "MiaAI-Lab's instanttensor checkpoint loader" item
+flagged in the 2026-09-16 upstream-check round. Read-only research +
+container inspection, no scratch trial run this session (recommended as
+the next step, not completed).
+
+**Architecture is safe for our EXL3 format by design, verified not
+assumed.** InstantTensor (`scitix/InstantTensor`, Apache-2.0, ScitiX AI +
+Peking University, real test suite) is a generic, dtype-agnostic
+`safe_open`-compatible reader -- it has zero EXL3/quant-specific code,
+by design, and doesn't need any: vLLM's native support (merged upstream
+via PR #36139, refined #46868/#52801 -- our base image postdates all
+three, **no vLLM-side patch needed**) wires it in at
+`default_loader.py`'s iterator-selection level, strictly below every
+per-parameter `weight_loader` hook. Our own `overlay/exl3.py`'s
+`shard_exl3_col`/`shard_exl3_row`/`_load_exl3` dispatch is completely
+untouched either way -- architecturally about as low-risk as a loader
+swap could be built.
+
+**Our own guardrails would catch most corruption loudly**: `_load_exl3`
+raises on any shape mismatch; `process_weights_after_loading` checks
+every expert's MCG marker (`0xCBAC1FED`) and raises if it doesn't match
+-- a real per-expert integrity check. **Real residual gap**: neither
+check validates the trellis payload bytes themselves (the bulk of the
+checkpoint) -- a silent bit-flip inside a correctly-shaped trellis
+tensor would pass both checks and only show up as degraded output
+quality, not a crash.
+
+**We already have real production evidence it round-trips correctly on
+this exact hardware** -- the NVFP4 lane (`glm-5.3-flash-nvfp4-vllm.yaml`,
+a different non-EXL3 checkpoint format) has already run `--load-format
+instanttensor` and passed a 249,951-token needle-in-haystack test, 4/4
+codes retrieved, zero corruption. Doesn't cover EXL3's int16-packed
+trellis format specifically, but is real, not hypothetical, evidence on
+TP=2/GB10.
+
+**Two concrete open risks, not resolved**:
+1. MiaAI-Lab installs it `--no-deps` "to dodge an NCCL version
+   conflict," despite upstream's own PR #52801 stating it only depends
+   on Torch as of >=0.1.9 -- something doesn't match on their end, and
+   pip's resolver isn't verifying it. Worth resolving before trial given
+   this fleet already tracks an unrelated but real open NCCL issue
+   (vLLM #51921).
+2. **`scitix/InstantTensor#13` (open)**: loading a second, small model
+   after the main one (their case: a speculative-decode draft model)
+   fails with a host-staging-allocator OOM, even with the loader's own
+   memory-budget knob turned down. This maps directly onto our own MTP
+   drafter load pattern, on a fleet already flagged across half a dozen
+   memory-pressure tracks as earlyoom-sensitive. `#19` (open) documents
+   a related CUDA host-registration failure on some driver/kernel
+   combos.
+3. Silver lining: both known failure modes are LOUD (process
+   termination / registration abort before reading), not silent
+   corruption -- meaningfully de-risks the worst-case scenario, though
+   it doesn't close the trellis-payload gap above.
+
+**What the actual upside is, and isn't**: boot/weight-load time only --
+upstream reports 10-32x load-time speedups on H200/H20; MiaAI-Lab
+measured ~35s for their 164 GiB checkpoint. **Explicitly no decode/
+prefill throughput change.** Boot time is not currently a pain point
+this project has flagged anywhere -- we already tolerate up to a
+1-hour boot timeout and it's never come up as an active complaint.
+
+**Recommendation**: not a priority. The upside doesn't address any
+current pain point, and the one open, concrete risk (#13, OOM on a
+second small model load) lands exactly on this fleet's known weak spot
+(MTP drafter load + earlyoom sensitivity) rather than somewhere neutral.
+If ever revisited: a throwaway scratch image with the dependency
+resolved WITHOUT `--no-deps` (to see what it actually wants and whether
+that's a problem), then a real TP=2 boot watching specifically for the
+MCG-marker check and for the drafter-load OOM pattern, then a logit-
+level A/B (not just "did it boot") before any production consideration.
+
+**Status**: architecture validated as safe-by-design; two concrete,
+unresolved risk flags identified; recommendation is to deprioritize
+given low payoff and risk concentration on an existing weak spot. No
+scratch trial run this session.
