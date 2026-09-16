@@ -1762,3 +1762,43 @@ non-root smoke-test step before ever touching production again. The
 NVRM ambient-fragmentation risk remains open and unresolved (as it has
 been for weeks) -- this incident is a fresh, well-documented data point
 for that existing track, not a new investigation.
+
+## Backport rebuild + non-root validation (2026-09-16, post-incident)
+
+Rebuilt `glm53-exl3-v20-upstreamsync:local` with the `patch_apc_no_
+store.py` permission fix from the incident above. Build succeeded,
+all 14 existing root-context self-checks passed (unchanged from
+before -- these never would have caught the bug, that's the whole
+point of what follows). New image: `sha256:a78a2d958fbc247b...`.
+
+**New: a real non-root validation, closing the gap the incident
+exposed.** Added `tests/check_nonroot_permissions.sh` -- runs the built
+image with `docker run --user 1000:1000` (the actual runtime UID:GID
+this fleet's containers use, confirmed via `docker inspect <image>
+--format '{{.Config.User}}'` returning empty -- it's supplied by
+`docker run --user` at launch time, not baked into the image) and
+verifies every file any `overlay/patch_*.py` in this build tree is
+known to touch is still readable by that user, plus does a full Python
+`import` of the specific modules the just-fixed patch touches. Ran it
+against the rebuilt image: **all 12 tracked files pass, mode 0644 on
+every one** -- including `vllm/v1/request.py`, the exact file that
+broke production. A full `import vllm.v1.request`, `vllm.sampling_
+params`, `vllm.v1.core.block_pool`, and the two `completion/*` modules
+also succeeded cleanly as the non-root user, and confirmed the actual
+new feature (`SamplingParams.skip_writing_prefix_cache`) is present and
+attached.
+
+**Not baked into the Dockerfile itself** -- deliberately kept as a
+separate, explicit post-build script rather than a `USER`-directive
+switch inside the build, since flipping the image's default user
+mid-build risks unintended side effects on later build steps and isn't
+how this project's containers actually get their runtime UID today.
+Run `tests/check_nonroot_permissions.sh [image_tag]` after any build
+that touches an `overlay/patch_*.py`, before ever deploying -- add new
+files to its tracked list whenever a new patch writes one.
+
+**Status**: rebuild validated at both the root (build-time) and
+non-root (runtime-identity) level for the first time in this project's
+history. **Not yet redeployed to production** -- this was a build+
+validate pass only, matching what was asked; deployment is a separate,
+deliberate next step.
