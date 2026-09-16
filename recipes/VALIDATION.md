@@ -1668,3 +1668,97 @@ graph-captured execution -- no kernel-dispatch bug exists to fix. The
 only lever (dense-FP8) is already known and already rejected for this
 fleet's workload shape. Not worth further investigation unless the
 fleet's prefill/decode balance changes materially.
+
+## Backport deployment incident, 2026-09-16: a real bug shipped, a real ambient crash hit on rollback, memory-preflight finally genuinely validated
+
+User granted standing permission for `sparkrun stop`/`run` and
+`prelaunch_flush.sh` this session specifically so the queued backport
+deployment and the long-blocked memory-preflight test could finally
+happen. Both did -- with two real incidents along the way, both now
+understood and one fixed.
+
+**Attempt 1: the 6 backports, real bug found.** Stop -> `prelaunch_
+flush.sh` (both hosts, clean pass) -> `sparkrun run` with the newly
+backported image. The container came up but the actual vLLM server
+process crashed on launch: `PermissionError: [Errno 13] Permission
+denied: '/usr/local/lib/python3.12/dist-packages/vllm/v1/request.py'`.
+Root cause, found by reading `overlay/patch_apc_no_store.py`'s
+`atomic_write()` directly: `tempfile.mkstemp()` creates its temp file
+mode `0600` (owner-only) regardless of the target file's real
+permissions; `os.replace()` is a rename, not a content copy, so the
+target inherited that restrictive mode. The Docker build applies this
+patch as root, so the bug was invisible there -- the container runs the
+server as a non-root user (`luser`), which lost read access to a core
+vLLM source file and crashed the whole engine at first launch. **This
+project's own `patch_spinwait.py` already has the fix for this exact
+class of bug** (`os.chmod(temp, stat.S_IMODE(target.stat().st_mode))`
+before the replace) -- the new patch just didn't carry it over. Fixed
+in `overlay/patch_apc_no_store.py` this session (added `import stat`,
+preserve `path.stat().st_mode` before `os.chmod(tmp, orig_mode)` prior
+to `os.replace`). The other two new patches (`patch_cache_reset.py`,
+`patch_kv_capacity_log.py`) use `Path.write_text()` directly (in-place
+overwrite, not a temp-file+replace) and do NOT share this bug --
+checked directly, confirmed.
+**Operational lesson**: this project's local Docker build validation
+runs entirely as root (build stage + the self-check `RUN` step), so it
+cannot catch a non-root runtime permission regression like this one --
+the build passed all 14 self-checks and still shipped a launch-blocking
+bug. **Any future patch touching an installed system file should be
+smoke-tested as the actual runtime user** (check the Dockerfile/
+container for `USER`, currently a non-root `luser`), not just validated
+at build time as root. Not yet added as an automated check -- worth
+doing before the next patch round.
+**Immediate recovery**: retagged the previous known-good image
+(`sha256:4ae0df077e70...`, the exact image that had run stably for 3
+days pre-incident) back onto the `:local` tag and redeployed --
+straightforward since Docker doesn't delete an image just because its
+tag moves.
+
+**Attempt 2 (the rollback): a real, ambient NVRM allocation failure,
+unrelated to the backport bug.** Stop -> fresh `prelaunch_flush.sh`
+pass (clean on both hosts again) -> `sparkrun run` with the rolled-back
+image. This time the server booted completely successfully -- weights
+loaded, CUDA graphs captured, engine initialized, API server started,
+even answered a real request (`GET /metrics 200` from the Prometheus
+scraper at `10.7.0.10`) -- then crashed **12 seconds later**:
+`Worker proc VllmWorker-0 died unexpectedly (exit code: None)`, the
+same uninformative-exit-code signature this project has chased
+before. Cross-referenced the head host's kernel log directly
+(`dmesg -T`, timezone-adjusted): `NVRM: nvCheckOkFailedNoLog: Check
+failed: Out of memory [NV_ERR_NO_MEMORY] (0x00000051) returned from
+_memdescAllocInternal(pMemDesc)`, timestamped within ~2 minutes of the
+crash. This is the exact NVRM allocation-failure signature this
+project's `host_fragmentation_xid31_reboot_risk` track already
+documents -- a host can show healthy `MemAvailable`/fragmentation
+numbers at one instant (both preflight checks passed cleanly
+immediately before this boot) and still hit a large-contiguous-
+allocation failure moments later once new activity (first live
+request, first fresh CUDA-graph-adjacent allocation) demands one. This
+is an ambient, previously-known, still-not-fully-resolved risk class --
+**not** caused by the backport bug (this was the pre-backport image),
+not new. Confirmed `journalctl -u earlyoom` showed nothing (earlyoom
+itself didn't fire this time -- a raw NVRM allocation failure inside
+the CUDA driver, upstream of anything earlyoom watches).
+**Recovery**: stopped, re-ran `prelaunch_flush.sh` (clean again), retried
+the identical `sparkrun run`. Succeeded cleanly this time -- healthy in
+~9 minutes, verified with a real completion request, no repeat NVRM
+error. Consistent with this failure class being probabilistic/timing-
+dependent, not deterministic -- a bare retry has a real chance of
+working, as it did here.
+
+**Memory-preflight check: finally genuinely validated, twice, on real
+hardware.** This was the entire point of today's `sparkrun stop`/`run`
+permission grant -- previously blocked by tooling permissions across two
+prior sessions. Ran for real, both attempts, both hosts, both times
+clean: `memory preflight: <N> KiB available >= <threshold> KiB needed
+(gmu=0.84 + 2 GiB headroom), OK`, alongside the neighboring
+fragmentation check. The mechanism works exactly as designed. Closes
+the long-open `check_memory_available()` validation item.
+
+**Status**: production restored and confirmed healthy on the known-good
+image. The backport bug is fixed in the working tree but **the fix has
+not yet been rebuilt or redeployed** -- next attempt should include a
+non-root smoke-test step before ever touching production again. The
+NVRM ambient-fragmentation risk remains open and unresolved (as it has
+been for weeks) -- this incident is a fresh, well-documented data point
+for that existing track, not a new investigation.

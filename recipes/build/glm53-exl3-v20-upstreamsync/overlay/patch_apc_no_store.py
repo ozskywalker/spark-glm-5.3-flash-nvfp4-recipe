@@ -82,6 +82,7 @@ from __future__ import annotations
 
 import ast
 import os
+import stat
 import sys
 import tempfile
 from pathlib import Path
@@ -443,11 +444,22 @@ def preflight(name: str, path: Path, edits, requires) -> str | None:
 
 def atomic_write(path: Path, text: str) -> None:
     """Write via a sibling temp file + os.replace: the target is never left
-    truncated, even if this process dies mid-write."""
+    truncated, even if this process dies mid-write.
+
+    ``mkstemp`` creates the temp file mode 0600 (owner-only) regardless of
+    the target's real permissions -- ``os.replace`` then installs that mode
+    verbatim, since replace is a rename, not a content copy. Built as root
+    (Docker build stage) this was invisible; the container runs this
+    process as a non-root user, which lost read access to the target and
+    crashed the whole engine at first request with a bare PermissionError.
+    Preserve the target's original mode before replacing it -- same fix
+    already applied in this project's patch_spinwait.py."""
+    orig_mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o644
     fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".glm53", dir=path.parent)
     try:
         with os.fdopen(fd, "w") as fh:
             fh.write(text)
+        os.chmod(tmp, orig_mode)
         os.replace(tmp, path)
     except BaseException:
         try:
