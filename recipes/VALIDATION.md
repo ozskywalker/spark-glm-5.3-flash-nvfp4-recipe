@@ -905,21 +905,16 @@ category of thing this fork's own overlay patches do.
    workload and a nontrivial integration cost (own CUTLASS DSL pin, a
    custom ARM64 build with x86 AVX units stripped). Research lead, not a
    backport candidate yet.
-2. **A GB10-safe exact TopK kernel for MoE expert routing**
-   (non-cooperative streaming-radix path, needed because the cooperative
-   path exceeds the shared-memory limit on devices with <128 KiB per
-   block -- GB10 is such a device). This **independently corroborates**
-   a hardware constraint already in this file (see "AEON-7/vllm-ultimate-
-   dgx-spark initial triage", the `cooperative_topk`->`persistent_topk`
-   fallback needed on GB10/sm12x for the sparse-indexer's TopK) but for a
-   **different call site** -- theirs is the MoE router's TopK
-   (`vllm/model_executor/layers/fused_moe/router/*.py`), ours was only
-   confirmed for the sparse-indexer's TopK
-   (`sparse_attn_indexer.py`). That item was left as "worth confirming we
-   already handle correctly" and never closed out. Two independent forks
-   now hitting the same GB10 limit from different code paths raises the
-   priority on actually checking our own MoE router TopK path, not just
-   assuming the indexer fix covers it. **Not yet checked.**
+2. ~~A GB10-safe exact TopK kernel for MoE expert routing~~ **CORRECTED
+   2026-09-16, see below**: this is not the MoE router's TopK at all --
+   it's FlashInfer's own JIT topk module
+   (`flashinfer.jit.topk.gen_topk_module`, built by their
+   `build/build_flashinfer_topk.sh`), used by their custom
+   `FLASHINFER_MLA_SPARSE_SM120` attention backend for sparse-MLA
+   page/candidate selection. Same subsystem as the already-tracked
+   `cooperative_topk`->`persistent_topk` indexer finding, not a second,
+   independent call site. See "cbertucci33 items 1/2 resolved" below for
+   the actual verified answer.
 3. **A lossless EXL3 checkpoint pre-slicer**
    (`tools/slice_exl3_checkpoint.py`) -- splits routed-expert tensors
    per-TP-rank offline, verifies bit-for-bit reconstruction, before
@@ -964,3 +959,208 @@ own build tree, not against a live host):
 - Added `cbertucci33/vllm-v29-glm53flash-exl3-dgx` to the tracked-repo
   rotation above, flagged as likely low-activity (single-author,
   integration-history framing, may not get further commits).
+
+## Routine upstream check, 2026-09-16 -- and items 1/2/3 from the cbertucci33 triage
+
+Fan-out round on a production traffic break (6 parallel agents, read-only
+research, production never touched). Also closed out the three action
+items queued from the 2026-09-15 cbertucci33 triage.
+
+**MiaAI-Lab main, `d8ad18311..HEAD` (155 commits, mostly merge noise from
+a 09-15 PR-cleanup burst).** Two items need a dedicated A/B, not a
+routine-round adoption:
+- **PR #186/#194/#198 -- "fair v5" mixed-prefill scheduler is now
+  MiaAI-Lab's own TP=2 default** (`GLM53_MIXED_PREFILL_CHUNK`:
+  `skip`->`fair`, `GLM53_FAIR_PREFILL_SHARE=0.30`, `MAX_STEP_MS=1000`).
+  A real decode/prefill-interleaving policy change on our exact topology.
+  Not adopted -- same standing rule as PR #186/#187 from the 09-15 round.
+- **PR #200/#201 -- default image now `:exl3-instanttensor`,
+  `LOAD_FORMAT=instanttensor`**: a new third-party direct-I/O safetensors
+  loader (`instanttensor==0.2.0`, installed `--no-deps` to dodge an NCCL
+  conflict) replacing the core weight-loading path. New dependency in a
+  correctness-critical path -- needs its own validation before we'd point
+  at it. Not adopted.
+
+Low-risk, applicable backport candidates identified (not shipped this
+session -- see "Net" below for why): PR #37 (`/reset_prefix_cache` admin
+endpoint, opt-in), PR #42 (pipefail-safe container health checks), PR #81
+(`GLM53_EXTRA_ENV` diagnostic passthrough, opt-in), PR #94
+(`GLM53_KV_CAPACITY_LOG`, boot-time log line only, default-on, useful
+given our memory-pressure tracks), PR #95 (`GLM53_APC_NO_STORE`
+per-request prefix-cache skip, inert unless a caller opts in), PR #170
+(long-prefill boot-warmup metadata-kernel fix). Not applicable: PR #184
+(TP=3), #115/#187/#188 (TP=4, or fair-scheduler-off confirmation for
+TP=3/4 -- confirms the TP=2 fair-default is specifically what needs our
+A/B), #137 (abliterated-weights preset, different model), #75 (EXL3
+SM121 kernel lab, still dev-only, passively watching), #129/#189/#192
+(docs/cosmetic/test-path).
+
+**Enntity/sparkglm `exl3` branch, `a8aaa229..2da6a1c3` (3 commits).**
+Nothing to backport -- every substantive item is the sibling project
+re-deriving conclusions we already reached independently (E3-vs-E2 not
+transferable once you already have grouped M64 + cooperative K4, matches
+our own v12-combined-era finding; cooperative-decode-32 not worth it,
+matches our serving limit of 16; MXFP8 DFlash2 draft still fails their
+own arithmetic semantic gates). One operational signal: the branch's
+README now explicitly marks it "retained" (frozen/archival), read
+together with the 09-13 shift toward a research/experiments structure --
+EXL3-relevant activity from this sibling may be tapering off. Flag for
+future rounds: check whether relevant work migrates to `main` (now
+NVFP4-focused, likely irrelevant) or simply stops.
+
+**mmastrac/glm-5.3-flash-4x-gx10.** No repo activity since 2026-09-14
+(last push still 2026-09-07). Resolved the deferred spin-wait diff-check:
+their value is `busy_loop_s=0.002` (2ms), applied via a `sed` bind-mount
+override targeting `shm_broadcast.py`, reporting CPU 185%->109%, ~20C
+cooler, decode 66.9->70.6 tok/s on their kit. **No action needed on our
+side** -- our own `patch_spinwait.py` docstring already records that we
+tested 2ms ourselves in our own frozen TP=2/MNBT=2048 sweep and it *lost*
+1.68% decode versus our chosen 16ms, which beat stock on both decode
+(+0.95%) and CPU (-85.3%). Their optimum for their workload isn't ours;
+we'd already tested their exact candidate and rejected it with real data.
+
+**tonyd2wild and AEON-7.** Both confirmed still silent (tonyd2wild: no
+commits past 09-02 on either branch; AEON-7: no commits past 09-12 on any
+of its four branches). The AEON-7 `updated_at` bump noted in the 09-15
+round remains a non-push event. Nothing to review.
+
+**cbertucci33/vllm-v29-glm53flash-exl3-dgx, `29640cb..96483c3`.** One new
+commit, README-only (+2 lines, notes on base-model provenance and
+cross-quant-variant compatibility). Confirms the "low-activity,
+single-author" read from the initial triage.
+
+### cbertucci33 items 1/2 resolved
+
+**Item 1 (GB10 TopK exposure) -- corrected and closed, no action
+needed.** Direct verification against our own running production
+container (`docker exec`, read-only) rather than assumption:
+- Our MoE expert router (`vllm/model_executor/layers/fused_moe/router/
+  grouped_topk_router.py`, the path `glm5next`'s `use_grouped_topk=True`
+  config selects) calls `ops.grouped_topk(...)`, a dedicated small-k
+  CUDA kernel built for the "top-8-of-288-experts" routing problem. It
+  never touches `cooperative_topk`/`persistent_topk` at all -- confirmed
+  by grepping every file in our installed vLLM package for those two
+  symbols: they appear ONLY in `sparse_attn_indexer.py` and
+  `sparse_attn_indexer_kpool.py`. **There is no "MoE router TopK GB10
+  exposure" -- that framing in the 2026-09-15 entry was wrong, based on
+  an unverified assumption about which subsystem cbertucci33's fix
+  targeted.** Their fix (confirmed by reading their
+  `build/build_flashinfer_topk.sh`, which calls
+  `flashinfer.jit.topk.gen_topk_module`) is inside FlashInfer's own JIT
+  module for their custom `FLASHINFER_MLA_SPARSE_SM120` backend -- a
+  third code path, distinct from both of vLLM's own.
+- More importantly: **our actual sparse-indexer TopK gate already
+  handles GB10 correctly**, read directly from
+  `sparse_attn_indexer.py`:
+  ```
+  use_cooperative_topk = (
+      current_platform.is_cuda()
+      and topk_tokens in (512, 1024, 2048)
+      and num_rows <= 32
+      and logits.stride(0) % 4 == 0
+      and current_platform.has_device_capability(90)
+      and not current_platform.is_device_capability_family(120)
+  )
+  use_persistent_topk = current_platform.is_cuda() and topk_tokens in (
+      512, 1024, 2048,
+  )
+  ```
+  `not current_platform.is_device_capability_family(120)` explicitly
+  excludes GB10 (family 120) from the cooperative path; GB10 falls
+  through to `use_persistent_topk`, which has no such exclusion. This
+  **directly confirms**, for the first time by reading the actual gate
+  rather than inferring from patch presence, the item the AEON-7 triage
+  left open ("worth confirming we already handle correctly"). Closed,
+  no code change needed.
+- We don't use FlashInfer's native sparse-MLA backend at all (our
+  FlashInfer is stock 0.6.17, not their custom-built 0.6.18 with the
+  `GLM53_NOPE` SM120/SM121 kernels from FlashInfer PRs #4802/#4947), so
+  we were never exposed to whatever shared-mem issue exists in
+  FlashInfer's own topk JIT module either. Not applicable to us on two
+  independent grounds.
+
+**Item 2 (checkpoint pre-slicer) -- real, plausible lever, not yet
+trialed.** Read our own `overlay/exl3.py`'s weight-loading path:
+`_narrow_tp()` (and `shard_exl3_col`/`shard_exl3_row`) slice each routed-
+expert tensor by `tp_rank`/`tp_size` via `.narrow(dim, ...).contiguous()`
+-- applied AFTER vLLM's standard loader has already materialized the
+FULL, un-sharded tensor from the checkpoint into host memory (vLLM's
+default safetensors loader path calls `safe_open(...).get_tensor(name)`,
+which copies the complete tensor out of the mmap rather than returning a
+view). That means, per large routed-expert tensor, each rank transiently
+holds both the full tensor AND its own narrowed half at once, before the
+full one is freed -- a real, avoidable peak-memory spike during the load
+phase specifically. This lines up directly with this project's own
+`memfree_memavailable_gap` and boot-time earlyoom tracks. A pre-sliced
+checkpoint (`slice_exl3_checkpoint.py`'s approach: split per-TP-rank
+offline, each rank's file only ever contains its own half) would remove
+this transient entirely -- each rank's `get_tensor()` call only ever
+materializes already-halved data.
+Caveat: we run TP=2 across 2 *separate* hosts (one rank per host), so we
+don't have the "N ranks competing for one host's RAM simultaneously"
+multiplier a single-host TP=2/4 setup would -- the exposure here is the
+single-rank-per-host transient 2x-on-the-largest-tensor, not a
+cross-rank pile-up. Real, but its actual magnitude (how big the largest
+single routed-expert tensor actually is, and whether it's the dominant
+term in our known boot-memory pressure or a minor contributor next to
+other allocations) is **not yet quantified** -- would need a scratch
+trial: slice our own checkpoint with their tool (or an equivalent), boot
+against it, and diff peak host RSS during load against our current
+un-sliced boot. Not done this session (production was on a brief break,
+not available for a full boot trial). Queued as a real candidate for the
+next dedicated (not routine) round.
+
+**Item 3 (Sparkinfer dedicated eval) -- downgraded from "research lead"
+to "unverifiable dependency," not worth a trial.** Dedicated research
+pass materially overturns the 2026-09-15 framing:
+- Sparkinfer (`gittensor-ai-lab/sparkinfer`) is real and very active
+  (1,568 commits, pushed same-day, MIT-licensed) but tied to Bittensor
+  subnet SN74 -- contributors paid in a crypto-incentive token for
+  verified speedups, judged by the project's own automated eval bot. A
+  full-repo code search for `exl3`/`trellis` returns **zero hits**. It
+  supports GGUF and NVFP4/ModelOpt for Qwen3.8/3.6 only -- no GLM, no
+  EXL3, nothing resembling cbertucci33's claimed integration surface.
+  `sm_121` is a genuine build target, but every published benchmark
+  (+86% decode/+127% prefill vs llama.cpp, DSpark speedups) is measured
+  on RTX 5090; DGX Spark/GB10 is listed only as an unstarted roadmap
+  item, and the "verifiable" eval log is self-hosted/self-reported, not
+  third-party audited -- structurally exactly the setup where narrow
+  overfitting to the pinned incentive-eval hardware is a real risk, not
+  a hypothetical one.
+- Inside cbertucci33's own `exl3.py`: generic/dense EXL3 matmuls already
+  run through stock `exllamav3_ext.exl3_gemm` -- the same path we use.
+  Sparkinfer is invoked ONLY for the routed-MoE-expert path, gated on
+  pre-sliced checkpoints, and the module's own docstring calls the
+  relevant API "Sparkinfer's **planned** full-rotation Trellis MoE API"
+  -- their own word, "planned." Their pinned Sparkinfer commit
+  (`d4438d490691f79022fdfc8149e1c5f161d15445`) returns 404 against the
+  real public repo; no fork or mirror containing it is findable anywhere
+  on GitHub. Their own test for this path monkeypatches
+  `_load_sparkinfer_trellis()` rather than exercising a real build. This
+  dependency is not obtainable -- their MoE-path performance claims rest
+  on something that, as far as can be verified from outside their own
+  machine, doesn't exist in public form.
+- If it did exist, integration cost would actually be modest (the
+  Sparkinfer-specific glue in their `exl3.py` is a small, isolated
+  slice, not smeared through the file) -- the blocker is entirely the
+  missing artifact, not architectural invasiveness. And yes, it would
+  force our checkpoint onto their pre-sliced-per-rank schema, layered on
+  top of (not replacing) the current dense-tensor path.
+- **Verdict: watch, don't act.** Re-check `gittensor-ai-lab/sparkinfer`
+  for `exl3`/`trellis` on the next routine rotation (cheap grep); re-open
+  only if that appears or cbertucci33's repo gets a resolved pin. No
+  trial possible today -- there's nothing installable to trial against.
+
+### Net
+
+Two real MiaAI-Lab (c)-category items flagged for future dedicated A/Bs
+(fair-v5 scheduler, instanttensor loader) and six low-risk (b)-category
+backport candidates identified but **not shipped this session** --
+volume (6+ new patches) and the higher-priority live decode-speed
+investigation reported by the user this same session took precedence;
+queued for the next implementation pass. The cbertucci33 GB10-TopK item
+is now fully resolved (corrected framing, verified we're safe on both
+counts). The checkpoint pre-slicer stays a real, well-reasoned but
+unquantified lever. The Sparkinfer lead is downgraded to a cheap watch
+item, not a live research thread -- its load-bearing dependency doesn't
+verifiably exist. Production untouched throughout.
