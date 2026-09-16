@@ -1273,3 +1273,73 @@ not fully explained by the already-tracked GEMM-kernel inefficiency
 alone, most likely the same ~200ms/100K-KV-step delta this project
 measured and set aside months ago without root-causing it. Production
 untouched throughout this investigation.
+
+## Correction: controlled short/long-context test overturns the 200ms-delta hypothesis (2026-09-16)
+
+Direct follow-up to "Long-context decode-speed investigation, 2026-09-16"
+above. With production traffic paused (a real window, not simulated),
+sent three controlled, isolated requests directly against the live
+`glm53-exl3-v20-upstreamsync:local` server (`c=1`, nothing else running
+concurrently) and read each request's own contribution to the
+`vllm:request_decode_time_seconds_sum` / `vllm:time_to_first_token_
+seconds_sum` / `vllm:request_generation_tokens_sum` counters via tight
+before/after deltas -- a clean, direct measurement, no profiler needed:
+
+| Request | Prompt tokens | Completion tokens | Decode-phase (measured) | TTFT (measured) |
+|---|---|---|---|---|
+| Baseline | 5 | 5 | 42.4 ms/token (23.6 tok/s) | 0.80s |
+| Short | 37 | 30 | 29.7 ms/token (33.6 tok/s) | 0.30s |
+| Long, cold (0% cache) | 108,001 | 30 | **28.1 ms/token (35.6 tok/s)** | 69.67s |
+| Long, repeated (cache hit) | 108,001 | 30 | **28.0 ms/token (35.7 tok/s)** | 2.77s |
+
+**Decode-phase per-token cost did not degrade with context length in
+this controlled test** -- 28-30 ms/token essentially flat from 37 to
+108,001 tokens, cached or not. This directly contradicts reading the
+old `DESIGN-indexer-workspace.md` "~200ms/step long-context delta" note
+as the explanation for the current complaint. That old figure either
+measured something materially different (concurrent load, a different
+vLLM/patch state, real multi-turn conversational KV structure rather
+than a single long synthetic prompt) or no longer reproduces on the
+current build -- either way, **it does not explain today's user report**,
+and citing it as the leading hypothesis in the entry above was wrong.
+Retracting that as the primary lead.
+
+**What the same test data actually explains cleanly**: TTFT. Cold (0%
+cache) 108K-token prefill took 69.67s -- a real, expected cost at roughly
+1,550 tok/s raw uncached prefill throughput, nothing wrong with it, just
+the honest cost of genuinely new tokens. The *identical* prompt repeated
+immediately after collapsed to 2.77s TTFT (25x faster) via prefix-cache
+reuse, confirming caching itself works correctly. **This is the same
+mechanism identified in this engagement's very first mcp-grafana probe**:
+apparent "tokens/sec" as commonly computed by a client
+(`output_tokens / total_wall_clock_time`, TTFT included) is dominated by
+prefill/TTFT whenever output is short relative to prompt size --
+median output length for this traffic class was ~40 tokens. Do the
+arithmetic on a partially-cached long-context turn: even a modest
+cache-miss fraction of a 100K+-token context, at ~1,550 tok/s raw prefill,
+adds seconds to tens of seconds of TTFT that a client-side "tok/s" counter
+will fold into the completion-token denominator, producing exactly the
+kind of single-digit "tok/s" the user is seeing -- without decode itself
+ever slowing down.
+
+**Revised leading hypothesis**: the user's subagent harness (openchamber
++ opencode) most likely isn't getting the same ~95% prefix-cache hit
+rate this fleet's *aggregate* traffic sees. Plausible mechanisms, neither
+confirmed yet: (a) many parallel/sequential subagents with large but
+mutually-diverging contexts (shared system prompt, divergent task
+content) evicting each other's cached prefixes under KV-cache capacity
+pressure: (b) the harness's own "tokens/sec" reporting counts TTFT in
+the denominator, making a client-side measurement artifact look like a
+server-side regression. Neither ruled in nor out this session -- would
+need either real (not synthetic) subagent-shaped multi-branch context
+traffic replayed against a monitored server, or the harness's own timing
+methodology, to settle definitively.
+
+**Status**: the ~200ms/100K-KV-step decode delta from `DESIGN-indexer-
+workspace.md` stays on record as a real, previously-measured, still-
+unexplained data point from past work -- but it is NOT the explanation
+for this session's user report. Root cause of *that* old number remains
+genuinely open; root cause of *the current complaint* is now most likely
+prefix-cache-hit-rate/TTFT-related, not a decode-speed regression at all.
+Production traffic resumed normally after this test (both hosts healthy,
+sanity completion request verified correct output before and after).
