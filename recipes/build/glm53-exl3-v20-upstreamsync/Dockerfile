@@ -1,5 +1,34 @@
 # GLM-5.3-Flash NoPE sparse MLA on SM121 (NVIDIA GB10 / DGX Spark).
 #
+# *** v20-upstreamsync amendment, 2026-09-16 (same version, local build-and-
+# validate only, not yet promoted): six low-risk items queued from a
+# 2026-09-16 upstream-check round against MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-
+# DGX-Sparks -- PRs #37, #42, #81, #94, #95, #170. All six implemented:
+#   #37  overlay/patch_cache_reset.py -- opt-in /reset_prefix_cache et al.
+#        on the head API server (GLM53_EXPOSE_CACHE_RESET, default 0/off).
+#   #42  start.sh -- pipefail-safe container health checks (no more
+#        `docker inspect | grep -q` false negatives) plus a flock-based TP2
+#        lifecycle lock (start/restart/stop serialized via logs/cluster.lock).
+#   #81  start.sh -- GLM53_EXTRA_ENV diagnostic env passthrough to both
+#        ranks, opt-in, launcher-owned names rejected.
+#   #94  overlay/patch_kv_capacity_log.py -- log-only per-group KV-capacity
+#        boot-line breakdown (GLM53_KV_CAPACITY_LOG, default 1/on). Scoped
+#        down from the upstream PR to the figures directly derivable from
+#        the same config objects the stock line uses -- see the patch's own
+#        module docstring for why the upstream PR's per-spec-class dense-
+#        retention costing was not ported.
+#   #95  overlay/patch_apc_no_store.py -- per-request GPU prefix-cache
+#        no-store (SamplingParams.skip_writing_prefix_cache / vllm_xargs),
+#        ported close to verbatim (all anchors matched byte-for-byte).
+#        GLM53_APC_NO_STORE default 1 (kill switch honors the flag), but the
+#        no-store behavior itself is opt-in per request -- nothing changes
+#        unless a caller asks for it.
+#   #170 scripts/boot-shape-warmup.sh -- long-prefill ladder (3584/7168/
+#        14336/65536) so BuildPrefillChunkMetadataKernel is warm before the
+#        first long request; fixed a quadratic prompt-builder and staged
+#        large payloads via files (curl ARG_MAX).
+# See NOTES.md for the full round writeup.
+#
 # *** v20-upstreamsync amendment, 2026-09-11 (same version, added after the
 # initial promotion below): folded in MiaAI-Lab's FP8 weight-only (Marlin)
 # dense-projections path (GLM53_DENSE_FP8, ported from v16-densefp8's
@@ -617,6 +646,12 @@ COPY tests/test_cudagraph_align.py /opt/glm53/test_cudagraph_align.py
 COPY overlay/patch_default_max_new_tokens.py /opt/glm53/patch_default_max_new_tokens.py
 COPY tests/test_default_max_new_tokens.py /opt/glm53/test_default_max_new_tokens.py
 COPY overlay/patch_dense_fp8.py /opt/glm53/patch_dense_fp8.py
+COPY overlay/patch_cache_reset.py /opt/glm53/patch_cache_reset.py
+COPY tests/test_cache_reset_endpoint.py /opt/glm53/test_cache_reset_endpoint.py
+COPY overlay/patch_kv_capacity_log.py /opt/glm53/patch_kv_capacity_log.py
+COPY tests/test_kv_capacity_log.py /opt/glm53/test_kv_capacity_log.py
+COPY overlay/patch_apc_no_store.py /opt/glm53/patch_apc_no_store.py
+COPY tests/test_apc_no_store.py /opt/glm53/test_apc_no_store.py
 RUN python3 /opt/glm53/patch_model_overrides.py
 RUN python3 /opt/glm53/patch_dflash2.py
 RUN python3 /opt/glm53/patch_glm_eagle3.py
@@ -689,6 +724,19 @@ RUN python3 /opt/glm53/patch_default_max_new_tokens.py
 # glm-5.3-flash-exl3-v20-upstreamsync-maxprefill-vllm.yaml (unset, for
 # workloads that want maximum prefill throughput instead).
 RUN python3 /opt/glm53/patch_dense_fp8.py
+# 2026-09-16 upstream-check round, backports of MiaAI-Lab/GLM-5.3-Flash-EXL3-
+# 2x-DGX-Sparks PRs #37, #94, #95 (see NOTES.md): opt-in cache-reset dev
+# routes (GLM53_EXPOSE_CACHE_RESET, default off), a log-only per-group
+# KV-capacity boot-line breakdown (GLM53_KV_CAPACITY_LOG, default on, scoped
+# down from the upstream PR to the directly-derivable figures -- see
+# patch_kv_capacity_log.py's module docstring), and a per-request GPU
+# prefix-cache no-store flag (GLM53_APC_NO_STORE, default on but inert
+# unless a caller actually sends skip_writing_prefix_cache). All anchors
+# verified byte-for-byte against this image's installed vLLM before being
+# written.
+RUN python3 /opt/glm53/patch_cache_reset.py
+RUN python3 /opt/glm53/patch_kv_capacity_log.py
+RUN python3 /opt/glm53/patch_apc_no_store.py
 
 RUN EXL3_SELFCHECK_GPU=0 python3 /opt/glm53/test_exl3_overlay.py \
     && python3 /opt/glm53/test_suppress_stops.py \
@@ -700,7 +748,10 @@ RUN EXL3_SELFCHECK_GPU=0 python3 /opt/glm53/test_exl3_overlay.py \
     && python3 /opt/glm53/test_indexer_workspace.py \
     && python3 /opt/glm53/test_ablit.py \
     && python3 /opt/glm53/test_cudagraph_align.py \
-    && python3 /opt/glm53/test_default_max_new_tokens.py
+    && python3 /opt/glm53/test_default_max_new_tokens.py \
+    && python3 /opt/glm53/test_cache_reset_endpoint.py \
+    && python3 /opt/glm53/test_kv_capacity_log.py \
+    && python3 /opt/glm53/test_apc_no_store.py
 
 # Baked by start.sh --build-arg so a git pull that changes overlay/Dockerfile
 # misses this label and rebuilds once. Keep last so stamp-only rebuilds are cheap.

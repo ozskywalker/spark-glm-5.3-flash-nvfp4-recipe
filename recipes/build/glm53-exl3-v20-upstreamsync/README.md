@@ -390,6 +390,13 @@ BUILD=1 SKIP_DOWNLOAD=1 SKIP_SYNC=1 ./start.sh restart  # force rebuild overlay 
 ./start.sh stop                # or ./stop.sh
 ```
 
+Concurrent lifecycle commands on the same checkout are serialized by a `flock`
+on `logs/cluster.lock`: `start`/`restart` refuse immediately when another
+lifecycle command owns it, and `stop` waits up to 30 s for it and then exits 1
+**without stopping anything** — retry once the running command exits. No PID is
+ever signalled to break the lock. The lock is per checkout and covers TP=2
+only: another clone and manual `docker rm` are not serialized by it.
+
 Do not pull `glm53-flash-sm121:v8` — that is the older NVFP4/Ray kernel.
 
 API: `http://127.0.0.1:8888/v1` (LAN: `http://10.0.0.1:8888/v1`).
@@ -498,7 +505,11 @@ that are now documented/enforced:
 | `GLM53_SUPPRESS_STOPS_IN_REASONING` | `1` | ignore client `stop` strings until `</think>` (thinking-on default) |
 | `GLM53_INDEXER_WORKSPACE` | `stock` | sparse-indexer prefill gather workspace. `stock` = `max_model_len * 40` entries (**5036.40 MB** locked at 1M — measured, `VLLM_DEBUG_WORKSPACE=1`). `rightsize` = the legal per-step maximum `min(MAX_NUM_SEQS, MNBT) * cdiv(MAX_MODEL_LEN + k, index_kpool)` = 126 MB at `MAX_NUM_SEQS=4` / 504 MB at 16, so **~+26–28% KV**. Opt-in; see [docs/DESIGN-indexer-workspace.md](docs/DESIGN-indexer-workspace.md) |
 | `GLM53_SPINWAIT_MS` | `stock` | SpinCondition reader busy-loop window. `stock` preserves vLLM's 1 s default; `1..1000` selects milliseconds. A frozen TP=2 sweep selected `16` (+0.95% median decode vs stock, 85.3% less active EngineCore CPU) |
-| `GLM53_BOOT_SHAPE_WARMUP` | `1` | after `/health`, burn DFlash2 BLOCK / sampler / kpool shapes (nonfatal) |
+| `GLM53_BOOT_SHAPE_WARMUP` | `1` | after `/health`, burn DFlash2 BLOCK / sampler / kpool shapes, including a long-prefill ladder (3584/7168/14336/65536) so `BuildPrefillChunkMetadataKernel` is warm before the first long request (nonfatal) |
+| `GLM53_EXTRA_ENV` | (empty) | space-separated `NAME=VALUE` list of extra container env for both ranks, for diagnostics (e.g. `VLLM_DEBUG_WORKSPACE=1`, `VLLM_LOGGING_LEVEL=DEBUG`). Names and values validated; launcher-owned names (everything the launcher forwards, plus `NCCL_*`/`HF_*`/`GLM53_*`/`EXL3_*`/`FLASHINFER_*`) are rejected instead of adding a duplicate `-e`. Only names are logged, and a rejected entry is reported by position only, never echoed; caller export wins over `.env` |
+| `GLM53_EXPOSE_CACHE_RESET` | `0` (off) | opt-in. `1` attaches the upstream cache-reset dev routes (`/reset_prefix_cache`, `/reset_mm_cache`, `/reset_encoder_cache`) on the head API server, so cold prefix-cache benchmarking does not need a container restart. This flag does not enable other dev routes; independent `VLLM_SERVER_DEV_MODE` retains precedence. Root routes are outside the bearer guard (`GUARDED_PREFIX`) — leave this off where clients are untrusted. Takes effect on restart |
+| `GLM53_KV_CAPACITY_LOG` | `1` | after vLLM's `GPU KV cache size: N tokens` boot line (`N` = max_concurrency × max_model_len, **not** a pool size), log one line per KV-cache group (spec type, block_size, page size, blocks/request) and a summary with the usable block ids and the blocks/request total (the stock line's own denominator). `0` = one line saying it is disabled. Log-only, no serving change either way |
+| `GLM53_APC_NO_STORE` | `1` | honour a per-request GPU prefix-cache "no-store" flag (`SamplingParams.skip_writing_prefix_cache`, or `vllm_xargs: {"skip_writing_prefix_cache": 1}`): the request may still read-hit, but its own blocks are never inserted into the cache, so they recycle ahead of other sessions' cached blocks instead of evicting them. Nothing changes unless a caller sends the flag. `0` = a valid request for it is ignored (logged once); malformed values are always rejected (HTTP 400) |
 | `TRITON_HOST_CACHE` / `TILELANG_HOST_CACHE` | `$CACHE_ROOT/triton` / `tilelang` | persist JIT caches across container recreate |
 | `LANGUAGE_MODEL_ONLY` | `0` | load vision tower (image + video) |
 | `SKIP_MM_PROFILING` | `1` | skip max-size MM dummy at init (OOM otherwise) |
@@ -549,7 +560,13 @@ After CUDA compile, Python overlay edits (`overlay/exl3.py`, tests) are a cheap 
 | `overlay/patch_ablit.py` | install the load_weights hook; bind-mounted and run on both ranks |
 | `ablit/` | direction vectors + `LAYER_MAP.json` from drowzeys' published recipe; `fetch_transplant.py` + `transplant/` for the donor o_proj byte-copy |
 | `tests/test_ablit.py` | recipe integrity, orthogonalization math, TP-shard equivalence, transplant byte-copy + TP slice, hook gating |
-| `scripts/boot-shape-warmup.sh` | post-`/health` DFlash2 k=7 BLOCK ladder + sampler/kpool arms |
+| `scripts/boot-shape-warmup.sh` | post-`/health` DFlash2 k=7 BLOCK ladder + sampler/kpool arms + long-prefill ladder (3584/7168/14336/65536, `PREFILL_S`) so `BuildPrefillChunkMetadataKernel` is warm before the first long request |
+| `overlay/patch_cache_reset.py` | mount only the upstream cache-reset dev router (`/reset_prefix_cache` et al.) when `GLM53_EXPOSE_CACHE_RESET=1` |
+| `tests/test_cache_reset_endpoint.py` | exact `build_app` anchor, flag semantics (off / on / dev-mode precedence), fail-closed drift, idempotence, installed copy |
+| `overlay/patch_kv_capacity_log.py` | log-only: after the stock `GPU KV cache size` line (kept byte-identical) log per-group `blocks/request` (the stock line's own denominator) and the usable-block-ids summary; knob `GLM53_KV_CAPACITY_LOG` (default `1`) |
+| `tests/test_kv_capacity_log.py` | exact two-anchor patch, idempotence, fail-closed drift, installed-source preflight |
+| `overlay/patch_apc_no_store.py` | per-request GPU prefix-cache no-store (`SamplingParams.skip_writing_prefix_cache` / `vllm_xargs`); three-file anchored patch, kill switch `GLM53_APC_NO_STORE` (default `1`, honors the flag; nothing changes unless a caller sends it) |
+| `tests/test_apc_no_store.py` | exact three-file patch, idempotence, fail-closed drift (whole-file and partial-snippet) |
 
 Image-build runs `EXL3_SELFCHECK_GPU=0`. `./start.sh` runs the GPU self-check
 (`docker run --gpus all`) before shipping unless `SKIP_OVERLAY_VERIFY=1`.

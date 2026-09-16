@@ -305,6 +305,24 @@ VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS="${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS:-1800}"
 # 1 = after /health, burn DFlash2 BLOCK / sampler / kpool shapes. Nonfatal.
 GLM53_BOOT_SHAPE_WARMUP="${GLM53_BOOT_SHAPE_WARMUP:-1}"
 GLM53_WARMUP_REQ_TIMEOUT="${GLM53_WARMUP_REQ_TIMEOUT:-240}"
+# Space-separated NAME=VALUE list of extra env for both container ranks
+# (diagnostics, e.g. VLLM_DEBUG_WORKSPACE=1, VLLM_LOGGING_LEVEL=DEBUG).
+GLM53_EXTRA_ENV="${GLM53_EXTRA_ENV:-}"
+# 1 = mount ONLY the upstream cache-reset dev routes (/reset_prefix_cache,
+# /reset_mm_cache, /reset_encoder_cache) on the head API server, so cold
+# bench runs can reset the prefix cache without a restart. Opt-in (default
+# 0): root-mounted routes sit outside the bearer guard (GUARDED_PREFIX), so
+# a shared kit must ask for this explicitly. Independent VLLM_SERVER_DEV_MODE
+# retains precedence. Restart applies the flag.
+GLM53_EXPOSE_CACHE_RESET="${GLM53_EXPOSE_CACHE_RESET:-0}"
+# 1 = after vLLM's "GPU KV cache size" boot line, log a per-group breakdown
+# and the usable block-id / blocks-per-request figures it is computed from
+# (log-only, no behavior change). Default on; 0 = one line saying so.
+GLM53_KV_CAPACITY_LOG="${GLM53_KV_CAPACITY_LOG:-1}"
+# 1 = honour a per-request skip_writing_prefix_cache flag (typed
+# SamplingParams field or vllm_xargs). Nothing changes unless a caller sends
+# the flag; 0 = a client's request for it is ignored (logged once).
+GLM53_APC_NO_STORE="${GLM53_APC_NO_STORE:-1}"
 
 # OpenAI-compatible API bearer token. Read the native VLLM_API_KEY env var
 # (vLLM falls back to it when --api-key is absent on the CLI), so the key
@@ -332,6 +350,11 @@ TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/root/.triton/cache}"
 TILELANG_CACHE_DIR="${TILELANG_CACHE_DIR:-/root/.tilelang/cache}"
 
 LOGDIR="$SCRIPT_DIR/logs"
+# TP2 lifecycle lock (helpers below). start/restart take it without waiting;
+# stop waits CLUSTER_LOCK_WAIT seconds and then refuses with exit 1.
+CLUSTER_LOCK="$LOGDIR/cluster.lock"
+CLUSTER_LOCK_PID="$LOGDIR/cluster.lock.pid"
+CLUSTER_LOCK_WAIT=30
 HEAD_SCRIPT="$SCRIPT_DIR/.glm53-exl3-head.inner.sh"
 WORKER_SCRIPT="$SCRIPT_DIR/.glm53-exl3-worker.inner.sh"
 EXPECTED_SHARDS="${EXPECTED_SHARDS:-120}"
@@ -426,6 +449,36 @@ validate_numeric_config() {
 }
 # GLM53 numeric config guard (end)
 
+# Serialize the TP2 lifecycle commands (start / restart / stop) so a second
+# launcher cannot docker-rm the first's containers mid wait_for_health (false
+# "head container exited" + empty logs). The flock on $CLUSTER_LOCK is the
+# authoritative owner; $CLUSTER_LOCK_PID is advisory diagnostics only — never
+# proof of ownership, and no PID is ever signalled.
+with_cluster_lock() {
+    mkdir -p "$LOGDIR"
+    exec 9>"$CLUSTER_LOCK"
+    if ! flock -n 9; then
+        local holder
+        holder="$(tr -d '[:space:]' <"$CLUSTER_LOCK_PID" 2>/dev/null || true)"
+        die "another start.sh/restart is already running${holder:+ (pid $holder)} — retry after it exits"
+    fi
+    echo $$ >"$CLUSTER_LOCK_PID" 2>/dev/null || true
+}
+
+# stop waits up to CLUSTER_LOCK_WAIT for the same lock and then refuses with
+# exit 1: no container is stopped, no PID metadata is written, and the lock
+# file is left alone. Retry once the start/restart holding it exits.
+with_cluster_lock_for_stop() {
+    mkdir -p "$LOGDIR"
+    exec 9>"$CLUSTER_LOCK"
+    if ! flock -w "$CLUSTER_LOCK_WAIT" 9; then
+        local holder
+        holder="$(tr -d '[:space:]' <"$CLUSTER_LOCK_PID" 2>/dev/null || true)"
+        die "cluster lock still held after ${CLUSTER_LOCK_WAIT}s${holder:+ (pid $holder)} — nothing was stopped; retry once that start.sh/restart exits"
+    fi
+    echo $$ >"$CLUSTER_LOCK_PID" 2>/dev/null || true
+}
+
 banner() {
     local label="${1:-start.sh}"
     printf '\n'
@@ -493,7 +546,9 @@ check_port_free() {
     local port="$1" envname="$2"
     command -v ss >/dev/null 2>&1 || return 0
     if ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${port}\$"; then
-        if docker inspect -f '{{.State.Running}}' "$CONTAINER_HEAD" 2>/dev/null | grep -q true; then
+        # Do not pipe docker inspect into grep -q: pipefail can turn grep's
+        # early close into a false negative when docker gets SIGPIPE.
+        if [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER_HEAD" 2>/dev/null || true)" = "true" ]; then
             die "port ${port} is held by ${CONTAINER_HEAD} — use './start.sh restart' or './start.sh stop' first"
         fi
         die "port ${port} is already in use — stop it or rerun with ${envname}=<free-port>"
@@ -1300,7 +1355,66 @@ launch_cluster() {
         -e VLLM_NO_USAGE_STATS=1
         -e DO_NOT_TRACK=1
         -e "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=$CG_ESTIMATE"
+        # Cache-only opt-in; independent VLLM_SERVER_DEV_MODE retains precedence.
+        -e "GLM53_EXPOSE_CACHE_RESET=$GLM53_EXPOSE_CACHE_RESET"
+        -e "GLM53_KV_CAPACITY_LOG=$GLM53_KV_CAPACITY_LOG"
+        -e "GLM53_APC_NO_STORE=$GLM53_APC_NO_STORE"
     )
+
+    # Extra container env for diagnostics (space-separated NAME=VALUE list, e.g.
+    # GLM53_EXTRA_ENV="VLLM_DEBUG_WORKSPACE=1"). Forwarded to both ranks as -e
+    # pairs (both ranks: nccl_common feeds the head directly and the worker via
+    # the string loop below). A name this launch already forwards -- every
+    # entry of nccl_common so far, the per-rank NCCL_SOCKET_IFNAME/
+    # GLOO_SOCKET_IFNAME/NCCL_IB_HCA/NCCL_IB_GID_INDEX/VLLM_HOST_IP block, the
+    # serve_env variable list, and VLLM_API_KEY -- is rejected, as are the
+    # launcher's own namespaces (NCCL_*, HF_*, GLM53_*, EXL3_*, FLASHINFER_*):
+    # docker takes the last duplicate -e, so a same-named entry would silently
+    # override the knob and skip its own validation. Values:
+    # [A-Za-z0-9_./:@,+=-]* only (no spaces, quotes, globs or shell
+    # metacharacters -- the worker command line is built as shell text). Only
+    # names are logged, and a rejected entry is reported by position only,
+    # never echoed; caller export wins over .env like every other knob here.
+    if [ -n "${GLM53_EXTRA_ENV:-}" ]; then
+        local _kv _name _value _entry _owned=" " _idx=0 _names=""
+        for _entry in "${nccl_common[@]}" \
+                      SERVED_MODEL_NAME PORT TP NNODES HEAD_IP MASTER_PORT QUANTIZATION \
+                      MAX_MODEL_LEN GPU_MEM_UTIL MAX_NUM_SEQS MAX_NUM_BATCHED_TOKENS \
+                      LONG_PREFILL_TOKEN_THRESHOLD \
+                      KV_CACHE_DTYPE MTP_TOKENS SPEC_METHOD DFLASH_TOKENS DFLASH_MODEL_DIR \
+                      DFLASH_DRAFT_TP \
+                      LANGUAGE_MODEL_ONLY SKIP_MM_PROFILING \
+                      LIMIT_MM CHAT_TEMPLATE ENFORCE_EAGER EXL3_FUSED_MOE EXL3_MOE_ROW_TILE EXL3_TEMP_ROWS_FUSED EXL3_FAT_SORTED EXL3_FAT_BATCHED EXL3_FAT_KERNEL MODEL_DIR EXTRA_ARGS \
+                      ABLIT ABLIT_METHOD ABLIT_DIRECTION ABLIT_LAYERS ABLIT_ALPHA ABLIT_INCLUDE_MTP \
+                      VLLM_API_KEY LD_PRELOAD \
+                      NCCL_SOCKET_IFNAME GLOO_SOCKET_IFNAME NCCL_IB_HCA NCCL_IB_GID_INDEX VLLM_HOST_IP; do
+            [ "$_entry" = "-e" ] && continue
+            _owned="$_owned ${_entry%%=*} "
+        done
+        set -f
+        for _kv in $GLM53_EXTRA_ENV; do
+            _idx=$((_idx + 1))
+            # The word split above delivers a whitespace-containing value as
+            # fragments, so the raw token and the unvalidated name can both
+            # carry part of a credential: neither is interpolated into a
+            # rejection message.
+            case "$_kv" in *=*) ;; *) die "GLM53_EXTRA_ENV entry $_idx must be NAME=VALUE";; esac
+            _name="${_kv%%=*}"; _value="${_kv#*=}"
+            [[ "$_name" =~ ^[A-Z_][A-Z0-9_]*$ ]] || die "GLM53_EXTRA_ENV entry $_idx: name must match [A-Z_][A-Z0-9_]*"
+            [[ "$_value" =~ ^[A-Za-z0-9_./:@,+=-]*$ ]] || die "GLM53_EXTRA_ENV: unsafe value for $_name (allowed: A-Z a-z 0-9 _ . / : @ , + = -)"
+            case "$_name" in
+                NCCL_*|HF_*|GLM53_*|EXL3_*|FLASHINFER_*|PATH|PYTHONPATH)
+                    die "GLM53_EXTRA_ENV: $_name is launcher-owned; set it through its own knob";;
+            esac
+            case "$_owned" in
+                *" $_name "*) die "GLM53_EXTRA_ENV: $_name is launcher-owned; set it through its own knob";;
+            esac
+            nccl_common+=(-e "$_kv"); _names="$_names $_name"
+        done
+        set +f
+        log "extra container env (both ranks):${_names}"
+    fi
+
     local worker_nccl="" e
     for e in "${nccl_common[@]}"; do
         [ "$e" = "-e" ] && continue
@@ -1453,22 +1567,38 @@ wait_for_health() {
         logpid=""
     }
     trap '_stop_logtail; warn "interrupted — containers keep running ('"'"'./start.sh logs'"'"' / '"'"'./start.sh stop'"'"')"; exit 130' INT
-    docker logs -f --tail 0 "$CONTAINER_HEAD" 2>&1 &
+    # 9>&-: the follower must not inherit the lifecycle lock fd. Bash passes
+    # `exec 9>` descriptors through exec, so a follower that somehow outlives
+    # this shell (SIGKILL, no trap) would keep the flock held.
+    docker logs -f --tail 0 "$CONTAINER_HEAD" 2>&1 9>&- &
     logpid=$!
 
-    local elapsed=0 healthy=0 exited=0 dead_side="" worker_fail=0
+    local elapsed=0 healthy=0 exited=0 dead_side="" worker_fail=0 head_fail=0
     while [ "$elapsed" -lt "$READY_TIMEOUT" ]; do
         if curl -fsS -m 5 "$url" >/dev/null 2>&1; then healthy=1; break; fi
-        if ! docker inspect -f '{{.State.Running}}' "$CONTAINER_HEAD" 2>/dev/null | grep -q true; then
-            log "head container exited during startup"
-            exited=1; dead_side="head"; break
+        # Keep the inspect result out of a grep -q pipeline. With pipefail,
+        # grep can close early and make a running container look dead.
+        # Same 3-strike window as the worker: one transient docker miss must
+        # not abort a multi-minute weight load.
+        if [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER_HEAD" 2>/dev/null || true)" = "true" ]; then
+            head_fail=0
+        else
+            head_fail=$((head_fail + 1))
+            if [ "$head_fail" -ge 3 ]; then
+                if docker inspect "$CONTAINER_HEAD" >/dev/null 2>&1; then
+                    log "head container not running during startup (3 consecutive checks)"
+                else
+                    log "head container missing during startup (removed by concurrent stop/restart?)"
+                fi
+                exited=1; dead_side="head"; break
+            fi
         fi
         # A dead worker rank can never make the head healthy — fail fast with
         # the log dump instead of polling for the full READY_TIMEOUT (issue
         # #22, item 4). Transient ssh/docker hiccups are tolerated; only
         # three consecutive non-running answers (~30 s) count as a dead
         # worker.
-        if worker_ssh "docker inspect -f '{{.State.Running}}' '$CONTAINER_WORKER' 2>/dev/null" | grep -q true; then
+        if [ "$(worker_ssh "docker inspect -f '{{.State.Running}}' '$CONTAINER_WORKER' 2>/dev/null" || true)" = "true" ]; then
             worker_fail=0
         else
             worker_fail=$((worker_fail + 1))
@@ -1554,7 +1684,7 @@ on_ready() {
 }
 
 # ------------------------------- start -------------------------------------
-start() {
+start_unlocked() {
     preflight
     ensure_image
     download_weights
@@ -1575,7 +1705,7 @@ start() {
     if wait_for_health; then
         post_ready_warmup
         on_ready
-        return
+        return 0
     fi
     collect_failure_logs
     echo "---- last 60 lines of head log ($LOGDIR/head.log) ----"
@@ -1585,14 +1715,25 @@ start() {
     die "server did not become healthy — full logs in $LOGDIR/"
 }
 
+start() {
+    with_cluster_lock
+    start_unlocked
+}
+
 # ------------------------------- stop --------------------------------------
-stop() {
+stop_containers() {
     log "stopping head container ..."
     docker rm -f "$CONTAINER_HEAD" >/dev/null 2>&1 || log "  (no head container was running)"
     log "stopping worker container on ${WORKER_SSH} ..."
     worker_ssh "docker rm -f '$CONTAINER_WORKER'" >/dev/null 2>&1 \
         || log "  (no worker container was running)"
     log "stopped."
+}
+
+stop() {
+    with_cluster_lock_for_stop
+    stop_containers
+    rm -f "$CLUSTER_LOCK_PID" || true
 }
 
 # ------------------------------ status -------------------------------------
@@ -1642,7 +1783,11 @@ main() {
         start)    shift || true; start ;;
         download) download_only ;;
         stop)     stop ;;
-        restart)  stop; start ;;
+        restart)
+            with_cluster_lock
+            stop_containers
+            start_unlocked
+            ;;
         status)   status ;;
         logs)     shift || true; logs "$@" ;;
         -h|--help|help) usage ;;
