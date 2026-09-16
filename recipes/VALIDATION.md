@@ -1802,3 +1802,31 @@ non-root (runtime-identity) level for the first time in this project's
 history. **Not yet redeployed to production** -- this was a build+
 validate pass only, matching what was asked; deployment is a separate,
 deliberate next step.
+
+## Backports deployed to production, confirmed stable (2026-09-16)
+
+Deployed the fixed, rebuilt, non-root-validated image
+(`sha256:a78a2d958fbc...`) via the now-standard cycle: stop ->
+`prelaunch_flush.sh` (both hosts, clean) -> `sparkrun run`. Healthy in
+~9.5 minutes. Verified: a real completion request returned correct
+output; checked again 15s later (the exact window the prior rollback
+crashed in) -- still healthy, no NVRM signature in the head's kernel
+log. Confirmed the new features are genuinely active, not just present:
+the `[glm53-kv-capacity-log]` per-group breakdown (PR #94 backport)
+appears in the real boot log with real numbers (5 KV-cache groups,
+usable block accounting, the "394/87 = 4.53x" cross-check line matching
+its own design).
+
+**Production now runs all 6 of today's backports**: `/reset_prefix_
+cache` admin endpoint (off by default), the pipefail-safe health-check
++ cluster-lock fix, `GLM53_EXTRA_ENV` diagnostic passthrough, KV-
+capacity boot logging (on by default, log-only), per-request prefix-
+cache skip (`GLM53_APC_NO_STORE`, inert unless a caller opts in), and
+the long-prefill warmup-ladder fix -- on top of the same known-good
+v20-upstreamsync base that's been running for days.
+
+**Status**: DEPLOYED, stable, confirmed. This closes out the entire
+2026-09-16 backport-deployment thread: bug found, fixed, rebuilt,
+validated (root AND non-root), deployed, confirmed. The
+`tests/check_nonroot_permissions.sh` gate added during this incident
+should be run before any future patch-touching rebuild, going forward.
