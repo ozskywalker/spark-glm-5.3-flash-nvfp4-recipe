@@ -1164,3 +1164,112 @@ counts). The checkpoint pre-slicer stays a real, well-reasoned but
 unquantified lever. The Sparkinfer lead is downgraded to a cheap watch
 item, not a live research thread -- its load-bearing dependency doesn't
 verifiably exist. Production untouched throughout.
+
+## Long-context decode-speed investigation, 2026-09-16 (5-9 tok/s at c=1/c=2)
+
+User report: after ~3 days of stability (1 reboot, 1.2-1.3B input tokens
+served), long-context decode has "crawled to 5-9 tok/s decode even on
+c=1 and c=2" specifically during subagent-heavy sessions (openchamber +
+opencode harness). Investigated via mcp-grafana (Prometheus), DCGM host
+metrics, and re-reading this project's own prior profiling work --
+production traffic was on a brief break, no new live capture was
+triggered against it (see "not done this session" below).
+
+**GPU hardware ruled out.** `DCGM_FI_DEV_SM_CLOCK` held a steady
+2400-2540 MHz on both nodes across the full 3-day window (no throttling,
+running at/above base clock throughout). `DCGM_FI_DEV_GPU_TEMP` cycled
+39-79C with load, well within normal range, no thermal runaway or
+sustained high-temp plateau. Clean on both counts -- this is not a
+hardware degradation story.
+
+**Aggregate server-side metrics don't show a broad regression, but the
+tail does.** `request_time_per_output_token_seconds`-derived decode
+throughput: p50 over the full 3-day window held flat at ~26.4-26.6 tok/s
+the entire time (barely moved). But the **p95 over just the last 6h
+dropped to 10.2 tok/s**, versus ~20.5 tok/s measured in yesterday's probe
+of this same metric. Typical/short requests are unaffected; the WORST
+requests in the distribution have gotten meaningfully worse recently.
+That's consistent with a problem concentrated in the long-context tail
+specifically, diluted away in the aggregate p50 -- exactly where
+subagent-harness traffic (deep, growing multi-turn context, per the
+mcp-grafana probe from two sessions ago: median prompt 122,860 tokens,
+95.1% prefix-cache hit rate) would land.
+
+**This project already has an unresolved, matching finding from before
+this session.** `docs/DESIGN-indexer-workspace.md` (`patch_indexer_
+workspace.py`'s design doc, written during the v19-indexercompat work) 
+states directly: *"the research train's arithmetic put the indexer's
+entire context-proportional decode cost at ~1 ms/step at 100K KV, ~0.5%
+of the measured 200 ms long-context delta... roofline arithmetic cannot
+prove the indexer is not a contributor -- so this PR simply does not
+make a latency claim in either direction."* Read plainly: at 100K KV
+context, someone already measured a **~200ms/step decode delta** versus
+short-context decode, confirmed the sparse indexer's own theoretically-
+expected linear-scaling cost is not the cause (only ~1ms of the 200ms),
+and then **explicitly left the actual cause unresolved** -- this was
+never root-caused, just ruled out as "not the indexer." **The magnitude
+matches the user's report almost exactly**: a healthy short-context
+decode step (~26 tok/s implies ~38ms/token) plus a +200ms/step delta at
+100K KV gives ~238ms/token, i.e. **~4.2 tok/s** -- squarely inside the
+user's observed 5-9 tok/s range. This was not surfaced or connected to
+the current complaint until now; it was written up as an aside in a
+memory-focused design doc and never cross-referenced into VALIDATION.md
+or SPEED.md.
+
+**Corroborating, not yet conclusive: a stray profiling trace.** Two
+untracked artifact directories already existed in the working tree
+before this session (`recipes/probes/cpu_profiles_v20/`,
+`recipes/probes/traces_v20_b1/`, both `git status`-untracked, no
+README/manifest, no cross-reference anywhere in VALIDATION.md/NOTES.md/
+SPEED.md -- an orphaned capture from an earlier ad-hoc session, unclear
+what context length it was captured at). Parsed the rank0 PyTorch trace
+directly (gzipped Chrome-trace JSON, 632,699 events):
+- Confirms the already-separately-tracked Ampere-fallback GEMM finding
+  is still present and substantial: `cutlass_80_wmma_tensorop_bf16_
+  s161616gemm...16x16` totals 2.74M us across 19,866 calls -- this is
+  the same kernel flagged in the AEON-7 triage entry above as "~36% of
+  decode GPU time, identified 2026-09-02, confirmed unchanged
+  2026-09-11." Still unaddressed as of this trace. This is a constant
+  per-active-token cost (MoE routed-expert GEMM), not itself obviously
+  context-length-scaled, so it's a separate, compounding inefficiency,
+  not the specific explanation for the *long-context-specific* delta.
+- One suspicious data point: `cudaEventSynchronize` totals 7.24M us
+  across only 85 calls -- an average of **~85ms per sync event**, large
+  enough to be a real contributor to a per-step delta in this range. Not
+  conclusive on its own without a paired short-context trace to diff
+  against (this file has no companion short-context capture, and no
+  metadata confirming what context length it was captured at) -- flagged
+  as the most promising lead for a follow-up trace comparison, not a
+  confirmed cause.
+
+**Not investigated this session, deliberately**: did not trigger a new
+profiling capture (py-spy/torch-profiler) against the live production
+containers -- that requires either a longer safe window than a brief
+traffic break, or explicit go-ahead, given capture overhead and the
+project's standing rule not to disturb production without confirmation.
+Also did not instrument the openchamber/opencode harness side (no access
+from this environment) -- can't fully rule out a compounding harness-side
+effect (e.g. how it paces/batches subagent calls), but the magnitude
+match to an already-documented, unresolved SERVER-side ~200ms/step
+long-context delta is strong enough that harness-side causes should be
+considered secondary, not primary, until this is re-checked.
+
+**Recommended next step** (not started, needs a dedicated window):
+capture a fresh, labeled paired trace -- one short-context (a few K
+tokens) and one long-context (100K+) decode step, same request shape
+otherwise -- and diff them directly for what actually grows with context
+length. Candidates worth checking first, in order: the `cudaEventSynchronize`
+count/duration, any O(context) CPU-side Python work per decode step
+(block-table/seq_lens/position_ids construction), and the indexer's
+*scoring* pass specifically (distinct from its already-ruled-out
+`cooperative_topk`/`persistent_topk` selection cost) since indexer
+scoring over full KV history is inherently O(context) by construction
+in this architecture family, unlike selection itself.
+
+**Status**: root cause not found, but the search space is now much
+narrower and grounded in this project's own prior (undocumented-until-
+now) measurement rather than a fresh guess. Not a GPU hardware issue,
+not fully explained by the already-tracked GEMM-kernel inefficiency
+alone, most likely the same ~200ms/100K-KV-step delta this project
+measured and set aside months ago without root-causing it. Production
+untouched throughout this investigation.
