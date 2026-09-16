@@ -1620,3 +1620,51 @@ not relevant to this specific gap.
 already optimal). New, narrower, evidence-backed lead identified
 (graph-capture cuBLAS inefficiency on mid-sized dense GEMMs) with a
 cheap, concrete validation step queued but not yet run this session.
+
+## CUDA graph-capture cuBLAS benchmark: negative result, GEMM investigation fully closed (2026-09-16)
+
+Direct test of the lead from the previous entry. Production confirmed
+idle (0 running requests, 0% GPU util both nodes) before starting;
+single brief `docker exec` benchmark run, no container/config changes,
+no restarts.
+
+**No graph-capture-specific cuBLAS penalty on GB10.** Tested 8 real
+weight shapes (pulled from the actual model's attention/MLA/MLP/KDA
+projections, TP=2-local sizes, 1.5-97.5 MB) x 3 decode-realistic batch
+sizes (M=1,4,8) = 24 combinations, eager vs. `torch.cuda.graph()`-
+captured-and-replayed. Mean graph-captured bandwidth was **96.8% of
+eager** (range 76.7-142.2%, noise-dominated in both directions -- no
+systematic regression). For the shapes that are actually memory-bound
+(48-97.5 MB; smaller ones showed L2-cache-resident inflated numbers,
+consistent with the original LM-head investigation's own caveat about
+sub-50MB tensors), both eager (169-235 GB/s) and graph-captured
+(155-220 GB/s) land in the same band as this hardware's own ~220-231
+GB/s raw ceiling -- same conclusion as the already-closed LM head
+finding, just confirmed across the smaller dense shapes too.
+
+**This closes the Ampere-fallback GEMM investigation with no available
+kernel-level win.** The sglang-flashnext-sm120 project's reported gap
+plausibly doesn't transfer here because their hardware (RTX PRO 6000)
+has far higher HBM bandwidth than GB10's unified LPDDR5x -- their
+graph-capture penalty may be specific to that memory subsystem or their
+own plumbing, not a general Blackwell/cuBLAS trait. GB10 simply doesn't
+reproduce it. Combined with the already-closed LM-head result, the
+entire dense-GEMM slice of the ~36% decode-time bucket is now
+confirmed bandwidth-bound at the hardware ceiling regardless of eager
+vs. graph-captured execution -- there is no native-kernel or dispatch-
+level fix available.
+
+**The only remaining lever is quantization coverage** (bf16 -> fp8 for
+attention projections / LM head, halving bytes moved) -- which is not
+new: this is the same dense-FP8 tradeoff already investigated and
+deliberately rejected (`v16_densefp8_prepped` / "Dense-FP8 promoted to
+default" history above) specifically because it favors decode at
+prefill's expense, the wrong tradeoff for this prefill-heavy fleet.
+Nothing new to promote from this line of investigation.
+
+**Status**: CLOSED. Both the LM head and the smaller dense GEMMs are
+confirmed bandwidth-bound at the hardware ceiling in both eager and
+graph-captured execution -- no kernel-dispatch bug exists to fix. The
+only lever (dense-FP8) is already known and already rejected for this
+fleet's workload shape. Not worth further investigation unless the
+fleet's prefill/decode balance changes materially.
