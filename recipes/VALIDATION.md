@@ -1343,3 +1343,72 @@ genuinely open; root cause of *the current complaint* is now most likely
 prefix-cache-hit-rate/TTFT-related, not a decode-speed regression at all.
 Production traffic resumed normally after this test (both hosts healthy,
 sanity completion request verified correct output before and after).
+
+## RoCE dual-rail verification (2026-09-16)
+
+Resolves the follow-up flagged in "Routine upstream check, 2026-09-13"
+(MiaAI-Lab measured +63% busbw dual-rail on their kit; never checked
+whether our own cluster config uses both rails). Read-only host
+inspection, both nodes, production untouched.
+
+**Physical hardware: both rails already exist and are cabled/connected
+on both hosts.** Each node has two separate physical ConnectX-7 cards
+(`rocep1s0f0`/`enp1s0f0np0` and `roceP2p1s0f0`/`enP2p1s0f0np0`), each
+with a live link-up port on the `192.168.177.0/24` RoCE subnet.
+Confirmed with a direct ping across the second rail specifically
+(`192.168.177.87` from the other node): sub-millisecond RTT, 0% loss,
+same as the first rail. **No new cable needed** -- this is a stock
+dual-CX7 DGX Spark configuration, already fully wired, just not
+exploited.
+
+**Current config: single-rail.** `start.sh` pins exactly one HCA device
+per rank (`HEAD_CX7_IB="${HEAD_CX7_IB:-rocep1s0f1}"`,
+`WORKER_CX7_IB="${WORKER_CX7_IB:-rocep1s0f0}"`), passed to NCCL as a
+single `NCCL_IB_HCA=<one device>` value. The second card on each host
+(`roceP2p1s0f0`/`enP2p1s0f0np0`) sits live and reachable but genuinely
+idle from NCCL's point of view.
+
+**What dual-rail would and would not help, and why**: TP=2 across two
+*separate hosts* (no NVLink) needs an NCCL all-reduce over the network
+at every layer, for every token, during both prefill and decode --
+that's the only place RoCE bandwidth matters for this deployment.
+Checkpoint loading and container/image distribution do NOT use this
+fabric in our setup (weights come from HF per-host independently;
+`sparkrun`'s image distribution goes over the separate management
+network, `10.7.0.x` -- confirmed via the `ib:`/`mgmt:` address split
+`sparkrun status` already shows per node).
+- **Prefill**: processes a large batch of tokens per forward pass, so
+  each all-reduce message is large -- genuinely bandwidth-bound.
+  Doubling available bandwidth via a second rail should give a real,
+  proportional benefit here. This lines up well with this fleet's own
+  workload shape (median prompt ~122K tokens per the mcp-grafana probe
+  earlier this engagement) -- unlike the dense-FP8 kernel work rejected
+  earlier for favoring decode at prefill's expense, this lever favors
+  the phase that actually dominates our traffic.
+- **Decode**: one token (or a handful, at our typical c=1/c=2) per step
+  -- the all-reduce message is tiny, and tiny-message collective time is
+  dominated by per-message latency/overhead, not raw bandwidth. A
+  second rail mainly helps here only if the first rail is congested
+  (unlikely at low concurrency); expect little to no decode-throughput
+  change from this change alone.
+- MiaAI-Lab's own +63% figure (20.9 vs. 12.8 GB/s peak busbw) is a raw
+  NCCL all-reduce microbenchmark, not an end-to-end inference-throughput
+  measurement -- a reasonable proxy for the prefill story above, but the
+  real serving-throughput gain is unmeasured and would need our own A/B.
+
+**Known pitfall if this is ever turned on**: MiaAI-Lab's own PR #172
+(referenced in the 2026-09-14 upstream-check entry above) fixed a bug
+where their launcher's RoCE GID preflight only checked the FIRST HCA on
+a dual-rail config (`HEAD_CX7_IB=dev1,dev2`), silently skipping
+validation and failing ~60s into a real run instead of at boot. Our own
+`start.sh` GID-preflight logic (around line 584-603) would need the
+same fix before a dual-rail config could be trusted -- not yet checked
+whether ours has this exact gap, since we've never run dual-rail.
+
+**Status**: verified feasible (hardware ready, zero cabling cost),
+config change identified (`NCCL_IB_HCA` needs both devices, comma-
+separated, on both ranks), expected benefit is prefill-specific and
+plausible-but-unquantified for us specifically. Not enabled this
+session -- this touches core NCCL fabric behavior and should get a
+deliberate test (and the GID-preflight dual-rail check ported first),
+not a drive-by flip in production.
