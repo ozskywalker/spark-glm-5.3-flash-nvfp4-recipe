@@ -1491,3 +1491,132 @@ level A/B (not just "did it boot") before any production consideration.
 unresolved risk flags identified; recommendation is to deprioritize
 given low payoff and risk concentration on an existing weak spot. No
 scratch trial run this session.
+
+## RoCE single-rail utilization measured directly (2026-09-16)
+
+Direct follow-up to the dual-rail verification above, prompted by the
+user asking how much of the single active rail we're actually using.
+Grafana ships `node_exporter`'s real InfiniBand port counters
+(`node_infiniband_port_data_transmitted_bytes_total` and friends) --
+didn't need to guess.
+
+**Link capacity, confirmed**: `rocep1s0f0`/`roceP2p1s0f0` (the two active
+rails) both report `node_infiniband_rate_bytes_per_second` = 25,000,000,000
+(200 Gb/sec NDR) -- this is the theoretical per-rail ceiling.
+
+**Actual measured usage, right now (idle)**: ~0 -- expected, no traffic
+in flight between requests.
+
+**Actual measured usage during real load**: queried the exact window
+around this session's own 108K-token cold-prefill test (the heaviest,
+most network-intensive single request we could construct -- a full,
+uncached TP=2 all-reduce workload). Peak observed: **~4.9 Gbit/s**
+(`max_over_time` across the full 3-day production window at 30s
+granularity). Against the 200 Gbit/s per-rail ceiling, that's **~2.45%
+utilization at the heaviest moment we could find or construct.**
+Typical (3-day average) usage sits far lower still, under 1 Gbit/s
+(~0.4%).
+
+**This revises the earlier dual-rail assessment.** The prior entry
+above reasoned that dual-rail bandwidth "should give a real,
+proportional win" for our prefill-heavy workload -- that was a
+first-principles argument (large all-reduce messages are
+bandwidth-bound in general), not yet a measurement. Now measured
+directly: **we are nowhere near saturating even the single active
+rail**, even at the heaviest realistic load. Doubling available
+bandwidth via a second rail is very unlikely to move real throughput
+under CURRENT traffic patterns -- if the link were the bottleneck,
+we'd expect this fleet's own 3-day peak to already be pushing toward
+the 200 Gb/s ceiling, and it isn't within two orders of magnitude.
+Whatever governs actual prefill/decode speed on this fleet, it is not
+network bandwidth. This is also consistent with the fleet's own
+observed concurrency (per earlier mcp-grafana probes: c=0-1 almost
+always, rarely c=2) -- the traffic pattern that would actually stress
+the link (many large concurrent prefills at once) essentially never
+occurs here.
+
+**Revised recommendation**: dual-rail stays technically free (hardware
+already cabled, zero cost to try) but should NOT be expected to move
+real throughput given current traffic patterns -- deprioritize versus
+the original "plausible real win" framing. Worth revisiting only if
+concurrency/traffic shape changes meaningfully (e.g. many simultaneous
+long-context requests becoming routine, which isn't the case today).
+
+## Ampere-fallback GEMM deep-dive: closed on the LM head, a real new lead elsewhere (2026-09-16)
+
+Deep research pass on the ~36%-of-decode-GPU-time `cutlass_80_wmma`
+kernel, tracked since 2026-09-02. Read-only research + read-only
+container inspection, no production changes.
+
+**The original framing (an SM80/Ampere kernel shape running on
+Blackwell hardware because no native kernel was ever selected) is
+CLOSED, negative, and reconfirmed current.** This exact question was
+already investigated 2026-09-02 (`recipes/validation-archive/v4.md`):
+the single biggest contributor -- the LM head GEMM (605 MB/rank, the
+largest dense weight in the model) -- is genuinely memory-bandwidth-
+bound, not tensor-core-bound (M=3 and M=8 measured identical latency).
+It already achieves 245.6 GB/s, which *exceeds* this exact hardware's
+own measured raw bandwidth ceiling (~220-231 GB/s from independent
+copy/reduction microbenchmarks on the same node). **No kernel --
+Blackwell-native or otherwise -- can move bytes faster than the memory
+subsystem allows, and this one already does.** Re-verified this
+session: current toolchain (CUDA 13.0, cuBLAS 13.1.1.3, PyTorch
+2.13.0+cu130) is byte-identical to what was tested in September, so
+this isn't stale. Not worth pursuing further.
+
+**A real, different, untested lead exists in the same kernel bucket.**
+The LM head benchmarks that established "already at bandwidth ceiling"
+were run OUTSIDE CUDA graph capture (an isolated repro, chosen at the
+time as a profiler-correlation workaround). Production always runs
+INSIDE captured CUDA graphs. Whether cuBLAS behaves differently under
+graph capture specifically, for the *mid-sized* dense GEMMs that share
+this kernel family (attention projections, MLP gate/up -- still a real
+slice of that same GEMM bucket, separate from the LM head), was never
+tested. Evidence this is plausible: `vllm-project/vllm#35467` documents
+cuBLAS auto-tuning picking a suboptimal tile config for medium-batch
+bf16 GEMMs on B200/SM100 (16-30% left on the table, open/unfixed,
+general not GB10-specific); more concretely, `gabrielolympie/
+sglang-flashnext-sm120` (a sibling SM120 project, RTX PRO 6000
+Blackwell) directly measured and fixed exactly this: **cuBLAS-under-
+graph-capture running mid-sized bf16 dense projections (512 KB-128 MB
+weight range -- matches our o_proj/MLP-gate-up/q_b_proj, NOT the 605 MB
+LM head) at only 20-75% of DRAM bandwidth**, versus ~90% with a
+purpose-built Triton split-K kernel. Their own docs confirm the LM-
+head-sized case is already fine under cuBLAS (~94% bandwidth) --
+consistent with, not contradicting, our own LM-head finding. Their
+measured end-to-end win: +3.6% decode tok/s. Caveat: their kernel's
+tuning table is hardcoded for RTX PRO 6000's much-higher-bandwidth
+GDDR7 memory -- the *technique* is portable, the *tuned numbers* are
+not; GB10 would need its own autotuning pass, and since our dense-GEMM
+numbers already sit closer to our own (lower) bandwidth ceiling than
+theirs did, the realistic gain here may be smaller than their headline.
+No LICENSE on that repo -- reimplement the documented technique, don't
+copy code verbatim.
+
+**Recommended next step, cheap and concrete**: a few hours of
+`docker exec`-based benchmarking, same methodology as the original
+September investigation, but run INSIDE an actual captured CUDA graph
+this time (not eager/isolated) -- to see whether GB10 shows the same
+graph-capture-specific degradation before committing to any kernel
+work. If confirmed, the fix is a **Triton-level kernel port/autotune**
+(comparable scope to the already-shipped `patch_gb10_router_gemm.py`,
+days not weeks), not new CUDA/CUTLASS authorship from scratch.
+
+**DeepGEMM's SM120 port**: `vllm-project/DeepGEMM` PR #4 ("Port SM120
+kernels from nv_dev") merged 2026-09-14, two days before this
+investigation -- but the PR's own text states no SM120 kernel in that
+branch has ever actually executed; validation is compile+SASS-opcode
+only, developed on SM100 hardware. Its featured ops (MQA logits,
+hyperconnection pre-norm, FP8/FP4 grouped GEMM) target DeepSeek-V4-
+Flash-style architectures and don't clearly match our dense-skinny-BF16
+shape either. Watch-item, not adoptable now -- revisit once it has real
+hardware validation.
+
+**Upstream CUTLASS**: recent SM120/121 additions found are FP8/
+blockscale/grouped-GEMM (MoE-oriented), not BF16 dense skinny-GEMM --
+not relevant to this specific gap.
+
+**Status**: original framing closed (LM head is fine, bandwidth-bound,
+already optimal). New, narrower, evidence-backed lead identified
+(graph-capture cuBLAS inefficiency on mid-sized dense GEMMs) with a
+cheap, concrete validation step queued but not yet run this session.
